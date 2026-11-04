@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+.lean_stamps/
+*.o
+*.a
+*.dylib
+*.metallib
+*.air
+
+# OS & Editor metadata
+.DS_Store
+.obsidian/
+
+# Research compiled binaries & external profiling scratch
+research/cpu_project
+research/physics/kepler_energy
+research/physics/test_swept
+research/sw_profile/

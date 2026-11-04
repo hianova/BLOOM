@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SDD (Spec-Driven Development) Visual & Animation Blueprint for BLOOM -->
+<!-- 1. <line> segments compile directly into 64B FlowGlyphDesc64 Q8.8/Q16 SDF vectors -->
+<!-- 2. <animate> tags compile directly into 64B FlowAnimClip64 4-phase Hearthstone-style choreography -->
+<!-- 3. <animateTransform> allows instant zero-editor preview in any browser or SVG viewer -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-256 -256 512 512" width="512" height="512">
+  <g id="glyph_reticle_prograde" data-glyph-id="101" data-style-id="1" data-stroke-q16="3276">
+    <animate data-clip-id="101" data-style-id="1"
+             data-anticipation-ms="120" data-delivery-ms="160" data-impact-ms="80" data-settle-ms="280"
+             data-scale-anticipation-q16="58982" data-scale-impact-q16="85196"
+             data-squash-gain-q16="16384" data-arc-height-q16="32768"
+             data-peak-flux-q16="262144" data-peak-ripple-q16="8192"
+             data-trauma-q16="16384" data-hitstop-frames="2" data-audio-patch="1"
+             data-overshoot-q16="9830"/>
+    <animateTransform attributeName="transform" type="scale"
+                      values="1.0;0.90;1.30;0.96;1.0" dur="0.64s" repeatCount="indefinite"/>
+    <line x1="-64" y1="0" x2="-20" y2="0" stroke="#00FFCC" stroke-width="4"/>
+    <line x1="20" y1="0" x2="64" y2="0" stroke="#00FFCC" stroke-width="4"/>
+    <line x1="0" y1="-64" x2="0" y2="-20" stroke="#00FFCC" stroke-width="4"/>
+    <line x1="-20" y1="-20" x2="20" y2="20" stroke="#00FFCC" stroke-width="2"/>
+    <line x1="-20" y1="20" x2="20" y2="-20" stroke="#00FFCC" stroke-width="2"/>
+  </g>
+  <g id="glyph_alert_800k" data-glyph-id="102" data-style-id="7" data-stroke-q16="4096">
+    <animate data-clip-id="102" data-style-id="7"
+             data-anticipation-ms="150" data-delivery-ms="100" data-impact-ms="110" data-settle-ms="320"
+             data-scale-anticipation-q16="52428" data-scale-impact-q16="98304"
+             data-squash-gain-q16="24576" data-arc-height-q16="49152"
+             data-peak-flux-q16="655360" data-peak-ripple-q16="16384"
+             data-trauma-q16="45875" data-hitstop-frames="4" data-audio-patch="2"
+             data-overshoot-q16="13107"/>
+    <animateTransform attributeName="transform" type="scale"
+                      values="1.0;0.80;1.50;0.92;1.0" dur="0.68s" repeatCount="indefinite"/>
+    <line x1="0" y1="-96" x2="-84" y2="64" stroke="#FF3300" stroke-width="5"/>
+    <line x1="-84" y1="64" x2="84" y2="64" stroke="#FF3300" stroke-width="5"/>
+    <line x1="84" y1="64" x2="0" y2="-96" stroke="#FF3300" stroke-width="5"/>
+    <line x1="0" y1="-36" x2="0" y2="20" stroke="#FFCC00" stroke-width="5"/>
+    <line x1="0" y1="36" x2="0" y2="44" stroke="#FFCC00" stroke-width="5"/>
+  </g>
+  <g id="glyph_grade_s_badge" data-glyph-id="103" data-style-id="0" data-stroke-q16="3000">
+    <!-- Hearthstone Legendary-Slam Style Choreography: Hover Lift -> Arc -> Golden Impact Slam -> Spring Settle -->
+    <animate data-clip-id="103" data-style-id="0"
+             data-anticipation-ms="200" data-delivery-ms="140" data-impact-ms="100" data-settle-ms="400"
+             data-scale-anticipation-q16="55705" data-scale-impact-q16="95027"
+             data-squash-gain-q16="28672" data-arc-height-q16="65536"
+             data-peak-flux-q16="917504" data-peak-ripple-q16="22937"
+             data-trauma-q16="52428" data-hitstop-frames="5" data-audio-patch="3"
+             data-overshoot-q16="16384"/>
+    <animateTransform attributeName="transform" type="scale"
+                      values="1.0;0.85;1.45;0.90;1.0" dur="0.84s" repeatCount="indefinite"/>
+    <line x1="-48" y1="-64" x2="48" y2="-64" stroke="#FFD700" stroke-width="4"/>
+    <line x1="-48" y1="-64" x2="-48" y2="0" stroke="#FFD700" stroke-width="4"/>
+    <line x1="-48" y1="0" x2="48" y2="0" stroke="#FFD700" stroke-width="4"/>
+    <line x1="48" y1="0" x2="48" y2="64" stroke="#FFD700" stroke-width="4"/>
+    <line x1="-48" y1="64" x2="48" y2="64" stroke="#FFD700" stroke-width="4"/>
+  </g>
+  <g id="glyph_ship_hull_profile" data-glyph-id="104" data-style-id="5" data-stroke-q16="3600">
+    <animate data-clip-id="104" data-style-id="5"
+             data-anticipation-ms="100" data-delivery-ms="180" data-impact-ms="70" data-settle-ms="250"
+             data-scale-anticipation-q16="60293" data-scale-impact-q16="78643"
+             data-squash-gain-q16="32768" data-arc-height-q16="26214"
+             data-peak-flux-q16="393216" data-peak-ripple-q16="12288"
+             data-trauma-q16="26214" data-hitstop-frames="3" data-audio-patch="4"
+             data-overshoot-q16="8192"/>
+    <animateTransform attributeName="transform" type="scale"
+                      values="1.0;0.92;1.20;0.97;1.0" dur="0.60s" repeatCount="indefinite"/>
+    <line x1="0" y1="-120" x2="-72" y2="40" stroke="#66CCFF" stroke-width="4"/>
+    <line x1="0" y1="-120" x2="72" y2="40" stroke="#66CCFF" stroke-width="4"/>
+    <line x1="-72" y1="40" x2="-32" y2="96" stroke="#66CCFF" stroke-width="4"/>
+    <line x1="72" y1="40" x2="32" y2="96" stroke="#66CCFF" stroke-width="4"/>
+    <line x1="-32" y1="96" x2="32" y2="96" stroke="#66CCFF" stroke-width="4"/>
+  </g>
+
+  <!-- ===================================================================== -->
+  <!-- FLOW SVG-UI 64-Byte Declarative Frontend Framework & OBS Director Bar -->
+  <!-- ===================================================================== -->
+  <rect id="ui_director_glass_dock" data-ui-node="201" data-prim="1" data-anchor="5"
+        data-bind="0" data-ox-q16="0" data-oy-q16="23592" data-hw-q16="19660" data-hh-q16="2621"
+        data-rx-q16="1310" data-style="65" data-action="0" data-listen="hover|drag"
+        x="-150" y="180" width="300" height="40" rx="10" fill="#20D8FF" fill-opacity="0.92" stroke="#44BBFF"/>
+
+  <rect id="ui_btn_vcam_135mm" data-ui-node="202" data-prim="1" data-anchor="5"
+        data-bind="3" data-ox-q16="-13107" data-oy-q16="23592" data-hw-q16="3604" data-hh-q16="1638"
+        data-rx-q16="655" data-style="66" data-action="1" data-listen="click|drag" role="button"
+        x="-135" y="188" width="55" height="24" rx="5" fill="#18F0B8" stroke="#00FFCC"/>
+
+  <rect id="ui_btn_vcam_24mm" data-ui-node="203" data-prim="1" data-anchor="5"
+        data-bind="3" data-ox-q16="-4587" data-oy-q16="23592" data-hw-q16="3604" data-hh-q16="1638"
+        data-rx-q16="655" data-style="67" data-action="2" data-listen="click|drag" role="button"
+        x="-65" y="188" width="55" height="24" rx="5" fill="#38A8FF" stroke="#66CCFF"/>
+
+  <rect id="ui_btn_thermal_purge" data-ui-node="204" data-prim="1" data-anchor="5"
+        data-bind="1" data-ox-q16="3932" data-oy-q16="23592" data-hw-q16="3604" data-hh-q16="1638"
+        data-rx-q16="655" data-style="68" data-action="5" data-listen="click|drag" role="button"
+        x="5" y="188" width="55" height="24" rx="5" fill="#FF6820" stroke="#FF6622"/>
+
+  <circle id="ui_btn_obs_zero_copy_rec" data-ui-node="205" data-prim="2" data-anchor="5"
+          data-bind="5" data-ox-q16="13107" data-oy-q16="23592" data-hw-q16="1966" data-hh-q16="983"
+          data-rx-q16="327" data-style="69" data-action="7" data-listen="click" role="button"
+          cx="105" cy="200" r="14" fill="#FF2244" stroke="#FFFFFF"/>
+
+  <circle id="ui_gauge_thermal_ring" data-ui-node="206" data-prim="2" data-anchor="2"
+          data-bind="1" data-ox-q16="26869" data-oy-q16="-19660" data-hw-q16="2949" data-hh-q16="2162"
+          data-rx-q16="393" data-style="7" data-action="8" data-listen="click|drag"
+          cx="205" cy="-150" r="22" fill="#B850FF" stroke="#FF5500" stroke-width="4"/>
+
+  <text id="ui_readout_kelvin_7seg" data-ui-node="207" data-prim="3" data-anchor="2"
+        data-bind="1" data-ox-q16="21626" data-oy-q16="-19660" data-hw-q16="3276" data-hh-q16="1638"
+        data-rx-q16="196" data-style="1" data-action="9" data-listen="click"
+        x="160" y="-145" fill="#00FFCC" font-family="monospace" font-size="14">760K</text>
+
+  <rect id="ui_btn_dopamine_jackpot" data-ui-node="208" data-prim="1" data-anchor="1"
+        data-bind="4" data-ox-q16="-25559" data-oy-q16="-20971" data-hw-q16="4587" data-hh-q16="1638"
+        data-rx-q16="819" data-style="70" data-action="6" data-listen="click|drag" role="button"
+        x="-230" y="-172" width="70" height="24" rx="6" fill="#FFD830" stroke="#FFD700"/>
+</svg>
