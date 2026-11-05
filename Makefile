@@ -62,7 +62,8 @@ LEAN_SRCS = research/NoteClaims.lean \
             research/ComposableTicketPipeline.lean \
             research/DopamineEconomy.lean \
             research/WallpaperEngine.lean \
-            research/SvgUiFramework.lean
+            research/SvgUiFramework.lean \
+            research/ZeroOverheadScaling.lean
 
 LEAN_ALL_STAMP = build/.lean_stamps/.all_lean.stamp
 
@@ -129,7 +130,6 @@ $(TARGET_SDL3_OBJ): src/sdl3_gpu_host.c include/flow_platform_bridge.h include/f
 
 $(TARGET_TEST_CORE): tests/test_flow_game.c $(HEADERS) $(TARGET_ENGINE_OBJ) $(TARGET_PREFAB_OBJ) $(TARGET_CINE_OBJ) $(FLOW_LIB) | dirs
 	$(CC) $(CFLAGS) tests/test_flow_game.c $(TARGET_ENGINE_OBJ) $(TARGET_PREFAB_OBJ) $(TARGET_CINE_OBJ) $(FLOW_LIB) -o $@
-	@ln -sf test-bloom build/test-flow-game
 
 $(TARGET_TEST_PREFAB): tests/test_prefab_ssot.c include/flow_prefab_ssot.h $(TARGET_PREFAB_OBJ) $(FLOW_LIB) | dirs
 	$(CC) $(CFLAGS) tests/test_prefab_ssot.c $(TARGET_PREFAB_OBJ) $(FLOW_LIB) -o $@
@@ -148,7 +148,6 @@ $(TARGET_TEST_SVGUI): tests/test_svg_ui_framework.c $(HEADERS) $(TARGET_SVGUI_OB
 
 $(TARGET_GAME): src/metal_host.m src/shaders.metal $(HEADERS) $(TARGET_ENGINE_OBJ) $(TARGET_PREFAB_OBJ) $(TARGET_PROC_OBJ) $(TARGET_CINE_OBJ) $(TARGET_WP_OBJ) $(TARGET_SVGUI_OBJ) $(TARGET_SDL3_OBJ) $(FLOW_LIB) | dirs
 	$(CC) $(OBJCFLAGS) src/metal_host.m $(TARGET_ENGINE_OBJ) $(TARGET_PREFAB_OBJ) $(TARGET_PROC_OBJ) $(TARGET_CINE_OBJ) $(TARGET_WP_OBJ) $(TARGET_SVGUI_OBJ) $(TARGET_SDL3_OBJ) $(FLOW_LIB) $(FRAMEWORKS) -o $@
-	@ln -sf bloom build/flow_game
 
 test: verify-flowy all
 	@echo ""

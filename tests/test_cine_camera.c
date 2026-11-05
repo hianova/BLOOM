@@ -275,6 +275,41 @@ static void test_shake_envelope_and_engine_integration(void) {
     printf("  ✓ 6D trauma decay, acceleration FOV breathing & SPSC packet publication verified!\n");
 }
 
+static void test_cinema_edl_and_48khz_lockstep(void) {
+    printf("[Test 7/7] FlowCinemaShot64 24fps EDL Timecode & 48kHz Audio Lockstep...\n");
+
+    assert(sizeof(FlowCinemaShot64) == 64U);
+    assert(_Alignof(FlowCinemaShot64) == 64U);
+
+    FlowCinemaShot64 shots[FLOW_CINEMA_REEL_SHOT_COUNT];
+    assert(flow_cine_build_default_reel64(shots, 24U) == 0);
+    for (uint32_t i = 0U; i < FLOW_CINEMA_REEL_SHOT_COUNT; ++i) {
+        assert(shots[i].shot_id == i + 1U);
+        assert(shots[i].stage_mode == i);
+        assert(shots[i].fps_rate == 24U);
+        assert(shots[i].frame_count == 48U);
+        assert(shots[i].audio_samples_per_frame == 2000U);
+        assert(shots[i].edl_signature_hash != 0ULL);
+    }
+
+    char tc0[12], tc1[12], tc_end[12];
+    assert(flow_cine_format_smpte_timecode(0U, 24U, tc0) == 0);
+    assert(flow_cine_format_smpte_timecode(48U, 24U, tc1) == 0);
+    assert(flow_cine_format_smpte_timecode(192U, 24U, tc_end) == 0);
+    assert(strcmp(tc0, "00:00:00:00") == 0);
+    assert(strcmp(tc1, "00:00:02:00") == 0);
+    assert(strcmp(tc_end, "00:00:08:00") == 0);
+
+    int16_t pcm_a[2000 * 2];
+    int16_t pcm_b[2000 * 2];
+    assert(flow_cine_synth_lockstep_audio48k(&shots[0], 10U, pcm_a, 2000U) == 0);
+    assert(flow_cine_synth_lockstep_audio48k(&shots[0], 10U, pcm_b, 2000U) == 0);
+    /* 100% bit-identical deterministic audio lockstep */
+    assert(memcmp(pcm_a, pcm_b, sizeof(pcm_a)) == 0);
+
+    printf("  ✓ FlowCinemaShot64 64B EDL (00:00:00:00..00:00:08:00) & 48kHz lockstep verified!\n");
+}
+
 int main(void) {
     printf("====================================================================\n");
     printf("BLOOM: FlowCineRig64 Cinematography & Physical Optics Test Suite\n");
@@ -286,9 +321,10 @@ int main(void) {
     test_jet2_damping_and_vcam_blending();
     test_physical_coc_dof_and_auto_exposure();
     test_shake_envelope_and_engine_integration();
+    test_cinema_edl_and_48khz_lockstep();
 
     printf("====================================================================\n");
-    printf("✓ ALL 6 FLOWCINERIG64 CINEMATOGRAPHY & OPTICS TESTS PASSED (100%% SOUND)\n");
+    printf("✓ ALL 7 FLOWCINERIG64 CINEMATOGRAPHY & OPTICS TESTS PASSED (100%% SOUND)\n");
     printf("====================================================================\n");
     return 0;
 }

@@ -534,6 +534,18 @@ static inline int64_t q16_tri_wave(int64_t phase_q16) {
     return (half * 4LL) - 65536LL;
 }
 
+static inline int64_t q16_smooth_sine(int64_t phase_q16) {
+    /* Pure Q16 C1 continuous parabolic sine approximation in [-65536, 65536] (0 Float / 0 Aliasing) */
+    uint32_t p = (uint32_t)(phase_q16 & 0xFFFFLL);
+    if (p < 32768U) {
+        uint32_t u = p;
+        return (int64_t)(((uint64_t)u * (32768U - u)) >> 12U);
+    } else {
+        uint32_t u = p - 32768U;
+        return -(int64_t)(((uint64_t)u * (32768U - u)) >> 12U);
+    }
+}
+
 void flow_audio_synth_samples_q16(const FlowAudioPatch64 *patch, int64_t *out_pcm_q16,
                                   size_t sample_count, int64_t dt_sample_q16) {
     if (!patch || !out_pcm_q16 || sample_count == 0U)
@@ -1124,10 +1136,10 @@ void flow_audio_synth_relativistic_q16(const FlowAudioPatch64 *patch,
         int64_t t_q16 = (int64_t)i * eff_dt_q16;
         int64_t carrier_phase = phase_lock + flow_jet2_eval_taylor(patch->carrier_jet, t_q16);
         int64_t mod_phase = phase_lock + (int64_t)(((i128)patch->mod_freq_q16 * (i128)t_q16) >> 16U);
-        int64_t mod_val = q16_tri_wave(mod_phase);
+        int64_t mod_val = q16_smooth_sine(mod_phase);
         int64_t fm_offset = (int64_t)(((i128)mod_val * (i128)eff_fm_idx) >> 16U);
 
-        int64_t raw_wave = q16_tri_wave(carrier_phase + fm_offset);
+        int64_t raw_wave = q16_smooth_sine(carrier_phase + fm_offset);
         if (i < sample_count / 4U) {
             env_q16 = q16_min(FLOW_Q16_ONE, env_q16 + patch->attack_step_q16);
         } else {
@@ -1403,47 +1415,86 @@ void flow_audio_synth_binaural_stereo_q16(const FlowAudioPatch64 *patch,
 
     int64_t lpf_alpha_q16 = (seed_style && seed_style->audio_lpf_cutoff_q16 > 4096)
         ? (int64_t)seed_style->audio_lpf_cutoff_q16
-        : 49152LL;
+        : 36864LL; /* Warm analog low-pass filter (cuts harsh high-frequency buzz) */
     int64_t cav_decay_q16 = av ? (int64_t)av->cavity_reverb_decay_q16 : 0LL;
     int64_t phase_lock    = av ? (int64_t)av->trimodal_phase_q16 : 0LL;
 
-    int64_t comb_l[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    int64_t comb_r[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    static int64_t s_phase_accum = 0LL;
+    static int64_t s_comb_l[8] = {0};
+    static int64_t s_comb_r[8] = {0};
+    static int64_t s_prev_l = 0LL, s_prev_r = 0LL;
+    static uint32_t s_vent_seed = 0x5A17C001U;
+    static uint32_t s_brown_seed = 0x87654321U;
+    static int64_t s_brown_l = 0LL, s_brown_r = 0LL;
+    static int64_t s_stream_env = 8192LL;
+
+    bool is_oneshot = (frame_count <= 128U);
+    int64_t comb_l[8] = {0}, comb_r[8] = {0};
     int64_t prev_l = 0LL, prev_r = 0LL;
     int64_t env_q16 = 0LL;
 
     for (size_t i = 0U; i < frame_count; ++i) {
-        int64_t t_center = (int64_t)i * eff_dt_q16;
+        int64_t t_center;
+        if (is_oneshot) {
+            t_center = (int64_t)i * eff_dt_q16;
+            if (i < frame_count / 4U) {
+                env_q16 = q16_min(FLOW_Q16_ONE, env_q16 + patch->attack_step_q16);
+            } else {
+                env_q16 = q16_max(8192LL, env_q16 - patch->decay_step_q16);
+            }
+        } else {
+            s_phase_accum += eff_dt_q16;
+            t_center = s_phase_accum;
+            if (s_stream_env < FLOW_Q16_ONE) {
+                s_stream_env = q16_min(FLOW_Q16_ONE, s_stream_env + 256LL);
+            }
+            env_q16 = s_stream_env;
+        }
+
         int64_t t_l = t_center + itd_dt_q16 * 64LL;
         int64_t t_r = t_center - itd_dt_q16 * 64LL;
 
-        int64_t mod_l = q16_tri_wave(phase_lock + (int64_t)(((i128)patch->mod_freq_q16 * (i128)t_l) >> 16U));
-        int64_t mod_r = q16_tri_wave(phase_lock + (int64_t)(((i128)patch->mod_freq_q16 * (i128)t_r) >> 16U));
+        int64_t mod_l = q16_smooth_sine(phase_lock + (int64_t)(((i128)patch->mod_freq_q16 * (i128)t_l) >> 16U));
+        int64_t mod_r = q16_smooth_sine(phase_lock + (int64_t)(((i128)patch->mod_freq_q16 * (i128)t_r) >> 16U));
         int64_t fm_l  = (int64_t)(((i128)mod_l * (i128)base_fm) >> 16U);
         int64_t fm_r  = (int64_t)(((i128)mod_r * (i128)base_fm) >> 16U);
 
-        int64_t wave_l = q16_tri_wave(phase_lock + flow_jet2_eval_taylor(patch->carrier_jet, t_l) + fm_l);
-        int64_t wave_r = q16_tri_wave(phase_lock + flow_jet2_eval_taylor(patch->carrier_jet, t_r) + fm_r);
+        /* Fundamental sine carrier + sub-octave warm body */
+        int64_t wave_l = q16_smooth_sine(phase_lock + flow_jet2_eval_taylor(patch->carrier_jet, t_l) + fm_l);
+        int64_t wave_r = q16_smooth_sine(phase_lock + flow_jet2_eval_taylor(patch->carrier_jet, t_r) + fm_r);
+        int64_t sub_l = q16_smooth_sine((phase_lock + flow_jet2_eval_taylor(patch->carrier_jet, t_l) + fm_l) >> 1U);
+        int64_t sub_r = q16_smooth_sine((phase_lock + flow_jet2_eval_taylor(patch->carrier_jet, t_r) + fm_r) >> 1U);
+        wave_l = (wave_l * 3LL + sub_l * 2LL) / 5LL;
+        wave_r = (wave_r * 3LL + sub_r * 2LL) / 5LL;
+
+        /* Pure 1/f^2 Brown Noise (Brownian motion leaky integrator: soothing warm waterfall/cabin air) */
+        s_brown_seed = s_brown_seed * 1664525U + 1013904223U;
+        int64_t white_l = (int64_t)(int16_t)(s_brown_seed & 0xFFFFU);
+        s_brown_seed = s_brown_seed * 1664525U + 1013904223U;
+        int64_t white_r = (int64_t)(int16_t)(s_brown_seed & 0xFFFFU);
+        s_brown_l = (s_brown_l * 62800LL + white_l * 2736LL) >> 16U;
+        s_brown_r = (s_brown_r * 62800LL + white_r * 2736LL) >> 16U;
+
+        /* Blend Brown noise as the primary calming soundscape */
+        wave_l = (wave_l * 1LL + s_brown_l * 4LL) / 5LL;
+        wave_r = (wave_r * 1LL + s_brown_r * 4LL) / 5LL;
 
         /* Add [720K..795K] 3rd-harmonic crystalline resonance overtone */
         if (thermal_res_gain_q16 > 0LL) {
-            int64_t harm_l = q16_tri_wave((phase_lock + flow_jet2_eval_taylor(patch->carrier_jet, t_l * 3LL)));
-            int64_t harm_r = q16_tri_wave((phase_lock + flow_jet2_eval_taylor(patch->carrier_jet, t_r * 3LL)));
-            wave_l += (int64_t)(((i128)harm_l * (i128)thermal_res_gain_q16) >> 17U);
-            wave_r += (int64_t)(((i128)harm_r * (i128)thermal_res_gain_q16) >> 17U);
+            int64_t harm_l = q16_smooth_sine(phase_lock + flow_jet2_eval_taylor(patch->carrier_jet, t_l * 3LL));
+            int64_t harm_r = q16_smooth_sine(phase_lock + flow_jet2_eval_taylor(patch->carrier_jet, t_r * 3LL));
+            wave_l += (int64_t)(((i128)harm_l * (i128)thermal_res_gain_q16) >> 18U);
+            wave_r += (int64_t)(((i128)harm_r * (i128)thermal_res_gain_q16) >> 18U);
         }
 
-        /* Add [X] Key -120K Pneumatic Decompression Sub-Bass & Hiss Sweep */
+        /* Add [X] Key -120K Pneumatic ASMR decompression breath / hiss sweep */
         if (purge_vent_active) {
-            int64_t vent_sub = q16_tri_wave((int64_t)(i * 720U) - (int64_t)(i * i * 2U));
-            wave_l = (wave_l >> 1U) + (vent_sub >> 1U);
-            wave_r = (wave_r >> 1U) + (vent_sub >> 1U);
-        }
-
-        if (i < frame_count / 4U) {
-            env_q16 = q16_min(FLOW_Q16_ONE, env_q16 + patch->attack_step_q16);
-        } else {
-            env_q16 = q16_max(8192LL, env_q16 - patch->decay_step_q16);
+            s_vent_seed = s_vent_seed * 1664525U + 1013904223U;
+            int64_t hiss = ((int64_t)(s_vent_seed & 0xFFFFU) - 32768LL) >> 2U;
+            int64_t vent_sub = q16_smooth_sine(t_center * 2LL) >> 1U;
+            int64_t vent_mix = (hiss >> 1U) + (vent_sub >> 1U);
+            wave_l = (wave_l >> 1U) + (vent_mix >> 1U);
+            wave_r = (wave_r >> 1U) + (vent_mix >> 1U);
         }
 
         int64_t dry_l = (int64_t)(((i128)wave_l * (i128)env_q16) >> 16U);
@@ -1454,21 +1505,26 @@ void flow_audio_synth_binaural_stereo_q16(const FlowAudioPatch64 *patch,
         /* Pinna elevation notch + SDF cavity comb reflection */
         size_t tap = i & 7U;
         size_t notch_idx = (i - pinna_notch_tap) & 7U;
-        int64_t wet_l = dry_l - (comb_l[notch_idx] >> 3U) + (int64_t)(((i128)comb_l[tap] * (i128)cav_decay_q16) >> 16U);
-        int64_t wet_r = dry_r - (comb_r[notch_idx] >> 3U) + (int64_t)(((i128)comb_r[tap] * (i128)cav_decay_q16) >> 16U);
+        int64_t *c_l = is_oneshot ? comb_l : s_comb_l;
+        int64_t *c_r = is_oneshot ? comb_r : s_comb_r;
+        int64_t *p_l = is_oneshot ? &prev_l : &s_prev_l;
+        int64_t *p_r = is_oneshot ? &prev_r : &s_prev_r;
+
+        int64_t wet_l = dry_l - (c_l[notch_idx] >> 3U) + (int64_t)(((i128)c_l[tap] * (i128)cav_decay_q16) >> 16U);
+        int64_t wet_r = dry_r - (c_r[notch_idx] >> 3U) + (int64_t)(((i128)c_r[tap] * (i128)cav_decay_q16) >> 16U);
 
         /* Coupled Seed Style Low-Pass Resonator Filter */
-        prev_l = prev_l + (int64_t)(((i128)(wet_l - prev_l) * (i128)lpf_alpha_q16) >> 16U);
-        prev_r = prev_r + (int64_t)(((i128)(wet_r - prev_r) * (i128)lpf_alpha_q16) >> 16U);
+        *p_l = *p_l + (int64_t)(((i128)(wet_l - *p_l) * (i128)lpf_alpha_q16) >> 16U);
+        *p_r = *p_r + (int64_t)(((i128)(wet_r - *p_r) * (i128)lpf_alpha_q16) >> 16U);
 
-        prev_l = q16_min(FLOW_Q16_ONE, q16_max(-FLOW_Q16_ONE, prev_l));
-        prev_r = q16_min(FLOW_Q16_ONE, q16_max(-FLOW_Q16_ONE, prev_r));
+        *p_l = q16_min(FLOW_Q16_ONE, q16_max(-FLOW_Q16_ONE, *p_l));
+        *p_r = q16_min(FLOW_Q16_ONE, q16_max(-FLOW_Q16_ONE, *p_r));
 
-        comb_l[tap] = prev_l;
-        comb_r[tap] = prev_r;
+        c_l[tap] = *p_l;
+        c_r[tap] = *p_r;
 
-        out_stereo_lr_q16[i * 2U + 0U] = prev_l;
-        out_stereo_lr_q16[i * 2U + 1U] = prev_r;
+        out_stereo_lr_q16[i * 2U + 0U] = *p_l;
+        out_stereo_lr_q16[i * 2U + 1U] = *p_r;
     }
 }
 

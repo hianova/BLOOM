@@ -25,15 +25,16 @@
 
 static FlowAudiovisualFrame64 s_live_av_frame;
 static FlowAudioPatch64 s_live_audio_patch = {
-    .carrier_jet = {0, 14417920, 1638400}, /* 220 Hz base + subtle chirp */
-    .mod_freq_q16 = 7208960,
-    .fm_index_q16 = 12288,
-    .attack_step_q16 = 4096,
-    .decay_step_q16 = 256,
+    .carrier_jet = {0, 3604480, 0}, /* 55 Hz (A1) warm deep spaceship drone */
+    .mod_freq_q16 = 1802240,        /* ~27.5 Hz sub-harmonic warmth */
+    .fm_index_q16 = 2048,           /* subtle organic warmth, zero harsh buzz */
+    .attack_step_q16 = 1024,
+    .decay_step_q16 = 64,
     .patch_id = 1U,
     .waveform_flags = 1U,
     .checksum = 0xCAFEBABEULL
 };
+static bool s_audio_muted = false;
 static uint32_t s_live_finish_class = 0U;
 static FlowGenerativeSeedStyle64 s_live_seed_style;
 static FlowSovereignGate64 s_live_sovereign_gate;
@@ -50,6 +51,9 @@ static FlowDebugLogEntry64 s_live_debug_logs[64];
 static FlowPipelineTelemetry64 s_live_pipeline_telemetry;
 static FlowLatexBoxNode64 s_live_latex_boxes[16];
 static FlowNarrativeDirector64 s_live_story_director;
+static FlowMoodboardPrefab64 s_live_moodboard;
+static uint32_t s_initial_mood_stage = 0U;
+static bool s_moodboard_initialized = false;
 static uint32_t s_target_fps = 120U;
 static bool s_vsync_enabled = true;
 static bool s_wallpaper_mode = false;
@@ -69,6 +73,13 @@ static void flow_audio_queue_callback(void *inUserData,
     size_t n_frames = inBuffer->mAudioDataBytesCapacity / (2U * sizeof(int16_t));
     if (n_frames > 256U) n_frames = 256U;
 
+    if (s_audio_muted) {
+        memset(out_s16, 0, n_frames * 2U * sizeof(int16_t));
+        inBuffer->mAudioDataByteSize = (UInt32)(n_frames * 2U * sizeof(int16_t));
+        AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, NULL);
+        return;
+    }
+
     bool purge_active = (s_live_purge_frames > 0U);
     if (s_live_purge_frames > 0U) {
         s_live_purge_frames--;
@@ -87,7 +98,7 @@ static void flow_audio_queue_callback(void *inUserData,
                                          n_frames,
                                          1365LL);
     for (size_t i = 0U; i < n_frames * 2U; ++i) {
-        int64_t v = (stereo_q16[i] * 7000LL) >> 16U;
+        int64_t v = (stereo_q16[i] * 1200LL) >> 16U;
         if (v > 32767LL) v = 32767LL;
         if (v < -32768LL) v = -32768LL;
         out_s16[i] = (int16_t)v;
@@ -100,6 +111,12 @@ static int cmp_double_asc(const void *a, const void *b) {
     double da = *(const double *)a;
     double db = *(const double *)b;
     return (da > db) - (da < db);
+}
+
+static inline int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
 }
 
 static NSString *load_metal_shader_with_ssot_abi(NSError **error) {
@@ -223,7 +240,7 @@ static void populate_host_uniforms(FlowGpuFrameUniforms256 *u,
     if (s_live_sovereign_gate.thermal_kelvin < FLOW_THERMAL_AMBIENT_KELVIN) {
         s_live_sovereign_gate.thermal_kelvin = (uint32_t)pkt->ricardian.thermal_kelvin;
     }
-    flow_av_resolve_frame64(220 * FLOW_Q16_ONE,
+    flow_av_resolve_frame64(55 * FLOW_Q16_ONE,
                             rs->doppler_factor_q16,
                             rs->proper_time_ratio_q16,
                             sdf_dist_q16,
@@ -388,6 +405,7 @@ static void flow_metal_sync_bus_slots(FlowMetalRenderer *r) {
     flow_metal_renderer_update_bus_slot(r, FLOW_BUS_SLOT_SOVEREIGN_GATE, &s_live_sovereign_gate);
     flow_metal_renderer_update_bus_slot(r, FLOW_BUS_SLOT_OBS_BRIDGE, &s_live_obs_bridge);
     flow_metal_renderer_update_bus_slot(r, FLOW_BUS_SLOT_STORY_DIRECTOR, &s_live_story_director);
+    flow_metal_renderer_update_bus_slot(r, FLOW_BUS_SLOT_MOODBOARD, &s_live_moodboard);
 }
 
 static void flow_metal_renderer_sync_buffers(FlowMetalRenderer *r,
@@ -418,6 +436,410 @@ static void flow_metal_encode_frame(id<MTLRenderCommandEncoder> enc, FlowMetalRe
             vertexStart:0
             vertexCount:4
           instanceCount:r->active_tile_count];
+}
+
+static const char *mood_stage_name(uint32_t stage_mode) {
+    switch (stage_mode & 3U) {
+        case FLOW_MOOD_STAGE_WINDOW_OPTICS:
+            return "Stage 1: Autumn Window Condensation & 2-Jet Rivulet Refraction";
+        case FLOW_MOOD_STAGE_PARTICLE_CORRIDOR:
+            return "Stage 2: Infinite 3D Hash-Lattice Point-Cloud Monoliths & Glitter Wave";
+        case FLOW_MOOD_STAGE_ISOMETRIC_DIORAMA:
+            return "Stage 3: Winter Shore Isometric CSG Cutaway Diorama Block";
+        default:
+            return "Stage 0: Classic Relativistic Space Citadel";
+    }
+}
+
+static bool load_moodboard_from_file_or_hex(const char *arg,
+                                            uint32_t preferred_stage,
+                                            FlowMoodboardPrefab64 *out_mb) {
+    if (!arg || !out_mb) return false;
+
+    /* 1. Try 128-Char Hex Share Code first */
+    if (strlen(arg) == 128U && flow_moodboard_decode_hex128(arg, out_mb)) {
+        if (preferred_stage < FLOW_MOOD_STAGE_COUNT) {
+            out_mb->stage_mode = preferred_stage;
+        }
+        return true;
+    }
+
+    /* 2. Load any image format (.jpg, .png, .ppm, .heic) via Cocoa NSImage / CGImage */
+    @autoreleasepool {
+        NSString *nsPath = [NSString stringWithUTF8String:arg];
+        NSImage *img = [[NSImage alloc] initWithContentsOfFile:nsPath];
+        if (!img) return false;
+
+        CGImageRef cgImg = [img CGImageForProposedRect:NULL context:nil hints:nil];
+        if (!cgImg) return false;
+
+        uint32_t w = (uint32_t)CGImageGetWidth(cgImg);
+        uint32_t h = (uint32_t)CGImageGetHeight(cgImg);
+        if (w < 4U || h < 4U) return false;
+
+        uint32_t samp_w = (w > 256U) ? 256U : w;
+        uint32_t samp_h = (h > 256U) ? 256U : h;
+        uint8_t *rgba = (uint8_t *)calloc((size_t)samp_w * (size_t)samp_h * 4U, 1U);
+        uint8_t *rgb  = (uint8_t *)calloc((size_t)samp_w * (size_t)samp_h * 3U, 1U);
+        if (!rgba || !rgb) {
+            free(rgba);
+            free(rgb);
+            return false;
+        }
+
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(rgba, samp_w, samp_h, 8, samp_w * 4U, cs,
+                                                 kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        CGColorSpaceRelease(cs);
+        if (!ctx) {
+            free(rgba);
+            free(rgb);
+            return false;
+        }
+        CGContextDrawImage(ctx, CGRectMake(0, 0, samp_w, samp_h), cgImg);
+        CGContextRelease(ctx);
+
+        for (uint32_t i = 0U; i < samp_w * samp_h; ++i) {
+            rgb[i * 3U + 0U] = rgba[i * 4U + 0U];
+            rgb[i * 3U + 1U] = rgba[i * 4U + 1U];
+            rgb[i * 3U + 2U] = rgba[i * 4U + 2U];
+        }
+
+        int rc = flow_moodboard_extract_from_rgb_buffer64(rgb, samp_w, samp_h, samp_w * 3U,
+                                                          preferred_stage, out_mb);
+        free(rgba);
+        free(rgb);
+        return (rc == 0);
+    }
+}
+
+static int render_moodboard_4k_ppm(const FlowMoodboardPrefab64 *mb, const char *out_ppm_path) {
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) return 1;
+
+        NSError *error = nil;
+        FlowMetalRenderer renderer;
+        if (!flow_metal_renderer_init(&renderer, device, MTLPixelFormatRGBA8Unorm, &error)) {
+            return 2;
+        }
+
+        const uint32_t W = FLOW_GAME_VIEWPORT_W;
+        const uint32_t H = FLOW_GAME_VIEWPORT_H;
+        MTLTextureDescriptor *tDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                         width:W
+                                                                                        height:H
+                                                                                     mipmapped:NO];
+        tDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        tDesc.storageMode = MTLStorageModeShared;
+        id<MTLTexture> renderTexture = [device newTextureWithDescriptor:tDesc];
+
+        FlowGameEngineState engine;
+        flow_game_init(&engine);
+        flow_svg_ui_compile_file("specs/cockpit_hud.svg",
+                                 s_live_svg_ui_nodes,
+                                 FLOW_SVG_UI_MAX_NODES,
+                                 &s_live_svg_ui_dom);
+        flow_broadcast_obs_init64(&s_live_obs_bridge, 0x4B01U, 0x4B02U, 0x4B03U);
+
+        s_live_moodboard = *mb;
+        flow_game_step(&engine, FLOW_Q16_ONE);
+        FlowGameFramePacket pkt;
+        if (!flow_game_poll_frame_packet(&engine, &pkt)) {
+            pkt.cine_camera = engine.cine_brain.resolved;
+            pkt.ricardian = engine.ricardian;
+            pkt.relative_scale = engine.relative_scale;
+            pkt.fps_governor = engine.fps_governor;
+        }
+        /* Clean full-frame 16:9 lookbook presentation without letterbox bars */
+        pkt.cine_camera.active_flags &= ~1U;
+
+        FlowGpuFrameUniforms256 u;
+        populate_host_uniforms(&u, W, H, 48U, &engine, &pkt, FLOW_GAME_TOTAL_TILES);
+        u.s1.cine_flags &= ~1U;
+        flow_svg_ui_bind_telemetry_q16(s_live_svg_ui_nodes,
+                                       s_live_svg_ui_dom.compiled_node_count,
+                                       u.s0.thermal_kelvin,
+                                       (int32_t)pkt.craft_vz_q16,
+                                       u.s1.vcam_id,
+                                       u.s3.dopamine_phase,
+                                       s_live_obs_bridge.broadcast_mode);
+
+        flow_metal_sync_bus_slots(&renderer);
+        flow_metal_renderer_sync_buffers(&renderer, NULL, FLOW_GAME_TOTAL_TILES, &u);
+
+        id<MTLCommandBuffer> cb = [renderer.queue commandBuffer];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = renderTexture;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0.003, 0.005, 0.012, 1.0);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        flow_metal_encode_frame(enc, &renderer);
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        uint8_t *readback = (uint8_t *)malloc((size_t)W * (size_t)H * 4U);
+        if (readback) {
+            [renderTexture getBytes:readback
+                        bytesPerRow:W * 4U
+                         fromRegion:MTLRegionMake2D(0, 0, W, H)
+                        mipmapLevel:0];
+            write_ppm_p6(out_ppm_path, readback, (int)W, (int)H);
+            free(readback);
+        }
+        flow_game_destroy(&engine);
+        return 0;
+    }
+}
+
+static int run_moodboard_gallery(void) {
+    static const char *const kMoodFiles[3] = {
+        "build/mood_1_window.ppm",
+        "build/mood_2_particles.ppm",
+        "build/mood_3_diorama.ppm"
+    };
+    printf("================================================================================\n");
+    printf("  BLOOM v%s: Moodboard-to-Prefab 4K Lookbook Gallery Generator\n", BLOOM_VERSION_STRING);
+    printf("================================================================================\n");
+    for (uint32_t mode = 1U; mode <= 3U; ++mode) {
+        FlowMoodboardPrefab64 mb;
+        flow_moodboard_init_preset64(&mb, mode);
+        char hex128[129];
+        flow_moodboard_encode_hex128(&mb, hex128);
+        int rc = render_moodboard_4k_ppm(&mb, kMoodFiles[mode - 1U]);
+        if (rc != 0) return rc;
+        printf("  ✓ %-26s -> %s\n", kMoodFiles[mode - 1U], mood_stage_name(mode));
+        printf("    Swatches: Sky=#%06X | Ground=#%06X | Accent=#%06X | Backdrop=#%06X\n",
+               mb.sky_rgb24, mb.ground_rgb24, mb.accent_rgb24, mb.backdrop_rgb24);
+        printf("    Hex128  : %.48s...\n", hex128);
+    }
+    printf("================================================================================\n");
+    return 0;
+}
+
+static bool write_wav_48k_stereo(const char *wav_path, const int16_t *pcm_stereo, uint32_t total_sample_frames) {
+    FILE *fp = fopen(wav_path, "wb");
+    if (!fp) return false;
+
+    uint32_t data_bytes = total_sample_frames * 2U * sizeof(int16_t);
+    uint32_t riff_size  = 36U + data_bytes;
+    uint32_t fmt_size   = 16U;
+    uint16_t audio_fmt  = 1U; /* PCM */
+    uint16_t channels   = 2U;
+    uint32_t sample_rate = FLOW_CINEMA_AUDIO_RATE_HZ;
+    uint32_t byte_rate   = sample_rate * channels * sizeof(int16_t);
+    uint16_t block_align = channels * sizeof(int16_t);
+    uint16_t bits_per_sample = 16U;
+
+    fwrite("RIFF", 1, 4, fp);
+    fwrite(&riff_size, 4, 1, fp);
+    fwrite("WAVEfmt ", 1, 8, fp);
+    fwrite(&fmt_size, 4, 1, fp);
+    fwrite(&audio_fmt, 2, 1, fp);
+    fwrite(&channels, 2, 1, fp);
+    fwrite(&sample_rate, 4, 1, fp);
+    fwrite(&byte_rate, 4, 1, fp);
+    fwrite(&block_align, 2, 1, fp);
+    fwrite(&bits_per_sample, 2, 1, fp);
+    fwrite("data", 1, 4, fp);
+    fwrite(&data_bytes, 4, 1, fp);
+    fwrite(pcm_stereo, 1, data_bytes, fp);
+    fclose(fp);
+    return true;
+}
+
+static bool export_cmx3600_edl(const char *edl_path,
+                               const FlowCinemaShot64 shots[FLOW_CINEMA_REEL_SHOT_COUNT]) {
+    FILE *fp = fopen(edl_path, "wb");
+    if (!fp) return false;
+
+    fprintf(fp, "TITLE: BLOOM_SOVEREIGN_CINEMA_REEL_24FPS\n");
+    fprintf(fp, "FCM: NON-DROP FRAME\n\n");
+
+    for (uint32_t s = 0U; s < FLOW_CINEMA_REEL_SHOT_COUNT; ++s) {
+        char tc_in[12], tc_out[12];
+        flow_cine_format_smpte_timecode(shots[s].start_frame, shots[s].fps_rate, tc_in);
+        flow_cine_format_smpte_timecode(shots[s].start_frame + shots[s].frame_count, shots[s].fps_rate, tc_out);
+        fprintf(fp, "%03u  AX       V     C        %s %s %s %s\n",
+                shots[s].shot_id, tc_in, tc_out, tc_in, tc_out);
+        fprintf(fp, "* FROM CLIP NAME: %s\n", mood_stage_name(shots[s].stage_mode));
+        fprintf(fp, "* BLOOM_64B_SHOT: VCAM=%u | AUDIO_HZ=%u | EDL_MAC=0x%016llX\n\n",
+                shots[s].vcam_id,
+                shots[s].audio_base_freq_hz,
+                (unsigned long long)shots[s].edl_signature_hash);
+    }
+    fclose(fp);
+    return true;
+}
+
+static int run_cinema_ffmpeg_mastering(const char *out_mp4_path) {
+    @autoreleasepool {
+        const uint32_t W = 1920U;
+        const uint32_t H = 1080U;
+        const uint32_t FPS = 24U;
+
+        FlowCinemaShot64 shots[FLOW_CINEMA_REEL_SHOT_COUNT];
+        flow_cine_build_default_reel64(shots, FPS);
+        uint32_t total_frames = 0U;
+        for (uint32_t s = 0U; s < FLOW_CINEMA_REEL_SHOT_COUNT; ++s) {
+            total_frames += shots[s].frame_count;
+        }
+        uint32_t total_audio_frames = total_frames * (FLOW_CINEMA_AUDIO_RATE_HZ / FPS);
+
+        printf("================================================================================\n");
+        printf("  BLOOM v%s: Zero-Temp-File FFmpeg Cinema Mastering & CMX 3600 EDL Pipeline\n", BLOOM_VERSION_STRING);
+        printf("================================================================================\n");
+
+        /* 1. Export CMX 3600 Non-Linear Editing Timeline (.edl) */
+        const char *edl_path = "build/bloom_cinema_reel.edl";
+        const char *wav_path = "build/bloom_cinema_audio.wav";
+        export_cmx3600_edl(edl_path, shots);
+        printf("  ✓ CMX 3600 EDL     : %s (4 Shots, %u Frames @ %ufps = %.1fs)\n",
+               edl_path, total_frames, FPS, (double)total_frames / (double)FPS);
+
+        /* 2. Synthesize Frame-Locked 48kHz Stereo Soundtrack */
+        int16_t *pcm_all = (int16_t *)calloc((size_t)total_audio_frames * 2U, sizeof(int16_t));
+        if (!pcm_all) return 1;
+        uint32_t pcm_cursor = 0U;
+        for (uint32_t s = 0U; s < FLOW_CINEMA_REEL_SHOT_COUNT; ++s) {
+            for (uint32_t f = 0U; f < shots[s].frame_count; ++f) {
+                flow_cine_synth_lockstep_audio48k(&shots[s],
+                                                  f,
+                                                  &pcm_all[pcm_cursor * 2U],
+                                                  shots[s].audio_samples_per_frame);
+                pcm_cursor += shots[s].audio_samples_per_frame;
+            }
+        }
+        write_wav_48k_stereo(wav_path, pcm_all, total_audio_frames);
+        free(pcm_all);
+        printf("  ✓ 48kHz Audio Lock : %s (%u Stereo Samples, 2000 samples/frame)\n",
+               wav_path, total_audio_frames);
+
+        /* 3. Initialize Metal Renderer & Open Zero-Temp-File FFmpeg Pipe */
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) return 2;
+
+        NSError *error = nil;
+        FlowMetalRenderer renderer;
+        if (!flow_metal_renderer_init(&renderer, device, MTLPixelFormatRGBA8Unorm, &error)) {
+            return 3;
+        }
+
+        MTLTextureDescriptor *tDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                         width:W
+                                                                                        height:H
+                                                                                     mipmapped:NO];
+        tDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        tDesc.storageMode = MTLStorageModeShared;
+        id<MTLTexture> renderTexture = [device newTextureWithDescriptor:tDesc];
+
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd),
+                 "ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgba -s %ux%u -r %u -i - "
+                 "-i \"%s\" -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p "
+                 "-c:a aac -b:a 192k -shortest \"%s\"",
+                 W, H, FPS, wav_path, out_mp4_path);
+
+        FILE *ff_pipe = popen(cmd, "w");
+        if (!ff_pipe) {
+            fprintf(stderr, "ERROR: Failed to open FFmpeg pipe.\n");
+            return 4;
+        }
+
+        FlowGameEngineState engine;
+        flow_game_init(&engine);
+        flow_svg_ui_compile_file("specs/cockpit_hud.svg",
+                                 s_live_svg_ui_nodes,
+                                 FLOW_SVG_UI_MAX_NODES,
+                                 &s_live_svg_ui_dom);
+        flow_broadcast_obs_init64(&s_live_obs_bridge, 0x4B01U, 0x4B02U, 0x4B03U);
+        flow_director_init64(&s_live_story_director);
+
+        uint8_t *frame_rgba = (uint8_t *)malloc((size_t)W * (size_t)H * 4U);
+        uint32_t global_frame = 0U;
+
+        for (uint32_t s = 0U; s < FLOW_CINEMA_REEL_SHOT_COUNT; ++s) {
+            const FlowCinemaShot64 *sh = &shots[s];
+            flow_moodboard_init_preset64(&s_live_moodboard, sh->stage_mode);
+            flow_cine_trigger_blend(&engine.cine_brain, sh->vcam_id, 0LL, FLOW_EASE_SMOOTHERSTEP_5);
+
+            char tc_in[12], tc_out[12];
+            flow_cine_format_smpte_timecode(sh->start_frame, FPS, tc_in);
+            flow_cine_format_smpte_timecode(sh->start_frame + sh->frame_count, FPS, tc_out);
+            printf("  ▶ Rendering Shot %u [%s -> %s] : %s\n",
+                   sh->shot_id, tc_in, tc_out, mood_stage_name(sh->stage_mode));
+
+            for (uint32_t f = 0U; f < sh->frame_count; ++f) {
+                flow_game_step(&engine, FLOW_Q16_ONE);
+                FlowGameFramePacket pkt;
+                if (!flow_game_poll_frame_packet(&engine, &pkt)) {
+                    pkt.cine_camera = engine.cine_brain.resolved;
+                    pkt.ricardian = engine.ricardian;
+                    pkt.relative_scale = engine.relative_scale;
+                    pkt.fps_governor = engine.fps_governor;
+                }
+                pkt.cine_camera.active_flags = sh->colorspace_flags;
+
+                /* Apply smooth deterministic camera dolly pan across the shot */
+                pkt.cine_camera.look_offset_xy_q16[0] += (int32_t)f * sh->dolly_vel_xyz_q16[0] - (24 * sh->dolly_vel_xyz_q16[0]);
+                pkt.cine_camera.look_offset_xy_q16[1] += (int32_t)f * sh->dolly_vel_xyz_q16[1] - (24 * sh->dolly_vel_xyz_q16[1]);
+
+                FlowGpuFrameUniforms256 u;
+                populate_host_uniforms(&u, W, H, global_frame * 2U, &engine, &pkt, FLOW_GAME_TOTAL_TILES);
+                u.s1.cine_flags = sh->colorspace_flags;
+
+                /* In Shot 4 (Diorama), animate the live X-Ray cutaway slice smoothly */
+                if (sh->xray_sweep_q16 > 0) {
+                    float sweep_t = (float)f / (float)(sh->frame_count > 1U ? sh->frame_count - 1U : 1U);
+                    float wave_t = (sweep_t < 0.5f) ? (sweep_t * 2.0f) : ((1.0f - sweep_t) * 2.0f);
+                    u.s3.xray_radius = wave_t * ((float)sh->xray_sweep_q16 / 65536.0f);
+                }
+
+                flow_svg_ui_bind_telemetry_q16(s_live_svg_ui_nodes,
+                                               s_live_svg_ui_dom.compiled_node_count,
+                                               u.s0.thermal_kelvin,
+                                               (int32_t)pkt.craft_vz_q16,
+                                               u.s1.vcam_id,
+                                               u.s3.dopamine_phase,
+                                               s_live_obs_bridge.broadcast_mode);
+
+                flow_metal_sync_bus_slots(&renderer);
+                flow_metal_renderer_sync_buffers(&renderer, NULL, FLOW_GAME_TOTAL_TILES, &u);
+
+                id<MTLCommandBuffer> cb = [renderer.queue commandBuffer];
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.colorAttachments[0].texture = renderTexture;
+                rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[0].clearColor = MTLClearColorMake(0.003, 0.005, 0.012, 1.0);
+                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+                id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+                flow_metal_encode_frame(enc, &renderer);
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+
+                [renderTexture getBytes:frame_rgba
+                            bytesPerRow:W * 4U
+                             fromRegion:MTLRegionMake2D(0, 0, W, H)
+                            mipmapLevel:0];
+                fwrite(frame_rgba, 1, (size_t)W * (size_t)H * 4U, ff_pipe);
+                global_frame++;
+            }
+        }
+
+        free(frame_rgba);
+        int ff_rc = pclose(ff_pipe);
+        flow_game_destroy(&engine);
+
+        printf("--------------------------------------------------------------------------------\n");
+        printf("  ✓ FFmpeg Master MP4: %s (Exit=%d, Zero Temp PPM Files Written!)\n", out_mp4_path, ff_rc);
+        printf("================================================================================\n");
+        return (ff_rc == 0) ? 0 : 5;
+    }
 }
 
 static int run_4k_benchmark(bool export_ppm) {
@@ -743,6 +1165,10 @@ static int run_4k_benchmark(bool export_ppm) {
         };
         flow_prefab_edit_init64(&s_live_prefab_edit, &s_live_prefab_inst);
         flow_director_init64(&s_live_story_director);
+        if (!s_moodboard_initialized) {
+            flow_moodboard_init_preset64(&s_live_moodboard, s_initial_mood_stage);
+            s_moodboard_initialized = true;
+        }
         memset(s_live_debug_logs, 0, sizeof(s_live_debug_logs));
         memset(&s_live_pipeline_telemetry, 0, sizeof(s_live_pipeline_telemetry));
 
@@ -942,6 +1368,25 @@ static int run_4k_benchmark(bool export_ppm) {
             flow_cine_trigger_blend(&_engine.cine_brain, FLOW_VCAM_COCKPIT_TACTICAL,
                                     20LL * FLOW_Q16_ONE, FLOW_EASE_SMOOTHERSTEP_5);
             break;
+        case 46: /* Key 'M': Toggle Audio Mute / Cinematic Spaceship Engine Ambient */
+            s_audio_muted = !s_audio_muted;
+            printf("[BLOOM AUDIO] Engine sound %s\n", s_audio_muted ? "MUTED" : "ACTIVE (55Hz Cinematic Sub-Bass)");
+            break;
+        case 11: { /* Key 'B': Cycle Fashion/Game Moodboard-to-Prefab Stages (0..3) */
+            uint32_t next_stage = (s_live_moodboard.stage_mode + 1U) & 3U;
+            flow_moodboard_init_preset64(&s_live_moodboard, next_stage);
+            flow_director_trigger_scene_transition64(&s_live_story_director,
+                                                     next_stage,
+                                                     _engine.current_layer,
+                                                     FLOW_TRANS_LIQUID_GLASS_WAVE,
+                                                     280U);
+            printf("[BLOOM MOODBOARD PREFAB] %s (Sky=#%06X Ground=#%06X Accent=#%06X)\n",
+                   mood_stage_name(next_stage),
+                   s_live_moodboard.sky_rgb24,
+                   s_live_moodboard.ground_rgb24,
+                   s_live_moodboard.accent_rgb24);
+            break;
+        }
         default:
             [super keyDown:event];
             break;
@@ -970,21 +1415,57 @@ static int run_4k_benchmark(bool export_ppm) {
     }
 }
 
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    NSTrackingAreaOptions options = (NSTrackingMouseMoved |
+                                     NSTrackingActiveAlways |
+                                     NSTrackingInVisibleRect);
+    NSTrackingArea *trackingArea = [[NSTrackingArea alloc] initWithRect:[self bounds]
+                                                                options:options
+                                                                  owner:self
+                                                               userInfo:nil];
+    [self addTrackingArea:trackingArea];
+}
+
+- (void)mouseMoved:(NSEvent *)event {
+    (void)event;
+    [self setNeedsDisplay:YES];
+}
+
 - (void)mouseDown:(NSEvent *)event {
     (void)event;
     _mousePressed = true;
     _mouseJustClicked = true;
     _dragDeltaXQ16 = 0;
+    /* Click in 3D viewport fires thruster impulse and camera response */
+    flow_game_input(&_engine, FLOW_Q16_ONE * 2, _pitch, _yaw, _roll, true);
+    flow_cine_add_trauma(&_engine.cine_brain, FLOW_Q16_ONE / 8);
 }
 
 - (void)mouseDragged:(NSEvent *)event {
-    _dragDeltaXQ16 += (int32_t)([event deltaX] * 256.0);
+    CGFloat dx = [event deltaX];
+    CGFloat dy = [event deltaY];
+    _dragDeltaXQ16 += (int32_t)(dx * 256.0);
+    /* Flight steering via mouse drag (Yaw & Pitch) */
+    _yaw = clamp_i32(_yaw + (int32_t)(dx * 128.0), -FLOW_Q16_ONE / 2, FLOW_Q16_ONE / 2);
+    _pitch = clamp_i32(_pitch - (int32_t)(dy * 128.0), -FLOW_Q16_ONE / 2, FLOW_Q16_ONE / 2);
 }
 
 - (void)mouseUp:(NSEvent *)event {
     (void)event;
     _mousePressed = false;
     _dragDeltaXQ16 = 0;
+    _yaw = 0;
+    _pitch = 0;
+}
+
+- (void)scrollWheel:(NSEvent *)event {
+    CGFloat dy = [event scrollingDeltaY];
+    if (dy > 0.1) {
+        _throttle = clamp_i32(_throttle + FLOW_Q16_ONE / 3, FLOW_Q16_ONE / 4, FLOW_Q16_ONE * 3);
+    } else if (dy < -0.1) {
+        _throttle = clamp_i32(_throttle - FLOW_Q16_ONE / 3, FLOW_Q16_ONE / 4, FLOW_Q16_ONE * 3);
+    }
 }
 
 - (void)rightMouseDown:(NSEvent *)event {
@@ -1046,6 +1527,22 @@ static int run_4k_benchmark(bool export_ppm) {
                                              norm_x_q16,
                                              norm_y_q16,
                                              s_live_av_frame.cavity_resonance_q16);
+        } else {
+            NSWindow *win = [self window];
+            if (win != nil) {
+                NSPoint mouseLoc = [win mouseLocationOutsideOfEventStream];
+                NSRect b = [self bounds];
+                int32_t norm_x_q16 = (b.size.width > 1.0)
+                    ? (int32_t)(((mouseLoc.x / b.size.width) * 2.0 - 1.0) * 65536.0)
+                    : 0;
+                int32_t norm_y_q16 = (b.size.height > 1.0)
+                    ? (int32_t)(((mouseLoc.y / b.size.height) * 2.0 - 1.0) * 65536.0)
+                    : 0;
+                flow_wallpaper_step_parallax_q16(&s_live_wallpaper,
+                                                 norm_x_q16,
+                                                 norm_y_q16,
+                                                 s_live_av_frame.cavity_resonance_q16);
+            }
         }
 
         FlowGpuFrameUniforms256 u;
@@ -1216,7 +1713,13 @@ int main(int argc, char *argv[]) {
     bool is_bench = false;
     bool is_storyboard = false;
     bool is_headless = false;
+    bool is_mood_gallery = false;
     const char *wp_export_path = NULL;
+    const char *import_mood_arg = NULL;
+    const char *mood_out_ppm = NULL;
+    const char *cinema_out_mp4 = NULL;
+    uint32_t cli_mood_stage = FLOW_MOOD_STAGE_AUTO_DETECT;
+
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--bench") == 0) {
             is_bench = true;
@@ -1224,6 +1727,19 @@ int main(int argc, char *argv[]) {
             is_storyboard = true;
         } else if (strcmp(argv[i], "--headless") == 0) {
             is_headless = true;
+        } else if (strcmp(argv[i], "--mood-gallery") == 0) {
+            is_mood_gallery = true;
+        } else if (strcmp(argv[i], "--cinema-reel") == 0) {
+            cinema_out_mp4 = "build/bloom_cinema_reel.mp4";
+        } else if (strcmp(argv[i], "--cinema-out") == 0 && (i + 1) < argc) {
+            cinema_out_mp4 = argv[++i];
+        } else if (strcmp(argv[i], "--mood") == 0 && (i + 1) < argc) {
+            cli_mood_stage = (uint32_t)strtoul(argv[++i], NULL, 10) & 3U;
+            s_initial_mood_stage = cli_mood_stage;
+        } else if (strcmp(argv[i], "--import-mood") == 0 && (i + 1) < argc) {
+            import_mood_arg = argv[++i];
+        } else if (strcmp(argv[i], "--mood-out") == 0 && (i + 1) < argc) {
+            mood_out_ppm = argv[++i];
         } else if (strcmp(argv[i], "--wallpaper") == 0) {
             s_wallpaper_mode = true;
         } else if (strcmp(argv[i], "--wallpaper-audio") == 0) {
@@ -1240,6 +1756,52 @@ int main(int argc, char *argv[]) {
             printf("BLOOM v%s (Pure C17 / Metal Deterministic Simulation Engine)\n", BLOOM_VERSION_STRING);
             return 0;
         }
+    }
+
+    if (cinema_out_mp4 != NULL) {
+        return run_cinema_ffmpeg_mastering(cinema_out_mp4);
+    }
+
+    if (is_mood_gallery) {
+        return run_moodboard_gallery();
+    }
+
+    if (import_mood_arg != NULL) {
+        if (!load_moodboard_from_file_or_hex(import_mood_arg, cli_mood_stage, &s_live_moodboard)) {
+            fprintf(stderr, "ERROR: Failed to extract Moodboard Prefab from '%s'\n", import_mood_arg);
+            return 1;
+        }
+        s_moodboard_initialized = true;
+        FlowPrefabDesc64 comp_prefab;
+        FlowArtStyle64 comp_style;
+        flow_moodboard_to_prefab_and_style64(&s_live_moodboard, &comp_prefab, &comp_style);
+        char hex128[129];
+        flow_moodboard_encode_hex128(&s_live_moodboard, hex128);
+        printf("[BLOOM MOODBOARD IMPORTER] Direct Image/Hex -> 64B Prefab & ArtStyle Compiled!\n");
+        printf("  ✓ Source       : %s\n", import_mood_arg);
+        printf("  ✓ Stage Mode   : %s\n", mood_stage_name(s_live_moodboard.stage_mode));
+        printf("  ✓ Swatches     : Sky=#%06X | Ground=#%06X | Accent=#%06X | Backdrop=#%06X\n",
+               s_live_moodboard.sky_rgb24,
+               s_live_moodboard.ground_rgb24,
+               s_live_moodboard.accent_rgb24,
+               s_live_moodboard.backdrop_rgb24);
+        printf("  ✓ Prefab SSOT  : ID=%u | Assembly=%u | Hash=0x%016llX\n",
+               comp_prefab.prefab_id,
+               comp_prefab.assembly_index,
+               (unsigned long long)comp_prefab.ssot_hash);
+        printf("  ✓ Share Hex128 : %s\n", hex128);
+        if (mood_out_ppm != NULL) {
+            int rc = render_moodboard_4k_ppm(&s_live_moodboard, mood_out_ppm);
+            if (rc == 0) {
+                printf("  ✓ 4K Render    : %s (3840x2160 P6)\n", mood_out_ppm);
+            }
+            return rc;
+        }
+    } else if (mood_out_ppm != NULL) {
+        uint32_t st = (cli_mood_stage < FLOW_MOOD_STAGE_COUNT) ? cli_mood_stage : FLOW_MOOD_STAGE_ISOMETRIC_DIORAMA;
+        flow_moodboard_init_preset64(&s_live_moodboard, st);
+        s_moodboard_initialized = true;
+        return render_moodboard_4k_ppm(&s_live_moodboard, mood_out_ppm);
     }
 
     if (wp_export_path != NULL) {
@@ -1290,6 +1852,7 @@ int main(int argc, char *argv[]) {
                                                        styleMask:styleMask
                                                          backing:NSBackingStoreBuffered
                                                            defer:NO];
+        [window setAcceptsMouseMovedEvents:YES];
         if (s_wallpaper_mode) {
             [window setLevel:CGWindowLevelForKey(kCGDesktopWindowLevelKey)];
             [window setCollectionBehavior:(NSWindowCollectionBehaviorCanJoinAllSpaces |
@@ -1300,7 +1863,7 @@ int main(int argc, char *argv[]) {
             printf("[BLOOM WALLPAPER ENGINE] Attached to macOS Desktop Layer (kCGDesktopWindowLevelKey, Click-Through=ON, Audio=%s)\n",
                    s_wallpaper_audio ? "ON" : "MUTED");
         } else {
-            [window setTitle:@"BLOOM v1.0.0: Pure C17 / Metal Engine [Keys: WASD/Space | V: VSync | G: FPS Gov | C/1-4: VCam]"];
+            [window setTitle:@"BLOOM v1.0.0: Pure C17 / Metal Engine [B: Moodboard | WASD: Flight | M: Mute | V: VSync | G: FPS Gov | C/1-4: VCam | K: Finisher]"];
         }
         FlowGameView *view = [[FlowGameView alloc] initWithFrame:frame];
         [window setContentView:view];

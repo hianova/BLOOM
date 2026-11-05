@@ -258,6 +258,536 @@ FLOW_GPU_INLINE float eval_7seg_digit_sdf(float2 p, uint digit) {
     return d;
 }
 
+FLOW_GPU_INLINE float3 unpack_rgb24(uint rgb24) {
+    return float3(float((rgb24 >> 16U) & 0xFFU),
+                  float((rgb24 >> 8U)  & 0xFFU),
+                  float(rgb24          & 0xFFU)) * (1.0f / 255.0f);
+}
+
+/*
+ * ============================================================================
+ * Moodboard Stage 1: Autumn Train Window Condensation, Gravity Rivulet Wiping
+ *                    & 2-Jet Surface Normal Snell's Law Refraction
+ * ============================================================================
+ */
+FLOW_GPU_INLINE float3 eval_mood_window_optics(
+    float2 uv_raw,
+    float2 look_off,
+    float time_sec,
+    float3 sky_col,
+    float3 ground_col,
+    float3 accent_col,
+    float3 backdrop_col,
+    float fog_condense,
+    float rivulet_strength
+) {
+    /* Linearize sRGB moodboard swatches before physical HDR lighting */
+    float3 sky_lin      = sky_col * sky_col;
+    float3 ground_lin   = ground_col * ground_col;
+    float3 accent_lin   = accent_col * accent_col;
+    float3 backdrop_lin = backdrop_col * backdrop_col * 0.14f;
+
+    float2 w_uv = uv_raw - look_off * 0.14f;
+    float2 win_half = float2(0.215f, 0.365f);
+    float win_rx = 0.052f;
+    float2 q_win = abs(w_uv) - win_half + float2(win_rx);
+    float d_win = min(max(q_win.x, q_win.y), 0.0f) + length(max(q_win, 0.0f)) - win_rx;
+
+    /* Outside Window: Dark Train Cabin Interior Silhouette + Rubber Gasket Bevel */
+    if (d_win > 0.0f) {
+        float gasket = smoothstep(0.024f, 0.002f, d_win);
+        float bevel_rim = exp(-abs(d_win - 0.006f) * 360.0f) * 0.035f;
+        float bounce = exp(-d_win * 16.0f) * 0.025f;
+        float3 cab_col = backdrop_lin + (sky_lin * 0.30f + ground_lin * 0.70f) * bounce;
+        return mix(cab_col, float3(0.002f, 0.0025f, 0.002f), gasket) + accent_lin * bevel_rim;
+    }
+
+    /* Inside Window Glass: Evaluate Gravity Rivulet Wiping State & 2-Jet Meniscus Gradient */
+    float wipe_clear = 0.0f;
+    float2 grad_h = float2(0.0f);
+    float meniscus_rim = 0.0f;
+
+    /* Primary & secondary rivulet column bands */
+    for (int layer = 0; layer < 2; ++layer) {
+        float freq = (layer == 0) ? 26.0f : 48.0f;
+        float u_x = (w_uv.x + float(layer) * 0.073f) * freq;
+        float cid = floor(u_x);
+        float h_col = fract(sin(cid * 127.1f + float(layer) * 311.7f) * 43758.5453f);
+
+        if (h_col > 0.32f) {
+            float y_head = -0.06f + 0.12f * fract(h_col * 13.7f)
+                         - 0.020f * sin(time_sec * 0.35f + h_col * 6.28f);
+            if (w_uv.y > y_head) {
+                float v_prog = clamp((w_uv.y - y_head) * 18.0f, 0.0f, 1.0f);
+                float wobble = 0.13f * sin(w_uv.y * 24.0f + h_col * 19.0f)
+                             + 0.06f * cos(w_uv.y * 58.0f - h_col * 11.0f);
+                float local_x = (u_x - cid - 0.5f) - wobble;
+                float track_w = (0.16f + 0.15f * fract(h_col * 5.3f)) * (0.72f + 0.28f * v_prog);
+                float norm_dx = local_x / max(track_w, 0.05f);
+
+                if (abs(norm_dx) < 1.35f) {
+                    /* Droplet wipes away micro-condensation inside the track */
+                    float w_mask = smoothstep(1.10f, 0.25f, abs(norm_dx)) * v_prog;
+                    wipe_clear = max(wipe_clear, w_mask * rivulet_strength);
+
+                    /* 2-Jet derivative grad(h) of the curved water meniscus */
+                    float env = exp(-norm_dx * norm_dx * 2.4f) * v_prog * rivulet_strength;
+                    grad_h.x += -norm_dx * env * 0.18f;
+                    grad_h.y += -0.14f * env;
+                    meniscus_rim += smoothstep(0.50f, 0.90f, abs(norm_dx)) * smoothstep(1.30f, 0.90f, abs(norm_dx)) * v_prog;
+                }
+            }
+        }
+    }
+
+    /* Condensation Mist Field (thick in lower 60% of window, wiped clean inside rivulet trails) */
+    float mist_vertical = smoothstep(-0.07f, 0.06f, w_uv.y);
+    float raw_fog = mist_vertical * fog_condense;
+    float active_fog = clamp(raw_fog * (1.0f - wipe_clear * 0.92f), 0.0f, 1.0f);
+
+    /* Micro-droplet grain normal perturbation in unwiped condensation zones */
+    float2 bead_uv = w_uv * 260.0f;
+    float2 bead_id = floor(bead_uv);
+    float2 bead_lc = bead_uv - bead_id - float2(0.5f);
+    float bead_h = fract(sin(dot(bead_id, float2(12.9898f, 78.233f))) * 43758.5f);
+    float droplet_lens = 0.0f;
+    if (bead_h > 0.30f && active_fog > 0.05f) {
+        float b_rad = length(bead_lc);
+        if (b_rad < 0.44f) {
+            grad_h = grad_h - bead_lc * (active_fog * 0.09f);
+            droplet_lens = (0.44f - b_rad) * active_fog;
+        }
+    }
+
+    /* Snell's Law Refracted Exterior Sampling (motion-blurred autumn field & cerulean sky) */
+    float2 ext_uv = w_uv + grad_h;
+    float horizon_y = -0.025f + 0.012f * sin(ext_uv.x * 7.5f) - 0.006f * cos(ext_uv.x * 19.0f);
+
+    /* Cerulean sky gradient from zenith to warm horizon haze */
+    float sky_t = clamp((-ext_uv.y + 0.04f) * 2.5f, 0.0f, 1.0f);
+    float3 sky_grad = mix(mix(sky_lin, accent_lin, 0.55f), sky_lin * 0.85f, sky_t);
+
+    /* Rich golden-amber autumn foliage with depth shading */
+    float motion_streak = sin(ext_uv.y * 75.0f + sin(ext_uv.x * 5.5f - time_sec * 1.4f) * 2.2f) * 0.08f;
+    float bottom_shade = smoothstep(0.06f, 0.35f, ext_uv.y);
+    float3 autumn_col = ground_lin * (1.18f + motion_streak) * (1.0f - 0.58f * bottom_shade);
+
+    /* Distant mountain silhouette haze band at horizon */
+    float mountain_band = exp(-abs(ext_uv.y - horizon_y) * 34.0f);
+    float blend_ground = smoothstep(horizon_y - 0.032f, horizon_y + 0.042f, ext_uv.y);
+    float3 ext_col = mix(sky_grad, autumn_col, blend_ground);
+    ext_col = mix(ext_col, mix(sky_lin, ground_lin, 0.38f) * 0.65f, mountain_band * 0.55f);
+
+    /* Mie forward scattering on fogged glass vs. dark crisp contrast inside wiped rivulets */
+    float3 mist_scatter = mix(accent_lin * 0.85f, mix(sky_lin, ground_lin, 0.62f) + float3(0.06f), 0.65f);
+    float3 glass_col = mix(ext_col, mist_scatter, active_fog * 0.38f) + accent_lin * (droplet_lens * 0.22f);
+
+    /* Meniscus dark refractive channel & sky-blue caustic highlight along upper rivulet heads */
+    float caustic_sky = clamp(-grad_h.x * 6.0f + wipe_clear * 0.45f, 0.0f, 1.0f) * smoothstep(0.09f, -0.05f, w_uv.y);
+    glass_col *= (1.0f - 0.48f * clamp(meniscus_rim, 0.0f, 1.0f) * smoothstep(-0.03f, 0.22f, w_uv.y));
+    glass_col *= (1.0f - 0.22f * wipe_clear * smoothstep(0.02f, 0.28f, w_uv.y));
+    glass_col += mix(sky_lin, accent_lin, 0.55f) * caustic_sky * 0.55f;
+
+    /* Inner window gasket soft shadow */
+    float edge_ao = smoothstep(0.0f, -0.022f, d_win);
+    return glass_col * (0.18f + 0.82f * edge_ao);
+}
+
+/*
+ * ============================================================================
+ * Moodboard Stage 2: Infinite 3D Hash-Lattice Point-Cloud Monolith Corridors,
+ *                    Anamorphic Horizon Singularity & Glittering Wave Path
+ * ============================================================================
+ */
+FLOW_GPU_INLINE float3 eval_mood_particle_corridor(
+    float2 uv_rot,
+    float2 look_off,
+    float time_sec,
+    float3 sky_col,
+    float3 ground_col,
+    float3 accent_col,
+    float particle_density,
+    float singularity_gain
+) {
+    float3 sky_lin    = sky_col * sky_col;
+    float3 ground_lin = ground_col * ground_col * 0.18f;
+    float3 accent_lin = accent_col * accent_col;
+
+    float2 vp = float2(look_off.x * 0.18f, -0.015f + look_off.y * 0.12f);
+    float2 duv = uv_rot - vp;
+
+    /* 1. Deep Void + Atmospheric Horizon Haze + Anamorphic Singularity Core */
+    float3 col = ground_lin * 0.25f;
+    float r_core = length(duv);
+    float horizon_band = exp(-abs(duv.y) * 24.0f) * exp(-abs(duv.x) * 1.6f);
+    col += sky_lin * horizon_band * 0.85f;
+
+    float core_energy = (0.00055f / (r_core * r_core + 0.00018f) + exp(-r_core * 26.0f) * 1.35f) * singularity_gain;
+    float anamorphic_streak = exp(-abs(duv.y) * 240.0f) * exp(-abs(duv.x) * 4.5f) * 1.85f * singularity_gain;
+    col += accent_lin * core_energy + mix(accent_lin, float3(0.65f, 0.85f, 1.0f), 0.40f) * anamorphic_streak;
+
+    /* 2. Infinite Volumetric Point-Cloud Monolith Corridors (Left & Right Perspective Slabs) */
+    float abs_x = abs(duv.x);
+    if (abs_x > 0.035f && duv.y < 0.045f) {
+        float density_thresh = clamp(0.80f - particle_density * 0.22f, 0.55f, 0.86f);
+        for (int k = 0; k < 4; ++k) {
+            float wall_x = 0.36f + float(k) * 0.32f;
+            float z_p = wall_x / abs_x;
+            float y_p = -duv.y * z_p;
+
+            if (z_p > 1.2f && z_p < 24.0f && y_p > -0.15f && y_p < 1.65f) {
+                float z_travel = z_p + time_sec * 0.45f + float(k) * 1.7f;
+                float pillar_mod = fract(z_travel * 0.55f);
+                /* Monolith vertical columns with dark architectural gaps between pillars */
+                if (pillar_mod < 0.58f) {
+                    /* Screen-adaptive lattice so particles stay crisp micro-sparks at all depths */
+                    float2 grid_uv = float2(z_travel * 36.0f, (-duv.y) * 240.0f + float(k) * 19.0f);
+                    float2 cell_id = floor(grid_uv);
+                    float2 local_p = grid_uv - cell_id - float2(0.5f);
+                    float s_dx = (duv.x >= 0.0f) ? 1.0f : -1.0f;
+                    float h_cell = fract(sin(dot(cell_id + float2(s_dx * 17.0f, float(k) * 31.0f),
+                                                 float2(127.1f, 311.7f))) * 43758.5453f);
+                    if (h_cell > density_thresh) {
+                        float2 jitter = float2(fract(h_cell * 13.3f) - 0.5f, fract(h_cell * 29.7f) - 0.5f) * 0.52f;
+                        float d_pt = length(local_p - jitter);
+                        float spark = smoothstep(0.32f, 0.04f, d_pt) * (0.40f + 0.60f * sin(time_sec * 3.2f + h_cell * 40.0f));
+                        float v_fade = smoothstep(1.65f, 0.15f, y_p) * smoothstep(-0.15f, 0.02f, y_p);
+                        float z_fade = exp(-z_p * 0.14f) * smoothstep(1.2f, 2.4f, z_p);
+                        float warm_mix = exp(-abs(duv.x) * 3.2f) * exp(-abs(duv.y) * 8.0f);
+                        float3 pt_col = mix(sky_lin * 1.8f + float3(0.08f, 0.14f, 0.28f),
+                                            accent_lin * 1.25f,
+                                            0.35f + 0.65f * warm_mix);
+                        col += pt_col * spark * v_fade * z_fade * 0.95f;
+                    }
+                }
+            }
+        }
+    }
+
+    /* 3. Undulating Particle Wave Sea & Central Glittering Starlight Path (duv.y > 0) */
+    if (duv.y > 0.002f) {
+        float z_g = 0.36f / (duv.y + 0.008f);
+        if (z_g < 30.0f) {
+            float x_g = duv.x * z_g;
+            float z_move = z_g - time_sec * 0.42f;
+            float wave = 0.10f * sin(x_g * 3.4f + z_move * 1.8f)
+                       + 0.05f * cos(x_g * 6.8f - z_move * 2.6f + time_sec * 0.6f);
+
+            /* Keep wave particle grid fine and dense across the entire ocean floor */
+            float2 g_uv = float2(duv.x * 320.0f + wave * 12.0f, z_move * 34.0f + wave * 6.0f);
+            float2 g_id = floor(g_uv);
+            float2 g_lc = g_uv - g_id - float2(0.5f);
+            float h_g = fract(sin(dot(g_id, float2(41.31f, 289.73f))) * 43758.5453f);
+
+            /* Central meandering glittering reflection path under the singularity */
+            float x_path = 0.040f * sin(z_g * 0.95f - time_sec * 1.1f) + wave * 0.18f;
+            float path_env = exp(-abs(x_g - x_path) * (4.8f + 0.22f * z_g));
+            float d_dot = length(g_lc);
+            float dot_mask = smoothstep(0.34f, 0.05f, d_dot);
+            float dist_fade = exp(-z_g * 0.10f) * smoothstep(0.002f, 0.035f, duv.y);
+
+            /* Subtle deep-blue wave contour particles */
+            if (h_g > 0.48f) {
+                float wave_crest = clamp(0.45f + wave * 3.8f, 0.10f, 1.1f);
+                col += (sky_lin * 1.2f + float3(0.02f, 0.05f, 0.14f)) * (dot_mask * wave_crest * dist_fade * 0.42f);
+            }
+
+            /* Specular microfacet glitter sparks along the central starlight path */
+            float glitter_thresh = 0.82f - 0.52f * path_env * clamp(particle_density, 0.3f, 1.0f);
+            if (h_g > glitter_thresh) {
+                float twinkle = 0.50f + 0.50f * sin(time_sec * 5.5f + h_g * 62.8f);
+                col += accent_lin * (dot_mask * path_env * twinkle * dist_fade * 2.4f);
+            }
+        }
+    }
+
+    return col;
+}
+
+/*
+ * ============================================================================
+ * Moodboard Stage 3: "Winter Shore" Isometric CSG Cutaway Diorama Block
+ *                    (Snow Terrain + Geological Strata Cross-Section +
+ *                     Beer-Lambert Translucent Sea + 2400K Cabin Blackbody GI)
+ * ============================================================================
+ */
+FLOW_GPU_INLINE float eval_diorama_terrain_h(float2 xz) {
+    /* Diagonal shoreline separating upper-left snowy rocky ridge from lower-right sea basin */
+    float shore = xz.x * 0.72f + xz.y * 0.68f - 0.04f;
+    float base_slope = clamp(-shore * 0.38f + 0.02f, -0.19f, 0.24f);
+
+    /* Flat foundation terrace around the Nordic cabin at (-0.28, -0.22) */
+    float2 d_cab = xz - float2(-0.28f, -0.22f);
+    float cab_pad = exp(-dot(d_cab, d_cab) * 14.0f);
+
+    /* Multi-octave organic Nordic coastal rock crags (zero regular sine stripes) */
+    float n1 = sin(xz.x * 6.3f + sin(xz.y * 5.7f) * 1.4f) * cos(xz.y * 6.9f - sin(xz.x * 4.8f) * 1.3f);
+    float n2 = sin(xz.x * 14.7f - xz.y * 12.3f + sin(xz.x * 9.1f)) * 0.45f;
+    float n3 = cos(xz.x * 29.0f + xz.y * 27.0f) * 0.18f;
+    float crags = (n1 * 0.048f + n2 * 0.028f + n3 * 0.012f) * (1.0f - 0.78f * cab_pad);
+
+    /* Sea stack rocks emerging in the water basin */
+    float r1 = exp(-dot(xz - float2(0.46f, -0.18f), xz - float2(0.46f, -0.18f)) * 45.0f) * 0.15f;
+    float r2 = exp(-dot(xz - float2(0.12f,  0.48f), xz - float2(0.12f,  0.48f)) * 48.0f) * 0.14f;
+
+    float h_raw = base_slope + crags + r1 + r2;
+    return mix(h_raw, 0.135f, cab_pad * 0.85f);
+}
+
+FLOW_GPU_INLINE float2 map_diorama_solid(float3 p) {
+    float h_t = eval_diorama_terrain_h(float2(p.x, p.z));
+    float d_terr = (p.y - h_t) * 0.75f;
+    float mat_id = 1.0f; /* 1.0 = Snow/Rock Terrain */
+
+    /* Nordic Red Cabin seated firmly on the upper-left snowy terrace */
+    float3 q = p - float3(-0.28f, 0.205f, -0.22f);
+    float d_walls = sd_round_box(q - float3(0.0f, -0.015f, 0.0f), float3(0.145f, 0.085f, 0.115f), 0.004f);
+    float3 qr = q - float3(0.0f, 0.070f, 0.0f);
+    float d_roof = max(max(abs(qr.z) * 0.72f + qr.y - 0.082f, -qr.y - 0.012f),
+                       max(abs(qr.x) - 0.165f, abs(qr.z) - 0.138f));
+    float d_chimney = sd_round_box(q - float3(0.035f, 0.145f, -0.045f), float3(0.018f, 0.045f, 0.018f), 0.002f);
+
+    if (d_walls < d_terr) {
+        d_terr = d_walls;
+        mat_id = 2.0f; /* 2.0 = Nordic Red Cabin Wall & Glowing 2400K Windows */
+    }
+    if (d_roof < d_terr) {
+        d_terr = d_roof;
+        mat_id = 3.0f; /* 3.0 = Snow-Capped Gable Roof */
+    }
+    if (d_chimney < d_terr) {
+        d_terr = d_chimney;
+        mat_id = 4.0f; /* 4.0 = Soot-Black Chimney */
+    }
+
+    /* Wooden Pier & Pilings extending from cabin deck into the sea (+x direction) */
+    float3 pq = p - float3(0.12f, 0.022f, -0.04f);
+    float d_deck = sd_round_box(pq, float3(0.24f, 0.010f, 0.048f), 0.002f);
+    float2 piling_xz = float2(fract(pq.x * 7.5f) - 0.5f, abs(pq.z) - 0.038f);
+    float d_piling = max(length(piling_xz) - 0.012f, max(abs(pq.x) - 0.23f, abs(pq.y + 0.055f) - 0.060f));
+    float d_pier = min(d_deck, d_piling);
+    if (d_pier < d_terr) {
+        d_terr = d_pier;
+        mat_id = 5.0f; /* 5.0 = Weathered Timber Pier */
+    }
+
+    return float2(d_terr, mat_id);
+}
+
+FLOW_GPU_INLINE float3 eval_mood_isometric_diorama(
+    float2 uv_raw,
+    float2 look_off,
+    float3 craft_rot,
+    float time_sec,
+    float3 snow_col,
+    float3 sea_col,
+    float3 cabin_col,
+    float3 backdrop_col,
+    float diorama_cut,
+    float xray_radius,
+    float snow_cover
+) {
+    /* Warm Studio Backdrop with soft radial lighting */
+    float vig = 1.0f - 0.16f * dot(uv_raw, uv_raw);
+    float3 bg_col = backdrop_col * vig;
+
+    /* Isometric Telephoto Camera Rig looking from (+x, +y, +z) toward origin */
+    float yaw = 0.78f + look_off.x * 0.55f + craft_rot.y * 0.30f;
+    float pitch = clamp(0.50f - look_off.y * 0.30f + craft_rot.x * 0.20f, 0.28f, 0.82f);
+    float cy = cos(yaw), sy = sin(yaw);
+    float cp = cos(pitch), sp = sin(pitch);
+
+    float3 fwd = float3(-sy * cp, -sp, -cy * cp);
+    float3 rgt = float3(cy, 0.0f, -sy);
+    float3 up  = float3(rgt.y * fwd.z - rgt.z * fwd.y,
+                        rgt.z * fwd.x - rgt.x * fwd.z,
+                        rgt.x * fwd.y - rgt.y * fwd.x);
+
+    /* Ortho-telephoto rays for true miniature tabletop proportions */
+    float ortho_scale = 1.76f;
+    float3 ro = fwd * (-4.5f) + (rgt * uv_raw.x - up * (uv_raw.y + 0.025f)) * ortho_scale;
+    float3 rd = normalize(fwd + (rgt * uv_raw.x - up * uv_raw.y) * 0.12f);
+
+    /* Cutaway Bounding Box (interactive with X-Ray slider!) */
+    float active_cut = clamp(diorama_cut - xray_radius * 0.65f, 0.38f, 1.0f);
+    float3 box_b = float3(0.82f * active_cut, 0.42f, 0.82f);
+
+    /* Analytic Ray-AABB Slab Intersection */
+    float3 inv_rd = float3(1.0f / (rd.x + 1e-6f), 1.0f / (rd.y + 1e-6f), 1.0f / (rd.z + 1e-6f));
+    float3 t0s = (float3(0.0f) - box_b - ro) * inv_rd;
+    float3 t1s = ( box_b - ro) * inv_rd;
+    float3 tsmaller = float3(min(t0s.x, t1s.x), min(t0s.y, t1s.y), min(t0s.z, t1s.z));
+    float3 tbigger  = float3(max(t0s.x, t1s.x), max(t0s.y, t1s.y), max(t0s.z, t1s.z));
+    float t_near = max(max(tsmaller.x, tsmaller.y), max(tsmaller.z, 0.0f));
+    float t_far  = min(tbigger.x, min(tbigger.y, tbigger.z));
+
+    /* Tabletop Plane (y = -0.25f) Soft Contact Shadow */
+    float y_table = -0.25f;
+    float3 col = bg_col;
+    if (rd.y < -1e-4f) {
+        float t_tab = (y_table - ro.y) / rd.y;
+        if (t_tab > 0.0f) {
+            float3 p_tab = ro + rd * t_tab;
+            float2 q_sh = abs(float2(p_tab.x, p_tab.z) - float2(-0.05f, -0.05f)) - float2(box_b.x, box_b.z);
+            float d_sh = length(max(q_sh, 0.0f)) + min(max(q_sh.x, q_sh.y), 0.0f);
+            float sh = smoothstep(-0.06f, 0.36f, d_sh);
+            float ao_under = smoothstep(-0.20f, 0.10f, d_sh);
+            col = bg_col * (0.66f + 0.34f * (0.55f * sh + 0.45f * ao_under));
+        }
+    }
+
+    if (t_near >= t_far) {
+        return col;
+    }
+
+    /* Entry face normal on the cutaway bounding box */
+    float3 p_entry = ro + rd * t_near;
+    float3 d_face = abs(abs(p_entry) - box_b);
+    float3 n_box = float3(0.0f, 1.0f, 0.0f);
+    if (d_face.x <= d_face.y && d_face.x <= d_face.z) {
+        n_box = float3((p_entry.x >= 0.0f) ? 1.0f : -1.0f, 0.0f, 0.0f);
+    } else if (d_face.z <= d_face.x && d_face.z <= d_face.y) {
+        n_box = float3(0.0f, 0.0f, (p_entry.z >= 0.0f) ? 1.0f : -1.0f);
+    }
+
+    /* Raymarch inside the Cutaway Diorama Slab */
+    float t = t_near;
+    float2 hit = float2(100.0f, 0.0f);
+    float t_water_hit = -1.0f;
+    float3 n_water_hit = float3(0.0f, 1.0f, 0.0f);
+    float water_level = -0.015f;
+
+    for (int i = 0; i < 32; ++i) {
+        if (t > t_far) break;
+        float3 p = ro + rd * t;
+        if (p.y < y_table) break;
+
+        /* Check if ray enters the translucent sea volume */
+        float wave_y = water_level
+                     + 0.0045f * sin(p.x * 26.0f + time_sec * 2.2f + sin(p.z * 14.0f))
+                     * cos(p.z * 24.0f - time_sec * 1.7f);
+        float h_terr_here = eval_diorama_terrain_h(float2(p.x, p.z));
+        if (t_water_hit < 0.0f && p.y <= wave_y && p.y > h_terr_here) {
+            t_water_hit = t;
+            if (t <= t_near + 0.008f && abs(n_box.y) < 0.1f) {
+                n_water_hit = n_box; /* Sliced vertical sea cross-section wall! */
+            } else {
+                float wx = 0.11f * cos(p.x * 26.0f + time_sec * 2.2f) * cos(p.z * 24.0f - time_sec * 1.7f);
+                float wz = -0.10f * sin(p.x * 26.0f + time_sec * 2.2f) * sin(p.z * 24.0f - time_sec * 1.7f);
+                n_water_hit = normalize(float3(-wx, 1.0f, -wz));
+            }
+        }
+
+        hit = map_diorama_solid(p);
+        if (hit.x < 0.0025f) break;
+        t += max(hit.x * 0.85f, 0.008f);
+    }
+
+    /* Key light from front-top-right so both cutaway walls and terrain are well-illuminated */
+    float3 sun_dir = normalize(float3(0.48f, 0.76f, 0.44f));
+    float3 cabin_light_pos = float3(-0.14f, 0.16f, -0.10f);
+    float3 warm_2400k = float3(2.2f, 1.15f, 0.30f);
+
+    if (hit.x < 0.012f && t <= t_far) {
+        float3 pos = ro + rd * t;
+        float2 pos_xz = float2(pos.x, pos.z);
+        bool is_cut_wall = (t <= t_near + 0.010f && abs(n_box.y) < 0.1f && pos.y < eval_diorama_terrain_h(pos_xz));
+
+        float3 nor = n_box;
+        if (!is_cut_wall) {
+            const float2 e = float2(0.0025f, -0.0025f);
+            const float3 exyy = float3(e.x, e.y, e.y);
+            const float3 eyyx = float3(e.y, e.y, e.x);
+            const float3 eyxy = float3(e.y, e.x, e.y);
+            const float3 exxx = float3(e.x, e.x, e.x);
+            nor = normalize(
+                exyy * map_diorama_solid(pos + exyy).x +
+                eyyx * map_diorama_solid(pos + eyyx).x +
+                eyxy * map_diorama_solid(pos + eyxy).x +
+                exxx * map_diorama_solid(pos + exxx).x
+            );
+        }
+
+        float diff = max(dot(nor, sun_dir), 0.0f);
+        float amb  = 0.46f + 0.24f * nor.y;
+        float3 to_cab = cabin_light_pos - pos;
+        float d_cab = length(to_cab);
+        float cab_gi = max(dot(nor, to_cab / max(d_cab, 0.05f)), 0.0f) / (1.0f + d_cab * d_cab * 16.0f);
+
+        float3 surf_col = snow_col;
+        if (is_cut_wall) {
+            /* Geological Sedimentary Rock Strata on Cutaway Wall + Crisp White Snow Crust Lip */
+            float h_top = eval_diorama_terrain_h(pos_xz);
+            float strata = sin(pos.y * 42.0f + sin(pos.x * 9.0f - pos.z * 8.0f) * 1.8f) * 0.5f + 0.5f;
+            float grain = fract(sin(dot(floor(float2(pos.x + pos.z, pos.y) * 95.0f), float2(12.9898f, 78.233f))) * 43758.5f);
+            float3 rock_wall = mix(float3(0.28f, 0.27f, 0.25f), float3(0.48f, 0.45f, 0.42f), strata * 0.75f + grain * 0.25f);
+            float snow_lip = smoothstep(h_top - 0.024f, h_top - 0.006f, pos.y);
+            surf_col = mix(rock_wall, snow_col, snow_lip) * (diff * 0.65f + 0.48f);
+        } else if (hit.y < 1.5f) {
+            /* Terrain: Slope & Elevation Snow Cover vs. Dark Nordic Coastal Granite */
+            float rock_noise = sin(pos.x * 19.0f + sin(pos.z * 17.0f) * 1.6f) * cos(pos.z * 21.0f - pos.x * 13.0f);
+            float wet_shore = smoothstep(-0.025f, 0.025f, pos.y);
+            float snow_mask = smoothstep(0.86f - snow_cover * 0.35f, 0.94f - snow_cover * 0.25f,
+                                         nor.y + 0.06f * rock_noise) * wet_shore;
+            float3 granite = mix(float3(0.14f, 0.15f, 0.16f), float3(0.24f, 0.25f, 0.27f), 0.5f + 0.5f * rock_noise);
+            float3 albedo = mix(granite, snow_col, snow_mask);
+            surf_col = albedo * (diff * 0.68f + float3(0.45f, 0.48f, 0.54f) * amb)
+                     + warm_2400k * cab_gi * 0.72f;
+        } else if (hit.y < 2.5f) {
+            /* Nordic Falu-Red Cabin + Glowing 2400K Windows */
+            float3 q = pos - float3(-0.28f, 0.205f, -0.22f);
+            bool win_front = (q.z > 0.105f && abs(q.x + 0.030f) < 0.038f && abs(q.y - 0.010f) < 0.032f);
+            bool win_side  = (q.x > 0.135f && abs(q.z - 0.010f) < 0.036f && abs(q.y - 0.012f) < 0.040f);
+            if (win_front || win_side) {
+                float pane = step(0.005f, abs(q.x + 0.030f)) * step(0.005f, abs(q.y - 0.010f));
+                surf_col = mix(float3(0.28f, 0.12f, 0.06f), float3(1.0f, 0.86f, 0.48f), 0.35f + 0.65f * pane);
+            } else {
+                float plank = 0.92f + 0.08f * sin(q.x * 160.0f);
+                surf_col = cabin_col * plank * (diff * 0.72f + 0.42f) + warm_2400k * cab_gi * 0.35f;
+            }
+        } else if (hit.y < 3.5f) {
+            /* Snow-Capped Gable Roof */
+            float roof_snow = smoothstep(0.20f, 0.50f, nor.y);
+            surf_col = mix(float3(0.24f, 0.18f, 0.16f), snow_col, roof_snow) * (diff * 0.65f + 0.48f);
+        } else if (hit.y < 4.5f) {
+            /* Chimney */
+            surf_col = float3(0.10f, 0.11f, 0.13f) * (diff * 0.7f + 0.3f);
+        } else {
+            /* Wooden Pier + Snow Dusting */
+            float pier_snow = smoothstep(0.65f, 0.90f, nor.y) * 0.45f;
+            float3 wood = mix(float3(0.34f, 0.24f, 0.16f), snow_col, pier_snow);
+            surf_col = wood * (diff * 0.85f + 0.38f) + warm_2400k * cab_gi * 0.75f;
+        }
+
+        /* If ray passed through the Translucent Beer-Lambert Sea Volume before hitting seabed/rocks */
+        if (t_water_hit > 0.0f && t_water_hit < t) {
+            float water_depth = max(t - t_water_hit, 0.01f);
+            float3 p_w = ro + rd * t_water_hit;
+            float3 absorption = exp(-float3(2.8f, 1.05f, 0.75f) * water_depth * 3.6f);
+            float3 deep_sea = sea_col * (0.42f + 0.35f * max(dot(n_water_hit, sun_dir), 0.0f));
+            float3 water_body = mix(deep_sea, surf_col * float3(0.75f, 0.92f, 0.98f), absorption);
+
+            /* Fresnel sky reflection + 2400K Warm Cabin Window Reflection on water ripples! */
+            float fresnel = pow(1.0f - max(dot(-rd, n_water_hit), 0.0f), 4.0f);
+            float2 glow_dir = float2(p_w.x - cabin_light_pos.x, p_w.z - cabin_light_pos.z);
+            float glow_path = exp(-abs(glow_dir.x * 0.55f - glow_dir.y * 0.83f) * 9.5f)
+                            * exp(-length(glow_dir) * 2.4f);
+            float3 refl_rd = rd - 2.0f * dot(rd, n_water_hit) * n_water_hit;
+            float ripple_glint = pow(clamp(dot(refl_rd, normalize(cabin_light_pos - p_w)), 0.0f, 1.0f), 14.0f);
+            float3 cab_refl = warm_2400k * (glow_path * 0.42f + ripple_glint * 0.65f) * step(0.5f, n_water_hit.y);
+
+            /* Crisp glass-resin edge bevel on the sliced water block corner */
+            float cut_rim = (1.0f - step(0.5f, n_water_hit.y)) * 0.14f;
+            surf_col = mix(water_body, snow_col * 0.85f, fresnel * 0.38f + cut_rim) + cab_refl;
+        }
+
+        col = surf_col;
+    }
+
+    return col;
+}
+
+
 fragment float4 tile_fragment(
     VertexOut in [[stage_in]],
     constant FlowGpuFrameUniforms256 &u [[buffer(1)]],
@@ -306,6 +836,53 @@ fragment float4 tile_fragment(
     float cr = cos(roll_angle), sr = sin(roll_angle);
     float2 uv_rot = float2(uv.x * cr - uv.y * sr, uv.x * sr + uv.y * cr);
 
+    uint mood_stage = engine_bus[FLOW_BUS_SLOT_MOODBOARD].u32_quads[0].y & 3U;
+    float3 col = float3(0.0f);
+
+    if (mood_stage != 0U) {
+        float3 sky_col      = unpack_rgb24(engine_bus[FLOW_BUS_SLOT_MOODBOARD].u32_quads[0].z);
+        float3 ground_col   = unpack_rgb24(engine_bus[FLOW_BUS_SLOT_MOODBOARD].u32_quads[0].w);
+        float3 accent_col   = unpack_rgb24(engine_bus[FLOW_BUS_SLOT_MOODBOARD].u32_quads[1].x);
+        float3 backdrop_col = unpack_rgb24(engine_bus[FLOW_BUS_SLOT_MOODBOARD].u32_quads[1].y);
+        float fog_cond      = clamp(float(int(engine_bus[FLOW_BUS_SLOT_MOODBOARD].u32_quads[1].z)) * (1.0f / 65536.0f), 0.0f, 1.0f);
+        float riv_wipe      = clamp(float(int(engine_bus[FLOW_BUS_SLOT_MOODBOARD].u32_quads[1].w)) * (1.0f / 65536.0f), 0.0f, 1.0f);
+        float part_dens     = clamp(float(int(engine_bus[FLOW_BUS_SLOT_MOODBOARD].u32_quads[2].x)) * (1.0f / 65536.0f), 0.1f, 1.0f);
+        float sing_gain     = clamp(float(int(engine_bus[FLOW_BUS_SLOT_MOODBOARD].u32_quads[2].y)) * (1.0f / 65536.0f), 0.2f, 2.0f);
+        float dio_cut       = clamp(float(int(engine_bus[FLOW_BUS_SLOT_MOODBOARD].u32_quads[2].z)) * (1.0f / 65536.0f), 0.4f, 1.0f);
+        float snow_cov      = clamp(float(int(engine_bus[FLOW_BUS_SLOT_MOODBOARD].u32_quads[3].x)) * (1.0f / 65536.0f), 0.0f, 1.0f);
+        float2 look_off     = float2(u.s1.cam_look_offset[0], u.s1.cam_look_offset[1]);
+        float3 c_rot        = float3(u.s0.craft_rot[0], u.s0.craft_rot[1], u.s0.craft_rot[2]);
+
+        if (mood_stage == 1U) {
+            col = eval_mood_window_optics(uv_raw, look_off, time_sec,
+                                          sky_col, ground_col, accent_col, backdrop_col,
+                                          fog_cond, riv_wipe);
+            col = pow(aces_tonemap(col * 1.15f), float3(1.0f / 2.2f));
+        } else if (mood_stage == 2U) {
+            col = eval_mood_particle_corridor(uv_rot, look_off, time_sec,
+                                              sky_col, ground_col, accent_col,
+                                              part_dens, sing_gain);
+            col = pow(aces_tonemap(col), float3(1.0f / 2.2f));
+        } else {
+            col = eval_mood_isometric_diorama(uv_raw, look_off, c_rot, time_sec,
+                                              sky_col, ground_col, accent_col, backdrop_col,
+                                              dio_cut, u.s3.xray_radius, snow_cov);
+            col = clamp(col, 0.0f, 1.0f);
+        }
+
+        /* Clean Fashion Lookbook 4-Swatch Pill Strip in Upper-Left Corner */
+        float2 sw_p = uv_raw - float2(-0.74f, -0.41f);
+        if (sw_p.x >= 0.0f && sw_p.x <= 0.16f && abs(sw_p.y) <= 0.014f) {
+            uint sw_idx = uint(clamp(sw_p.x * 25.0f, 0.0f, 3.0f));
+            float3 sw_c = (sw_idx == 0U) ? sky_col
+                        : ((sw_idx == 1U) ? ground_col
+                        : ((sw_idx == 2U) ? accent_col : backdrop_col));
+            float cell_fx = fract(sw_p.x * 25.0f);
+            float border = smoothstep(0.04f, 0.09f, min(cell_fx, 1.0f - cell_fx))
+                         * smoothstep(0.014f, 0.010f, abs(sw_p.y));
+            col = mix(float3(0.12f), sw_c, border);
+        }
+    } else {
     float3 ro_bg = float3(0.0f, 0.0f, -500.0f);
     float3 rd_bg = normalize(float3(uv_rot / bg_zoom, 1.15f));
     float3 rd_fg = normalize(float3(uv_rot, fg_fov_z));
@@ -313,7 +890,7 @@ fragment float4 tile_fragment(
     /* 0. Deep Space Background + Starfield */
     float star_seed = fract(sin(dot(floor(uv_rot * 520.0f), float2(12.9898f, 78.233f))) * 43758.5453f);
     float star = step(0.9965f, star_seed) * (0.5f + 1.5f * fract(star_seed * 19.3f));
-    float3 col = float3(0.003f, 0.005f, 0.012f) + float3(1.0f, 0.95f, 0.9f) * star;
+    col = float3(0.003f, 0.005f, 0.012f) + float3(1.0f, 0.95f, 0.9f) * star;
 
     float3 sun_dir = normalize(float3(0.62f, 0.42f, -0.66f));
 
@@ -731,6 +1308,7 @@ fragment float4 tile_fragment(
         col = mix(col, (gauge_frac <= temp_frac) ? gauge_col : float3(0.12f, 0.14f, 0.18f), 0.85f);
         if (abs(gauge_frac - 0.667f) < 0.005f) col = float3(1.0f, 0.2f, 0.2f);
     }
+    } /* End of mood_stage == 0U space scene */
 
     /*
      * 5. Declarative 64-Byte FLOW SVG-UI Frontend DOM & Liquid-Glass Director Bar

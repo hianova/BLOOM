@@ -738,3 +738,177 @@ int flow_cine_brain_step(FlowCineBrainState *brain,
 
     return 0;
 }
+
+/*
+ * ============================================================================
+ * 8. FlowCinemaShot64: Frame-Accurate Cinema EDL & 48kHz Audio Lockstep Engine
+ * ============================================================================
+ */
+static uint64_t flow_cine_hash_shot64(const FlowCinemaShot64 *s) {
+    const uint8_t *bytes = (const uint8_t *)s;
+    uint64_t h = 0xCBF29CE484222325ULL;
+    for (size_t i = 0U; i < 56U; ++i) {
+        h ^= (uint64_t)bytes[i];
+        h *= 0x100000001B3ULL;
+    }
+    return h ^ 0x43494E454D413634ULL; /* "CINEMA64" */
+}
+
+int flow_cine_build_default_reel64(FlowCinemaShot64 out_shots[FLOW_CINEMA_REEL_SHOT_COUNT],
+                                   uint32_t fps_rate) {
+    if (!out_shots)
+        return -1;
+    if (fps_rate == 0U)
+        fps_rate = 24U;
+
+    uint32_t frames_per_shot = fps_rate * 2U; /* 2.0 seconds per shot -> 8.0s 4-Act Reel */
+    uint32_t samples_per_frame = FLOW_CINEMA_AUDIO_RATE_HZ / fps_rate;
+
+    memset(out_shots, 0, sizeof(FlowCinemaShot64) * FLOW_CINEMA_REEL_SHOT_COUNT);
+
+    /* Shot 1: Act I - Relativistic Space Citadel & 800K Cavity (135mm Telephoto) */
+    out_shots[0].shot_id                 = 1U;
+    out_shots[0].stage_mode              = 0U;
+    out_shots[0].vcam_id                 = FLOW_VCAM_ORBIT_TELEPHOTO;
+    out_shots[0].fps_rate                = fps_rate;
+    out_shots[0].start_frame             = 0U;
+    out_shots[0].frame_count             = frames_per_shot;
+    out_shots[0].audio_samples_per_frame = samples_per_frame;
+    out_shots[0].transition_style        = 1U; /* Iris Aperture Wipe */
+    out_shots[0].dolly_vel_xyz_q16[0]    = 512;
+    out_shots[0].dolly_vel_xyz_q16[1]    = -256;
+    out_shots[0].dolly_vel_xyz_q16[2]    = 1024;
+    out_shots[0].xray_sweep_q16          = 0;
+    out_shots[0].audio_base_freq_hz      = 110U; /* A2 Deep Space Drone */
+    out_shots[0].colorspace_flags        = FLOW_CINE_FLAG_LETTERBOX_239 | FLOW_CINE_FLAG_ANAMORPHIC_FLARE;
+    out_shots[0].edl_signature_hash      = flow_cine_hash_shot64(&out_shots[0]);
+
+    /* Shot 2: Act II - Autumn Train Window Condensation & 2-Jet Rivulet Refraction (35mm Dolly) */
+    out_shots[1].shot_id                 = 2U;
+    out_shots[1].stage_mode              = 1U;
+    out_shots[1].vcam_id                 = FLOW_VCAM_FLYBY_DOLLY;
+    out_shots[1].fps_rate                = fps_rate;
+    out_shots[1].start_frame             = frames_per_shot;
+    out_shots[1].frame_count             = frames_per_shot;
+    out_shots[1].audio_samples_per_frame = samples_per_frame;
+    out_shots[1].transition_style        = 2U; /* Horizon Curtain Wipe */
+    out_shots[1].dolly_vel_xyz_q16[0]    = 768;
+    out_shots[1].dolly_vel_xyz_q16[1]    = 192;
+    out_shots[1].dolly_vel_xyz_q16[2]    = 0;
+    out_shots[1].xray_sweep_q16          = 0;
+    out_shots[1].audio_base_freq_hz      = 165U; /* E3 Warm Train Harmonic */
+    out_shots[1].colorspace_flags        = FLOW_CINE_FLAG_DOF_BOKEH;
+    out_shots[1].edl_signature_hash      = flow_cine_hash_shot64(&out_shots[1]);
+
+    /* Shot 3: Act III - Infinite 3D Point-Cloud Monoliths & Glitter Wave (24mm Chase) */
+    out_shots[2].shot_id                 = 3U;
+    out_shots[2].stage_mode              = 2U;
+    out_shots[2].vcam_id                 = FLOW_VCAM_CHASE_DYNAMIC;
+    out_shots[2].fps_rate                = fps_rate;
+    out_shots[2].start_frame             = frames_per_shot * 2U;
+    out_shots[2].frame_count             = frames_per_shot;
+    out_shots[2].audio_samples_per_frame = samples_per_frame;
+    out_shots[2].transition_style        = 3U; /* Diagonal Blade Wipe */
+    out_shots[2].dolly_vel_xyz_q16[0]    = -640;
+    out_shots[2].dolly_vel_xyz_q16[1]    = -320;
+    out_shots[2].dolly_vel_xyz_q16[2]    = 2048;
+    out_shots[2].xray_sweep_q16          = 0;
+    out_shots[2].audio_base_freq_hz      = 147U; /* D3 Singularity Pulse */
+    out_shots[2].colorspace_flags        = FLOW_CINE_FLAG_ANAMORPHIC_FLARE;
+    out_shots[2].edl_signature_hash      = flow_cine_hash_shot64(&out_shots[2]);
+
+    /* Shot 4: Act IV - Winter Shore Isometric CSG Cutaway Diorama + Live X-Ray Sweep */
+    out_shots[3].shot_id                 = 4U;
+    out_shots[3].stage_mode              = 3U;
+    out_shots[3].vcam_id                 = FLOW_VCAM_ORBIT_TELEPHOTO;
+    out_shots[3].fps_rate                = fps_rate;
+    out_shots[3].start_frame             = frames_per_shot * 3U;
+    out_shots[3].frame_count             = frames_per_shot;
+    out_shots[3].audio_samples_per_frame = samples_per_frame;
+    out_shots[3].transition_style        = 0U;
+    out_shots[3].dolly_vel_xyz_q16[0]    = 896;
+    out_shots[3].dolly_vel_xyz_q16[1]    = -384;
+    out_shots[3].dolly_vel_xyz_q16[2]    = 512;
+    out_shots[3].xray_sweep_q16          = 22528; /* Sweep cutaway slice across the diorama! */
+    out_shots[3].audio_base_freq_hz      = 220U;  /* A3 Nordic Crystalline Chord */
+    out_shots[3].colorspace_flags        = 0U;
+    out_shots[3].edl_signature_hash      = flow_cine_hash_shot64(&out_shots[3]);
+
+    return 0;
+}
+
+static void flow_cine_write_2digits(char *dst, uint32_t val) {
+    uint32_t v = val % 100U;
+    dst[0] = (char)('0' + (v / 10U));
+    dst[1] = (char)('0' + (v % 10U));
+}
+
+int flow_cine_format_smpte_timecode(uint32_t frame_idx,
+                                    uint32_t fps_rate,
+                                    char out_tc[12]) {
+    if (!out_tc)
+        return -1;
+    if (fps_rate == 0U)
+        fps_rate = 24U;
+
+    uint32_t ff = frame_idx % fps_rate;
+    uint32_t total_sec = frame_idx / fps_rate;
+    uint32_t ss = total_sec % 60U;
+    uint32_t total_min = total_sec / 60U;
+    uint32_t mm = total_min % 60U;
+    uint32_t hh = (total_min / 60U) % 24U;
+
+    flow_cine_write_2digits(&out_tc[0], hh);
+    out_tc[2] = ':';
+    flow_cine_write_2digits(&out_tc[3], mm);
+    out_tc[5] = ':';
+    flow_cine_write_2digits(&out_tc[6], ss);
+    out_tc[8] = ':';
+    flow_cine_write_2digits(&out_tc[9], ff);
+    out_tc[11] = '\0';
+    return 0;
+}
+
+int flow_cine_synth_lockstep_audio48k(const FlowCinemaShot64 *shot,
+                                      uint32_t shot_local_frame,
+                                      int16_t *out_pcm_stereo,
+                                      uint32_t sample_frames) {
+    if (!shot || !out_pcm_stereo)
+        return -1;
+
+    uint32_t base_hz = (shot->audio_base_freq_hz > 40U) ? shot->audio_base_freq_hz : 110U;
+    uint32_t fifth_hz = (base_hz * 3U) / 2U;
+    uint32_t octave_hz = base_hz * 2U;
+
+    uint64_t global_sample_start = (uint64_t)(shot->start_frame + shot_local_frame)
+                                 * (uint64_t)shot->audio_samples_per_frame;
+    /* Smooth fade-in on first 4 frames and fade-out on last 4 frames of each shot */
+    int64_t env_q16 = FLOW_Q16_ONE;
+    if (shot_local_frame < 4U) {
+        env_q16 = (int64_t)(shot_local_frame + 1U) * (FLOW_Q16_ONE / 4LL);
+    } else if (shot->frame_count > 4U && shot_local_frame >= shot->frame_count - 4U) {
+        uint32_t rem = shot->frame_count - shot_local_frame;
+        env_q16 = (int64_t)rem * (FLOW_Q16_ONE / 4LL);
+    }
+
+    for (uint32_t i = 0U; i < sample_frames; ++i) {
+        uint64_t s_idx = global_sample_start + (uint64_t)i;
+        uint64_t ph1 = (s_idx * (uint64_t)base_hz   * 65536ULL) / (uint64_t)FLOW_CINEMA_AUDIO_RATE_HZ;
+        uint64_t ph2 = (s_idx * (uint64_t)fifth_hz  * 65536ULL) / (uint64_t)FLOW_CINEMA_AUDIO_RATE_HZ;
+        uint64_t ph3 = (s_idx * (uint64_t)octave_hz * 65536ULL) / (uint64_t)FLOW_CINEMA_AUDIO_RATE_HZ;
+
+        int64_t w1 = flow_cine_tri_wave_q16(ph1);
+        int64_t w2 = flow_cine_tri_wave_q16(ph2 + 16384ULL);
+        int64_t w3 = flow_cine_tri_wave_q16(ph3);
+
+        int64_t mix_l = (w1 * 3LL + w2 * 2LL + w3) / 6LL;
+        int64_t mix_r = (w1 * 3LL - w2 + w3 * 2LL) / 6LL;
+
+        int64_t pcm_l = (mix_l * env_q16 * 7200LL) >> (2U * FLOW_Q16_SHIFT);
+        int64_t pcm_r = (mix_r * env_q16 * 7200LL) >> (2U * FLOW_Q16_SHIFT);
+
+        out_pcm_stereo[i * 2U + 0U] = (int16_t)flow_cine_clamp_i64(pcm_l, -32000LL, 32000LL);
+        out_pcm_stereo[i * 2U + 1U] = (int16_t)flow_cine_clamp_i64(pcm_r, -32000LL, 32000LL);
+    }
+    return 0;
+}

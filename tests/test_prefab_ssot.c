@@ -463,6 +463,64 @@ static void test_trc_accessibility_epilepsy_and_colorblind_geometry(void) {
            meltdown_safe.strobe_hz_q16);
 }
 
+static void test_moodboard_to_prefab_notebook(void) {
+    printf("[Test 9] Fashion/Game Moodboard-to-Prefab Notebook (FlowMoodboardPrefab64 + Hex128)...\n");
+
+    assert(sizeof(FlowMoodboardPrefab64) == 64U);
+    assert(_Alignof(FlowMoodboardPrefab64) == 64U);
+
+    for (uint32_t m = 0U; m < FLOW_MOOD_STAGE_COUNT; ++m) {
+        FlowMoodboardPrefab64 mb;
+        flow_moodboard_init_preset64(&mb, m);
+        assert(mb.stage_mode == m);
+        assert(mb.mood_signature != 0ULL);
+
+        char hex[129];
+        flow_moodboard_encode_hex128(&mb, hex);
+        assert(strlen(hex) == 128U);
+
+        FlowMoodboardPrefab64 decoded;
+        assert(flow_moodboard_decode_hex128(hex, &decoded) == true);
+        assert(memcmp(&mb, &decoded, sizeof(mb)) == 0);
+
+        /* Reject tampered Hex128 share code */
+        hex[12] = (hex[12] == 'A') ? 'B' : 'A';
+        assert(flow_moodboard_decode_hex128(hex, &decoded) == false);
+
+        FlowPrefabDesc64 prefab;
+        FlowArtStyle64 style;
+        flow_moodboard_to_prefab_and_style64(&mb, &prefab, &style);
+        assert(prefab.prefab_id == mb.mood_id);
+        assert(prefab.ssot_hash == flow_prefab_calc_hash(&prefab));
+        assert(style.style_id == mb.mood_id);
+    }
+
+    /* Test automatic genre classification & swatch extraction on synthetic 16x16 RGB image */
+    uint8_t synth_rgb[16 * 16 * 3];
+    for (uint32_t y = 0U; y < 16U; ++y) {
+        for (uint32_t x = 0U; x < 16U; ++x) {
+            size_t idx = ((size_t)y * 16U + (size_t)x) * 3U;
+            /* Cream studio surround -> auto-detects Stage 3 Isometric Diorama */
+            synth_rgb[idx + 0U] = 235U;
+            synth_rgb[idx + 1U] = 230U;
+            synth_rgb[idx + 2U] = 220U;
+            if (x == 8U && y == 8U) {
+                /* Nordic red cabin swatch */
+                synth_rgb[idx + 0U] = 190U;
+                synth_rgb[idx + 1U] = 45U;
+                synth_rgb[idx + 2U] = 38U;
+            }
+        }
+    }
+    FlowMoodboardPrefab64 extracted;
+    assert(flow_moodboard_extract_from_rgb_buffer64(synth_rgb, 16U, 16U, 16U * 3U,
+                                                    FLOW_MOOD_STAGE_AUTO_DETECT, &extracted) == 0);
+    assert(extracted.stage_mode == FLOW_MOOD_STAGE_ISOMETRIC_DIORAMA);
+    assert(extracted.accent_rgb24 == ((190U << 16U) | (45U << 8U) | 38U));
+
+    printf("  ✓ 64B Moodboard-to-Prefab Extractor, Auto-Classifier & Hex128 Codec verified!\n");
+}
+
 int main(void) {
     printf("====================================================================\n");
     printf("BLOOM: Prefab SSOT + Art Bible (HTML/CSS/JS) Test Suite\n");
@@ -476,9 +534,10 @@ int main(void) {
     test_wave64_compaction_and_layer_collapse();
     test_fashion_lofting_and_steam_marketplace();
     test_trc_accessibility_epilepsy_and_colorblind_geometry();
+    test_moodboard_to_prefab_notebook();
 
     printf("====================================================================\n");
-    printf("✓ ALL 8 SSOT / PREFAB / ART BIBLE / FASHION / TRC ACCESSIBILITY TESTS PASSED\n");
+    printf("✓ ALL 9 SSOT / PREFAB / ART BIBLE / FASHION / MOODBOARD TESTS PASSED\n");
     printf("====================================================================\n");
     return 0;
 }

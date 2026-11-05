@@ -210,4 +210,48 @@ int flow_cine_brain_step(FlowCineBrainState *brain,
                          bool collision_hit,
                          int64_t dt_q16);
 
+/*
+ * ----------------------------------------------------------------------------
+ * 6. FlowCinemaShot64: 64-Byte Frame-Accurate Cinema EDL & FFmpeg Pipe Descriptor
+ * ----------------------------------------------------------------------------
+ * Zero-Depreciation Film Mastering Contract:
+ *   - Decouples deterministic cinema timecode lockstep (e.g. 24fps, 2000 audio
+ *     samples/frame at 48kHz) from transient video codecs (H.264/HEVC/ProRes/AV1).
+ *   - Enables zero-temp-file POSIX pipe streaming straight into FFmpeg alongside
+ *     Hollywood-standard CMX 3600 (.edl) non-linear editing timeline export.
+ * ----------------------------------------------------------------------------
+ */
+#define FLOW_CINEMA_REEL_SHOT_COUNT 4U
+#define FLOW_CINEMA_AUDIO_RATE_HZ   48000U
+
+typedef struct __attribute__((aligned(64))) {
+    uint32_t shot_id;                  /* 4B: CMX 3600 EDL Event / Shot ID (1..N) */
+    uint32_t stage_mode;               /* 4B: Active stage (0=Space, 1=Window, 2=Particles, 3=Diorama) */
+    uint32_t vcam_id;                  /* 4B: Active Virtual Camera rig (FLOW_VCAM_*) */
+    uint32_t fps_rate;                 /* 4B: Locked cinema frame rate (24, 30, 48, 60) */
+    uint32_t start_frame;              /* 4B: Inclusive start frame on master timeline */
+    uint32_t frame_count;              /* 4B: Exact shot duration in frames */
+    uint32_t audio_samples_per_frame;  /* 4B: Exact 48kHz stereo sample frames per video frame */
+    uint32_t transition_style;         /* 4B: Wipe/cut transition style at end of shot */
+    int32_t  dolly_vel_xyz_q16[3];     /* 12B: Deterministic camera dolly velocity in Q16 */
+    int32_t  xray_sweep_q16;           /* 4B: Automated cutaway sweep delta in Q16 */
+    uint32_t audio_base_freq_hz;       /* 4B: Procedural 48kHz soundtrack root frequency (Hz) */
+    uint32_t colorspace_flags;         /* 4B: Optical & color mastering flags (ACES / 2.39:1) */
+    uint64_t edl_signature_hash;       /* 8B: 64-bit integrity MAC of the 64B shot descriptor */
+} FlowCinemaShot64;
+
+FLOW_STATIC_ASSERT_UNIVALENT(FlowCinemaShot64, RicardianStateV4);
+_Static_assert(sizeof(FlowCinemaShot64) == 64U, "FlowCinemaShot64 must be 64 bytes");
+_Static_assert(_Alignof(FlowCinemaShot64) == 64U, "FlowCinemaShot64 must be 64-byte aligned");
+
+int flow_cine_build_default_reel64(FlowCinemaShot64 out_shots[FLOW_CINEMA_REEL_SHOT_COUNT],
+                                   uint32_t fps_rate);
+int flow_cine_format_smpte_timecode(uint32_t frame_idx,
+                                    uint32_t fps_rate,
+                                    char out_tc[12]);
+int flow_cine_synth_lockstep_audio48k(const FlowCinemaShot64 *shot,
+                                      uint32_t shot_local_frame,
+                                      int16_t *out_pcm_stereo,
+                                      uint32_t sample_frames);
+
 #endif /* FLOW_CINE_CAMERA_H */

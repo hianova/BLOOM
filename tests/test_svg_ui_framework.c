@@ -233,6 +233,15 @@ static void test_prefab_revert_xray_and_debug_pipeline(void) {
     assert(inst.pos_q16[0] == (10LL << 16) && inst.pos_q16[1] == -(5LL << 16));
     assert(edit.revert_exec_count == 1U);
 
+    /* 1b. Modal Translate + Commit -> baseline updated, undo_commit_count incremented */
+    flow_prefab_edit_begin_modal64(&edit, &inst, FLOW_PREFAB_MODAL_TRANSLATE);
+    flow_prefab_edit_apply_scrub64(&edit, &inst, 16384, 8192);
+    flow_prefab_edit_commit64(&edit, &inst);
+    assert(edit.undo_commit_count == 1U);
+    assert(edit.baseline_pos_q16[0] == inst.pos_q16[0]);
+    assert(edit.baseline_pos_q16[1] == inst.pos_q16[1]);
+    assert(edit.modal_op_mode == FLOW_PREFAB_MODAL_NONE);
+
     /* 2. SDF X-Ray Cutaway Mask (Theorem 8: exterior invariant, interior strictly > 0) */
     flow_prefab_edit_begin_modal64(&edit, &inst, FLOW_PREFAB_MODAL_XRAY_SCRUB);
     flow_prefab_edit_apply_scrub64(&edit, &inst, 16384, 0);

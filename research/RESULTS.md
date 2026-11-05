@@ -1,4 +1,9 @@
-# Phase 0/2 結果(Apple M1,4K,GPU 計時,中位數)
+# 歷史研究與基準測試記錄 (Historical Research Benchmarks & Notes)
+
+> [!NOTE]
+> 本文件記錄 BLOOM v1.0.0 之前的早期原型基準（Phase 0/2 概念驗證、Solar Walker 歷史對照）。現行正式基準請參見根目錄 `make bench` / `./build/bloom --bench`。
+
+## Phase 0/2 結果 (Apple M1, 4K, GPU 計時, 中位數)
 
 重現:`cd bench && clang++ -std=c++17 -O2 -fobjc-arc -framework Metal -framework Foundation bench.mm -o bench && ./bench K N overdraw`
 (`bench2.mm` 同理,最後多一個 lights 參數)。

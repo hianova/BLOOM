@@ -500,4 +500,65 @@ int64_t flow_prefab_eval_xray_cutaway_q16(const FlowPrefabEditState64 *edit,
                                           int64_t d_outer_q16,
                                           int64_t d_xray_sphere_q16);
 
+/*
+ * ============================================================================
+ * 9. Fashion & Game Moodboard-to-Prefab Notebook (FlowMoodboardPrefab64)
+ * ============================================================================
+ * Bridges fashion-industry Moodboard / Lookbook collage workflows directly into
+ * zero-modeling 3D Prefab & Optical Shader stages:
+ *   - Stage Mode 0 (FLOW_MOOD_STAGE_SPACE_DEFAULT): Classic Relativistic Citadel
+ *   - Stage Mode 1 (FLOW_MOOD_STAGE_WINDOW_OPTICS): Autumn Train Window Condensation,
+ *     Gravity Rivulet Wiping State & 2-Jet Snell's Law Refraction
+ *   - Stage Mode 2 (FLOW_MOOD_STAGE_PARTICLE_CORRIDOR): Infinite 3D Hash-Lattice
+ *     Point-Cloud Monolith Corridors + Horizon Singularity + Glittering Wave Path
+ *   - Stage Mode 3 (FLOW_MOOD_STAGE_ISOMETRIC_DIORAMA): "Winter Shore" Isometric
+ *     CSG Cutaway Diorama Block (Snow Terrain + Geological Strata Cross-Section +
+ *     Beer-Lambert Translucent Sea Volume + 2400K Warm Cabin Blackbody GI)
+ * ============================================================================
+ */
+#define FLOW_MOOD_STAGE_SPACE_DEFAULT     0U
+#define FLOW_MOOD_STAGE_WINDOW_OPTICS     1U
+#define FLOW_MOOD_STAGE_PARTICLE_CORRIDOR 2U
+#define FLOW_MOOD_STAGE_ISOMETRIC_DIORAMA 3U
+#define FLOW_MOOD_STAGE_COUNT             4U
+#define FLOW_MOOD_STAGE_AUTO_DETECT       0xFFFFFFFFU
+
+typedef struct __attribute__((aligned(64))) {
+    uint32_t mood_id;              /*  4B: Lookbook / Moodboard entry ID */
+    uint32_t stage_mode;           /*  4B: FLOW_MOOD_STAGE_* (0..3) */
+    uint32_t sky_rgb24;            /*  4B: Upper horizon / sky swatch (0x00RRGGBB) */
+    uint32_t ground_rgb24;         /*  4B: Lower ground / foliage / sea swatch (0x00RRGGBB) */
+    uint32_t accent_rgb24;         /*  4B: Emissive / singularity / cabin glow (0x00RRGGBB) */
+    uint32_t backdrop_rgb24;       /*  4B: Studio tabletop / interior frame swatch (0x00RRGGBB) */
+    int32_t  fog_condense_q16;     /*  4B: Window Mie condensation & roughness [0..65536] */
+    int32_t  rivulet_wipe_q16;     /*  4B: Gravity water droplet trail wiping & refraction [0..65536] */
+    int32_t  particle_density_q16; /*  4B: 3D hash-lattice monolith & wave glitter density [0..65536] */
+    int32_t  singularity_gain_q16; /*  4B: Horizon anamorphic singularity core intensity [0..131072] */
+    int32_t  diorama_cut_q16;      /*  4B: Isometric cutaway slab aperture / slice ratio [0..65536] */
+    int32_t  water_level_q16;      /*  4B: Beer-Lambert translucent sea volume level [-32768..32768] */
+    int32_t  snow_cover_q16;       /*  4B: Normal-projected procedural snow accumulation [0..65536] */
+    uint32_t cabin_warmth_kelvin;  /*  4B: Interior blackbody emissive temperature (e.g. 2400K) */
+    uint64_t mood_signature;       /*  8B: 64-bit SSOT integrity hash for 128-Hex sharing */
+} FlowMoodboardPrefab64;
+
+FLOW_STATIC_ASSERT_UNIVALENT(FlowMoodboardPrefab64, RicardianStateV4);
+_Static_assert(sizeof(FlowMoodboardPrefab64) == 64U, "FlowMoodboardPrefab64 must be exactly 64 bytes");
+_Static_assert(_Alignof(FlowMoodboardPrefab64) == 64U, "FlowMoodboardPrefab64 must be 64-byte aligned");
+
+void flow_moodboard_init_preset64(FlowMoodboardPrefab64 *mb, uint32_t stage_mode);
+
+int flow_moodboard_extract_from_rgb_buffer64(const uint8_t *rgb_bytes,
+                                             uint32_t width,
+                                             uint32_t height,
+                                             uint32_t row_stride_bytes,
+                                             uint32_t preferred_stage_mode,
+                                             FlowMoodboardPrefab64 *out_mb);
+
+void flow_moodboard_to_prefab_and_style64(const FlowMoodboardPrefab64 *mb,
+                                          FlowPrefabDesc64 *out_prefab,
+                                          FlowArtStyle64 *out_style);
+
+void flow_moodboard_encode_hex128(const FlowMoodboardPrefab64 *mb, char out_hex[129]);
+bool flow_moodboard_decode_hex128(const char hex[129], FlowMoodboardPrefab64 *out_mb);
+
 #endif /* FLOW_PREFAB_SSOT_H */

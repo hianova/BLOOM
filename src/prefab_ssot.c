@@ -1962,5 +1962,358 @@ int64_t flow_prefab_eval_xray_cutaway_q16(const FlowPrefabEditState64 *edit,
     return (d_outer_q16 >= neg_xray) ? d_outer_q16 : neg_xray;
 }
 
+/*
+ * ============================================================================
+ * 9. Fashion & Game Moodboard-to-Prefab Notebook (FlowMoodboardPrefab64)
+ * ============================================================================
+ */
+static uint64_t flow_moodboard_calc_signature(const FlowMoodboardPrefab64 *mb) {
+    if (!mb) return 0ULL;
+    uint64_t h = 0x9E3779B97F4A7C15ULL;
+    h ^= (uint64_t)mb->mood_id + 0x517CC1B727220A95ULL;
+    h = splitmix64_fashion(h ^ ((uint64_t)mb->stage_mode << 32U) ^ (uint64_t)mb->sky_rgb24);
+    h = splitmix64_fashion(h ^ ((uint64_t)mb->ground_rgb24 << 24U) ^ (uint64_t)mb->accent_rgb24);
+    h = splitmix64_fashion(h ^ ((uint64_t)mb->backdrop_rgb24 << 16U) ^ (uint64_t)(uint32_t)mb->fog_condense_q16);
+    h = splitmix64_fashion(h ^ ((uint64_t)(uint32_t)mb->rivulet_wipe_q16 << 32U) ^ (uint64_t)(uint32_t)mb->particle_density_q16);
+    h = splitmix64_fashion(h ^ ((uint64_t)(uint32_t)mb->singularity_gain_q16 << 32U) ^ (uint64_t)(uint32_t)mb->diorama_cut_q16);
+    h = splitmix64_fashion(h ^ ((uint64_t)(uint32_t)mb->water_level_q16 << 32U) ^ (uint64_t)(uint32_t)mb->snow_cover_q16);
+    h = splitmix64_fashion(h ^ (uint64_t)mb->cabin_warmth_kelvin);
+    return h;
+}
+
+void flow_moodboard_init_preset64(FlowMoodboardPrefab64 *mb, uint32_t stage_mode) {
+    if (!mb) return;
+    memset(mb, 0, sizeof(*mb));
+
+    uint32_t mode = stage_mode % FLOW_MOOD_STAGE_COUNT;
+    mb->stage_mode = mode;
+
+    if (mode == FLOW_MOOD_STAGE_WINDOW_OPTICS) {
+        /* Preset 1: Autumn Train Window Condensation & Gravity Rivulet Refraction */
+        mb->mood_id              = 101U;
+        mb->sky_rgb24            = 0x3A7EC2U; /* Crisp cerulean sky blue */
+        mb->ground_rgb24         = 0xD88B28U; /* Golden autumn wheat & foliage */
+        mb->accent_rgb24         = 0xF5E6CCU; /* Warm Mie-scattered sun mist */
+        mb->backdrop_rgb24       = 0x0E100CU; /* Dark train cabin interior frame */
+        mb->fog_condense_q16     = 54000;     /* ~0.82 condensation frosting in lower window */
+        mb->rivulet_wipe_q16     = 60000;     /* ~0.92 gravity droplet trail wiping & 2-Jet refraction */
+        mb->particle_density_q16 = 16384;
+        mb->singularity_gain_q16 = 32768;
+        mb->diorama_cut_q16      = 65536;
+        mb->water_level_q16      = 0;
+        mb->snow_cover_q16       = 0;
+        mb->cabin_warmth_kelvin  = 3400U;
+    } else if (mode == FLOW_MOOD_STAGE_PARTICLE_CORRIDOR) {
+        /* Preset 2: Infinite Point-Cloud Monoliths & Glittering Wave Singularity */
+        mb->mood_id              = 202U;
+        mb->sky_rgb24            = 0x143264U; /* Deep atmospheric horizon cobalt blue */
+        mb->ground_rgb24         = 0x050C1AU; /* Midnight undulating particle wave sea */
+        mb->accent_rgb24         = 0xFFE2A6U; /* Golden-white singularity & monolith dust motes */
+        mb->backdrop_rgb24       = 0x02040AU; /* Deep void cosmos */
+        mb->fog_condense_q16     = 12000;
+        mb->rivulet_wipe_q16     = 0;
+        mb->particle_density_q16 = 60000;     /* High-density 3D hash lattice point cloud */
+        mb->singularity_gain_q16 = 88000;     /* ~1.34x blazing horizon singularity + anamorphic flare */
+        mb->diorama_cut_q16      = 65536;
+        mb->water_level_q16      = -16384;
+        mb->snow_cover_q16       = 0;
+        mb->cabin_warmth_kelvin  = 4200U;
+    } else if (mode == FLOW_MOOD_STAGE_ISOMETRIC_DIORAMA) {
+        /* Preset 3: "Winter Shore" Isometric CSG Cutaway Diorama Block */
+        mb->mood_id              = 303U;
+        mb->sky_rgb24            = 0xF0F6FFU; /* Crisp twilight snow cover */
+        mb->ground_rgb24         = 0x1A4858U; /* Beer-Lambert translucent Nordic sea teal */
+        mb->accent_rgb24         = 0xB83228U; /* Classic Nordic Falu-red cabin & 2400K glow */
+        mb->backdrop_rgb24       = 0xEFEBE1U; /* Warm cream studio tabletop backdrop */
+        mb->fog_condense_q16     = 16384;
+        mb->rivulet_wipe_q16     = 0;
+        mb->particle_density_q16 = 24000;
+        mb->singularity_gain_q16 = 45000;
+        mb->diorama_cut_q16      = 58982;     /* Clean isometric rectangular slab cutaway */
+        mb->water_level_q16      = -4096;     /* Translucent sea level inside cutaway block */
+        mb->snow_cover_q16       = 54000;     /* ~0.82 normal-projected snow accumulation */
+        mb->cabin_warmth_kelvin  = 2400U;     /* 2400K warm interior window GI & water reflection */
+    } else {
+        /* Preset 0: Classic Relativistic Space Citadel Stage */
+        mb->mood_id              = 100U;
+        mb->sky_rgb24            = 0x2E7AF6U;
+        mb->ground_rgb24         = 0xC69460U;
+        mb->accent_rgb24         = 0xFFC838U;
+        mb->backdrop_rgb24       = 0x02040AU;
+        mb->fog_condense_q16     = 0;
+        mb->rivulet_wipe_q16     = 0;
+        mb->particle_density_q16 = 32768;
+        mb->singularity_gain_q16 = 65536;
+        mb->diorama_cut_q16      = 65536;
+        mb->water_level_q16      = 0;
+        mb->snow_cover_q16       = 0;
+        mb->cabin_warmth_kelvin  = 760U;
+    }
+
+    mb->mood_signature = flow_moodboard_calc_signature(mb);
+}
+
+int flow_moodboard_extract_from_rgb_buffer64(const uint8_t *rgb_bytes,
+                                             uint32_t width,
+                                             uint32_t height,
+                                             uint32_t row_stride_bytes,
+                                             uint32_t preferred_stage_mode,
+                                             FlowMoodboardPrefab64 *out_mb) {
+    if (!rgb_bytes || width < 4U || height < 4U || row_stride_bytes < width * 3U || !out_mb) {
+        return -1;
+    }
+
+    /*
+     * Sample a deterministic 16x16 grid within the active visual canvas
+     * (x in [12%..88%], y in [18%..76%]) so mobile screenshot status bars
+     * or app captions do not pollute the extracted optical swatches.
+     */
+    uint64_t top_r = 0ULL, top_g = 0ULL, top_b = 0ULL, top_cnt = 0ULL;
+    uint64_t bot_r = 0ULL, bot_g = 0ULL, bot_b = 0ULL, bot_cnt = 0ULL;
+    uint64_t brd_r = 0ULL, brd_g = 0ULL, brd_b = 0ULL, brd_cnt = 0ULL;
+    uint64_t lmargin_luma_sum = 0ULL, lmargin_cnt = 0ULL;
+    uint64_t studio_cream_sum = 0ULL, studio_cream_cnt = 0ULL;
+    uint64_t total_luma_sum = 0ULL, total_cnt = 0ULL;
+    uint32_t peak_luma = 0U;
+    uint32_t peak_rgb24 = 0xFFE0A0U;
+    uint32_t warm_red_score = 0U;
+    uint32_t warm_red_rgb24 = 0xB83228U;
+
+    for (uint32_t gy = 0U; gy < 16U; ++gy) {
+        uint32_t py = ((18U + (gy * 58U) / 15U) * height) / 100U;
+        if (py >= height) py = height - 1U;
+        const uint8_t *row = rgb_bytes + (size_t)py * (size_t)row_stride_bytes;
+
+        for (uint32_t gx = 0U; gx < 16U; ++gx) {
+            uint32_t px = ((10U + (gx * 80U) / 15U) * width) / 100U;
+            if (px >= width) px = width - 1U;
+
+            uint32_t r = (uint32_t)row[px * 3U + 0U];
+            uint32_t g = (uint32_t)row[px * 3U + 1U];
+            uint32_t b = (uint32_t)row[px * 3U + 2U];
+            uint32_t luma = (r * 77U + g * 150U + b * 29U) >> 8U;
+
+            total_luma_sum += (uint64_t)luma;
+            total_cnt++;
+
+            if (luma > peak_luma && gx >= 4U && gx <= 11U && gy >= 3U && gy <= 12U) {
+                peak_luma = luma;
+                peak_rgb24 = (r << 16U) | (g << 8U) | b;
+            }
+
+            /* Detect rich Nordic cabin red / warm terracotta swatch */
+            if (r > g + 35U && r > b + 35U && r > 90U) {
+                uint32_t r_excess = r - ((g + b) >> 1U);
+                if (r_excess > warm_red_score) {
+                    warm_red_score = r_excess;
+                    warm_red_rgb24 = (r << 16U) | (g << 8U) | b;
+                }
+            }
+
+            /* Outer left/right margin of the active frame */
+            if (gx <= 1U || gx >= 14U) {
+                brd_r += r;
+                brd_g += g;
+                brd_b += b;
+                brd_cnt++;
+                if (gy >= 3U && gy <= 11U) {
+                    lmargin_luma_sum += luma;
+                    lmargin_cnt++;
+                }
+                if (gy >= 8U && gy <= 14U) {
+                    studio_cream_sum += luma;
+                    studio_cream_cnt++;
+                }
+            }
+
+            /* Central upper window / sky zone */
+            if (gx >= 4U && gx <= 11U && gy >= 1U && gy <= 5U) {
+                top_r += r;
+                top_g += g;
+                top_b += b;
+                top_cnt++;
+            }
+
+            /* Central lower ground / autumn foliage / sea zone */
+            if (gx >= 4U && gx <= 11U && gy >= 8U && gy <= 13U) {
+                bot_r += r;
+                bot_g += g;
+                bot_b += b;
+                bot_cnt++;
+            }
+        }
+    }
+
+    uint32_t avg_luma = (total_cnt > 0ULL) ? (uint32_t)(total_luma_sum / total_cnt) : 64U;
+    uint32_t margin_luma = (lmargin_cnt > 0ULL) ? (uint32_t)(lmargin_luma_sum / lmargin_cnt) : 64U;
+    uint32_t cream_luma = (studio_cream_cnt > 0ULL) ? (uint32_t)(studio_cream_sum / studio_cream_cnt) : 64U;
+
+    uint32_t sky_r = (top_cnt > 0ULL) ? (uint32_t)(top_r / top_cnt) : 58U;
+    uint32_t sky_g = (top_cnt > 0ULL) ? (uint32_t)(top_g / top_cnt) : 126U;
+    uint32_t sky_b = (top_cnt > 0ULL) ? (uint32_t)(top_b / top_cnt) : 194U;
+
+    uint32_t gnd_r = (bot_cnt > 0ULL) ? (uint32_t)(bot_r / bot_cnt) : 216U;
+    uint32_t gnd_g = (bot_cnt > 0ULL) ? (uint32_t)(bot_g / bot_cnt) : 139U;
+    uint32_t gnd_b = (bot_cnt > 0ULL) ? (uint32_t)(bot_b / bot_cnt) : 40U;
+
+    uint32_t bg_r = (brd_cnt > 0ULL) ? (uint32_t)(brd_r / brd_cnt) : 16U;
+    uint32_t bg_g = (brd_cnt > 0ULL) ? (uint32_t)(brd_g / brd_cnt) : 18U;
+    uint32_t bg_b = (brd_cnt > 0ULL) ? (uint32_t)(brd_b / brd_cnt) : 14U;
+
+    uint32_t resolved_mode = preferred_stage_mode;
+    if (resolved_mode >= FLOW_MOOD_STAGE_COUNT) {
+        /*
+         * Automatic Structural Genre Classification:
+         *   1. Bright cream/studio margin in lower half (cream_luma >= 150) -> Stage 3 (Isometric Diorama)
+         *   2. Very dark overall field (avg_luma <= 52) with bright singularity -> Stage 2 (Particle Corridor)
+         *   3. Dark cabin margin around bright sky-to-ground window gradient -> Stage 1 (Window Optics)
+         */
+        if (cream_luma >= 150U) {
+            resolved_mode = FLOW_MOOD_STAGE_ISOMETRIC_DIORAMA;
+        } else if (avg_luma <= 52U && peak_luma >= 120U) {
+            resolved_mode = FLOW_MOOD_STAGE_PARTICLE_CORRIDOR;
+        } else {
+            resolved_mode = FLOW_MOOD_STAGE_WINDOW_OPTICS;
+        }
+    }
+
+    /* Initialize baseline preset for the resolved stage, then infuse extracted image swatches */
+    flow_moodboard_init_preset64(out_mb, resolved_mode);
+    out_mb->mood_id = 500U + resolved_mode;
+
+    if (resolved_mode == FLOW_MOOD_STAGE_WINDOW_OPTICS) {
+        /* Boost saturation slightly so out-of-focus bokeh looks vivid through clear rivulets */
+        if (sky_b > sky_r) {
+            out_mb->sky_rgb24 = (sky_r << 16U) | (sky_g << 8U) | sky_b;
+        }
+        if (gnd_r > gnd_b) {
+            out_mb->ground_rgb24 = (gnd_r << 16U) | (gnd_g << 8U) | gnd_b;
+        }
+        out_mb->accent_rgb24   = peak_rgb24;
+        out_mb->backdrop_rgb24 = ((bg_r >> 1U) << 16U) | ((bg_g >> 1U) << 8U) | (bg_b >> 1U);
+    } else if (resolved_mode == FLOW_MOOD_STAGE_PARTICLE_CORRIDOR) {
+        out_mb->accent_rgb24 = peak_rgb24;
+        /* Keep deep cosmic blues while tinting with sampled chromaticity */
+        uint32_t tint_b = (sky_b > 28U) ? sky_b : 88U;
+        uint32_t tint_g = (sky_g > 16U) ? sky_g : 44U;
+        uint32_t tint_r = (sky_r > 8U)  ? sky_r : 18U;
+        out_mb->sky_rgb24    = (tint_r << 16U) | (tint_g << 8U) | tint_b;
+        out_mb->ground_rgb24 = ((tint_r >> 2U) << 16U) | ((tint_g >> 2U) << 8U) | ((tint_b >> 1U) & 0xFFU);
+    } else if (resolved_mode == FLOW_MOOD_STAGE_ISOMETRIC_DIORAMA) {
+        if (warm_red_score > 25U) {
+            out_mb->accent_rgb24 = warm_red_rgb24;
+        }
+        if (cream_luma >= 150U) {
+            out_mb->backdrop_rgb24 = (clamp_u8_i64((int64_t)bg_r + 35LL) << 16U) |
+                                     (clamp_u8_i64((int64_t)bg_g + 32LL) << 8U)  |
+                                      clamp_u8_i64((int64_t)bg_b + 28LL);
+        }
+    }
+
+    (void)margin_luma;
+    out_mb->mood_signature = flow_moodboard_calc_signature(out_mb);
+    return 0;
+}
+
+void flow_moodboard_to_prefab_and_style64(const FlowMoodboardPrefab64 *mb,
+                                          FlowPrefabDesc64 *out_prefab,
+                                          FlowArtStyle64 *out_style) {
+    if (!mb) return;
+
+    if (out_style) {
+        memset(out_style, 0, sizeof(*out_style));
+        out_style->style_id           = mb->mood_id;
+        out_style->base_rgb_hex       = mb->ground_rgb24;
+        out_style->accent_rgb_hex     = mb->accent_rgb24;
+        out_style->roughness_q16      = mb->fog_condense_q16;
+        out_style->metallic_q16       = (mb->stage_mode == FLOW_MOOD_STAGE_PARTICLE_CORRIDOR) ? 49152 : 16384;
+        out_style->emissive_gain_q16  = mb->singularity_gain_q16;
+        out_style->sdf_noise_freq_q16 = mb->particle_density_q16;
+        out_style->sdf_noise_amp_q16  = mb->rivulet_wipe_q16 >> 2;
+        out_style->msdf_stroke_q16    = FLOW_Q16_ONE;
+        out_style->strobe_hz_q16      = FLOW_Q16_ONE;
+        out_style->thermal_shift_q16  = (int32_t)(mb->cabin_warmth_kelvin << 4U);
+        out_style->flags              = FLOW_STYLE_FLAG_PHOTOSENSITIVE_SAFE;
+    }
+
+    if (out_prefab) {
+        memset(out_prefab, 0, sizeof(*out_prefab));
+        out_prefab->prefab_id        = mb->mood_id;
+        out_prefab->art_style_id     = mb->mood_id;
+        out_prefab->ricardian_grade  = FLOW_RICARDIAN_GRADE_S;
+        out_prefab->assembly_index   = (uint16_t)(4U + mb->stage_mode * 2U);
+        if (mb->stage_mode == FLOW_MOOD_STAGE_ISOMETRIC_DIORAMA) {
+            out_prefab->csg_op_mask = FLOW_CSG_ENCODE_MASK(
+                FLOW_PREFAB_PRIM_BOX, FLOW_PREFAB_PRIM_OCTAHEDRON, FLOW_CSG_OP_INTERSECT, 1U
+            );
+        } else if (mb->stage_mode == FLOW_MOOD_STAGE_WINDOW_OPTICS) {
+            out_prefab->csg_op_mask = FLOW_CSG_ENCODE_MASK(
+                FLOW_PREFAB_PRIM_BOX, FLOW_PREFAB_PRIM_CAPSULE, FLOW_CSG_OP_SMOOTH_SUBTRACT, 1U
+            );
+        } else {
+            out_prefab->csg_op_mask = FLOW_CSG_ENCODE_MASK(
+                FLOW_PREFAB_PRIM_BOX, FLOW_PREFAB_PRIM_SPHERE, FLOW_CSG_OP_SMOOTH_UNION, 4U
+            );
+        }
+        out_prefab->bounding_radius_q16 = 2 * FLOW_Q16_ONE;
+        out_prefab->prim_params_q16[0]  = mb->diorama_cut_q16;
+        out_prefab->prim_params_q16[1]  = mb->fog_condense_q16;
+        out_prefab->prim_params_q16[2]  = mb->rivulet_wipe_q16;
+        out_prefab->prim_params_q16[3]  = mb->particle_density_q16;
+        out_prefab->prim_params_q16[4]  = mb->water_level_q16;
+        out_prefab->prim_params_q16[5]  = mb->snow_cover_q16;
+        out_prefab->msdf_glyph_id       = 101U + (mb->stage_mode & 3U);
+        out_prefab->flags               = FLOW_PREFAB_FLAG_COLLIDABLE | FLOW_PREFAB_FLAG_CELESTIAL;
+        out_prefab->ssot_hash           = flow_prefab_calc_hash(out_prefab);
+    }
+}
+
+void flow_moodboard_encode_hex128(const FlowMoodboardPrefab64 *mb, char out_hex[129]) {
+    if (!out_hex) return;
+    if (!mb) {
+        memset(out_hex, '0', 128U);
+        out_hex[128] = '\0';
+        return;
+    }
+
+    const uint8_t *bytes = (const uint8_t *)mb;
+    for (size_t i = 0; i < 64U; ++i) {
+        out_hex[i * 2U + 0U] = HEX_LUT[(bytes[i] >> 4U) & 0x0FU];
+        out_hex[i * 2U + 1U] = HEX_LUT[bytes[i] & 0x0FU];
+    }
+    out_hex[128] = '\0';
+}
+
+bool flow_moodboard_decode_hex128(const char hex[129], FlowMoodboardPrefab64 *out_mb) {
+    if (!hex || !out_mb) return false;
+    if (hex[128] != '\0') {
+        memset(out_mb, 0, sizeof(*out_mb));
+        return false;
+    }
+
+    FlowMoodboardPrefab64 decoded;
+    uint8_t *bytes = (uint8_t *)&decoded;
+
+    for (size_t i = 0; i < 64U; ++i) {
+        int hi = hex_nibble_val(hex[i * 2U + 0U]);
+        int lo = hex_nibble_val(hex[i * 2U + 1U]);
+        if (hi < 0 || lo < 0) {
+            memset(out_mb, 0, sizeof(*out_mb));
+            return false;
+        }
+        bytes[i] = (uint8_t)((hi << 4) | lo);
+    }
+
+    uint64_t expected_sig = flow_moodboard_calc_signature(&decoded);
+    if (decoded.mood_signature != expected_sig) {
+        memset(out_mb, 0, sizeof(*out_mb));
+        return false;
+    }
+
+    *out_mb = decoded;
+    return true;
+}
+
+
 
 

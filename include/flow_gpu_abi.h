@@ -163,6 +163,7 @@ typedef struct __attribute__((aligned(64))) {
 #define FLOW_SVG_ACTION_TOGGLE_VSYNC  10U /* Toggle CAMetalLayer displaySyncEnabled (VSync ON/OFF) */
 #define FLOW_SVG_ACTION_CYCLE_FPS_GOV 11U /* Cycle 60 -> 120 -> Uncapped -> 30 FPS Governor budget */
 #define FLOW_SVG_ACTION_STORY_DIRECTOR 12U /* Trigger Scripted Story Finisher ("劇情殺") + Scene Transition */
+#define FLOW_SVG_ACTION_CYCLE_MOOD    13U /* Cycle Moodboard-to-Prefab Stage (Space / Window / Particles / Diorama) */
 
 typedef struct __attribute__((aligned(64))) {
     uint32_t node_id;           /*  4B: Component ID from SVG id / data-node-id */
@@ -212,8 +213,7 @@ typedef struct __attribute__((aligned(64))) {
 #define FLOW_BUS_SLOT_SOVEREIGN_GATE  10U  /* FlowSovereignGate64 */
 #define FLOW_BUS_SLOT_OBS_BRIDGE      11U  /* FlowBroadcastObsBridge64 */
 #define FLOW_BUS_SLOT_STORY_DIRECTOR  12U  /* FlowNarrativeDirector64 ("劇情殺" & "過渡動畫") */
-#define FLOW_BUS_SLOT_CUSTOM_12       12U  /* Alias for Slot 12 */
-#define FLOW_BUS_SLOT_CUSTOM_13       13U  /* Future Plugin Slot 13 */
+#define FLOW_BUS_SLOT_MOODBOARD       13U  /* FlowMoodboardPrefab64 (Moodboard-to-Prefab Stage & Swatches) */
 #define FLOW_BUS_SLOT_CUSTOM_14       14U  /* Future Plugin Slot 14 */
 #define FLOW_BUS_SLOT_CUSTOM_15       15U  /* Future Plugin Slot 15 */
 
