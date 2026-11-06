@@ -1646,3 +1646,157 @@ void flow_ui_text_input_move_cursor64(FlowUiTextInput64 *input,
     input->content_hash         = compute_text_input_hash64(input);
 }
 
+/* ============================================================================
+ * 10. System Font Glyph Atlas, CJK IME Composition, Host Window & Native OS ABI
+ * ============================================================================ */
+
+static uint64_t calc_ui_block_mac64(const void *block64, uint64_t seed) {
+    const uint64_t *w = (const uint64_t *)block64;
+    uint64_t h = seed ^ 0x9E3779B97F4A7C15ULL;
+    for (size_t i = 0U; i < 7U; ++i) {
+        uint64_t x = w[i] + 0x9E3779B97F4A7C15ULL + (uint64_t)i;
+        x = (x ^ (x >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+        x = (x ^ (x >> 27U)) * 0x94D049BB133111EBULL;
+        h ^= x ^ (x >> 31U);
+        h = (h << 13U) | (h >> 51U);
+    }
+    return (h == 0ULL) ? 1ULL : h;
+}
+
+void flow_font_glyph_rasterize64(uint32_t codepoint, FlowFontAtlasGlyph64 *out_glyph) {
+    if (!out_glyph) return;
+    memset(out_glyph, 0, sizeof(*out_glyph));
+    out_glyph->codepoint = codepoint;
+    bool is_cjk = (codepoint >= 0x2E80U && codepoint <= 0x9FFFU) ||
+                  (codepoint >= 0xAC00U && codepoint <= 0xD7AFU) ||
+                  (codepoint >= 0xF900U && codepoint <= 0xFAFFU);
+    uint32_t slot = codepoint & 0xFFU;
+    out_glyph->atlas_u_q16   = (uint16_t)((slot & 0x0FU) << 12U);
+    out_glyph->atlas_v_q16   = (uint16_t)(((slot >> 4U) & 0x0FU) << 12U);
+    out_glyph->atlas_w_q16   = is_cjk ? 4096U : 2048U;
+    out_glyph->atlas_h_q16   = 4096U;
+    out_glyph->advance_x_q16 = is_cjk ? 65536 : 36864;
+    out_glyph->bearing_x_q16 = 2048;
+    out_glyph->bearing_y_q16 = 57344;
+
+    uint64_t seed = (uint64_t)codepoint * 0x9E3779B97F4A7C15ULL + 0xBF58476D1CE4E5B9ULL;
+    for (size_t i = 0U; i < 32U; ++i) {
+        seed ^= seed >> 12U;
+        seed ^= seed << 25U;
+        seed ^= seed >> 27U;
+        out_glyph->sdf_bitmap8x8[i] = (uint8_t)((seed * 0x2545F4914F6CDD1DULL) >> 56U);
+    }
+    out_glyph->glyph_mac = calc_ui_block_mac64(out_glyph, 0x464F4E54474C5950ULL);
+}
+
+void flow_ime_composition_init64(FlowImeComposition64 *ime, uint32_t target_node_id) {
+    if (!ime) return;
+    memset(ime, 0, sizeof(*ime));
+    ime->target_node_id = target_node_id;
+    ime->ime_mac = calc_ui_block_mac64(ime, 0x494D45434F4D5036ULL);
+}
+
+bool flow_ime_composition_set_preedit64(FlowImeComposition64 *ime,
+                                        const char *utf8_preedit,
+                                        uint8_t candidate_idx) {
+    if (!ime || !utf8_preedit) return false;
+    uint8_t len = 0U;
+    while (utf8_preedit[len] != '\0' && len < FLOW_IME_PREEDIT_CAP) {
+        ime->preedit_utf8[len] = utf8_preedit[len];
+        len++;
+    }
+    ime->preedit_utf8[len] = '\0';
+    ime->preedit_len       = len;
+    ime->cursor_offset     = len;
+    ime->candidate_index   = (candidate_idx < 10U) ? candidate_idx : 0U;
+    ime->ime_active        = (len > 0U) ? 1U : 0U;
+    ime->ime_mac           = calc_ui_block_mac64(ime, 0x494D45434F4D5036ULL);
+    return true;
+}
+
+bool flow_ime_composition_commit_to_input64(FlowImeComposition64 *ime,
+                                            FlowUiTextInput64 *input,
+                                            FlowSvgUiNode64 *bound_node) {
+    if (!ime || !input || ime->preedit_len == 0U) return false;
+    uint8_t avail = (input->byte_len < FLOW_UI_TEXT_INPUT_CAP)
+        ? (uint8_t)(FLOW_UI_TEXT_INPUT_CAP - input->byte_len)
+        : 0U;
+    uint8_t copy_n = (ime->preedit_len <= avail) ? ime->preedit_len : avail;
+    if (copy_n == 0U) return false;
+
+    uint8_t pos = (input->cursor_byte_pos <= input->byte_len)
+        ? input->cursor_byte_pos
+        : input->byte_len;
+    for (uint8_t k = (uint8_t)(input->byte_len + copy_n - 1U); k >= (uint8_t)(pos + copy_n); --k) {
+        input->utf8_buf[k] = input->utf8_buf[k - copy_n];
+    }
+    for (uint8_t i = 0U; i < copy_n; ++i) {
+        input->utf8_buf[pos + i] = ime->preedit_utf8[i];
+    }
+    input->byte_len            = (uint8_t)(input->byte_len + copy_n);
+    input->utf8_buf[input->byte_len] = '\0';
+    input->cursor_byte_pos     = (uint8_t)(pos + copy_n);
+    input->selection_anchor_pos = input->cursor_byte_pos;
+    input->edit_revision       += 1U;
+    input->content_hash        = compute_text_input_hash64(input);
+    sync_text_input_to_node(input, bound_node);
+
+    memset(ime->preedit_utf8, 0, sizeof(ime->preedit_utf8));
+    ime->preedit_len     = 0U;
+    ime->cursor_offset   = 0U;
+    ime->ime_active      = 0U;
+    ime->committed_count += 1U;
+    ime->ime_mac         = calc_ui_block_mac64(ime, 0x494D45434F4D5036ULL);
+    return true;
+}
+
+void flow_host_window_init64(FlowHostWindowDesc64 *win,
+                             uint32_t backend_api,
+                             uint32_t logical_w,
+                             uint32_t logical_h,
+                             int32_t dpi_scale_q16,
+                             uint32_t target_fps) {
+    if (!win) return;
+    memset(win, 0, sizeof(*win));
+    win->backend_api       = (backend_api >= 1U && backend_api <= 4U) ? backend_api : FLOW_HOST_BACKEND_METAL_COCOA;
+    win->logical_width_px  = (logical_w > 0U) ? logical_w : 1920U;
+    win->logical_height_px = (logical_h > 0U) ? logical_h : 1080U;
+    win->target_fps        = (target_fps > 0U) ? target_fps : 60U;
+    win->host_flags        = 0x09U; /* VSync + IME enabled */
+    flow_host_window_apply_dpi64(win, dpi_scale_q16);
+}
+
+void flow_host_window_apply_dpi64(FlowHostWindowDesc64 *win, int32_t new_dpi_scale_q16) {
+    if (!win) return;
+    int32_t scale = clamp_i32_ui(new_dpi_scale_q16, 32768, 262144); /* [0.5x .. 4.0x] */
+    win->dpi_scale_q16 = scale;
+    win->fb_width_px   = (uint32_t)(((uint64_t)win->logical_width_px * (uint64_t)scale + 32768ULL) >> 16U);
+    win->fb_height_px  = (uint32_t)(((uint64_t)win->logical_height_px * (uint64_t)scale + 32768ULL) >> 16U);
+    win->frame_epoch  += 1ULL;
+    win->window_mac    = calc_ui_block_mac64(win, 0x484F535457494E36ULL);
+}
+
+bool flow_native_dialog_prepare64(FlowNativeDialogDesc64 *dlg,
+                                  uint32_t dialog_kind,
+                                  uint32_t filter_mask,
+                                  const char *payload_utf8) {
+    if (!dlg || dialog_kind < FLOW_DIALOG_OPEN_FILE || dialog_kind > FLOW_DIALOG_CLIPBOARD_PASTE) {
+        return false;
+    }
+    memset(dlg, 0, sizeof(*dlg));
+    dlg->dialog_kind = dialog_kind;
+    dlg->filter_mask = filter_mask;
+    dlg->status_code = 2U; /* Accepted / Ready */
+    if (payload_utf8) {
+        uint32_t len = 0U;
+        while (payload_utf8[len] != '\0' && len < 39U) {
+            dlg->path_or_clip_utf8[len] = payload_utf8[len];
+            len++;
+        }
+        dlg->path_or_clip_utf8[len] = '\0';
+        dlg->payload_len = len;
+    }
+    dlg->dialog_mac = calc_ui_block_mac64(dlg, 0x4E4154444C473634ULL);
+    return true;
+}
+

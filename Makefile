@@ -39,7 +39,7 @@ TARGET_TEST_WP     = build/test-wallpaper-engine
 TARGET_TEST_SVGUI  = build/test-svg-ui
 TARGET_GAME        = build/bloom
 
-.PHONY: all test clean bench storyboard headless wallpaper run dirs verify-flowy verify-lean-all
+.PHONY: all test clean bench storyboard headless wallpaper run dirs verify-flowy verify-lean-all bundle-macos
 
 all: $(BLOOM_LIB) $(TARGET_TEST_CORE) $(TARGET_TEST_PREFAB) $(TARGET_TEST_PROC) $(TARGET_TEST_CINE) $(TARGET_TEST_WP) $(TARGET_TEST_SVGUI) $(TARGET_GAME)
 
@@ -209,6 +209,22 @@ wallpaper: $(TARGET_GAME)
 
 run: $(TARGET_GAME)
 	./$(TARGET_GAME)
+
+bundle-macos: $(TARGET_GAME)
+	@mkdir -p build/BLOOM.app/Contents/MacOS build/BLOOM.app/Contents/Resources
+	@cp $(TARGET_GAME) build/BLOOM.app/Contents/MacOS/bloom
+	@cp specs/cockpit_hud.svg build/BLOOM.app/Contents/Resources/cockpit_hud.svg
+	@printf '%s\n' \
+	  '<?xml version="1.0" encoding="UTF-8"?>' \
+	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+	  '<plist version="1.0"><dict>' \
+	  '  <key>CFBundleExecutable</key><string>bloom</string>' \
+	  '  <key>CFBundleIdentifier</key><string>org.flow.bloom</string>' \
+	  '  <key>CFBundleName</key><string>BLOOM</string>' \
+	  '  <key>CFBundleVersion</key><string>$(BLOOM_VERSION)</string>' \
+	  '  <key>NSHighResolutionCapable</key><true/>' \
+	  '</dict></plist>' > build/BLOOM.app/Contents/Info.plist
+	@echo "✓ Packaged standalone macOS Application Bundle: build/BLOOM.app"
 
 clean:
 	rm -rf build

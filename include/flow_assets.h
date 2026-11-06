@@ -160,4 +160,17 @@ bool flow_asset_load_svg_icon_file(const char *svg_path,
                                    uint32_t style_id,
                                    FlowGpuGlyphDesc64 *out_glyph);
 
+/* 4. Data-Driven 64-Byte GPU CSG Instruction Compiler & Program Evaluator */
+void flow_asset_compile_glb_to_csg_op64(const FlowGlbMeshDesc64 *mesh,
+                                        uint32_t op_id,
+                                        uint32_t bool_op,
+                                        int32_t smooth_k_q16,
+                                        FlowGpuCsgOp64 *out_op);
+
+int64_t flow_asset_eval_csg_program_q16(const FlowGpuCsgOp64 *ops,
+                                        size_t op_count,
+                                        int64_t px_q16,
+                                        int64_t py_q16,
+                                        int64_t pz_q16);
+
 #endif /* FLOW_ASSETS_H */

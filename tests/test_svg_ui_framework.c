@@ -21,7 +21,7 @@
 #include <string.h>
 
 static void test_64b_univalence(void) {
-    printf("  [Test 1/15] 64B Univalence (11 Descriptors: SVG-UI, OBS, Prefab, Log, LaTeX, Director, Layout, RegBank, TextInput)... ");
+    printf("  [Test 1/16] 64B Univalence (15 Descriptors: SVG-UI, OBS, Prefab, Log, LaTeX, Director, Layout, RegBank, TextInput, Font, IME, Window, Dialog)... ");
     assert(sizeof(FlowSvgUiNode64) == 64U && _Alignof(FlowSvgUiNode64) == 64U);
     assert(sizeof(FlowSvgUiDomState64) == 64U && _Alignof(FlowSvgUiDomState64) == 64U);
     assert(sizeof(FlowBroadcastObsBridge64) == 64U && _Alignof(FlowBroadcastObsBridge64) == 64U);
@@ -33,7 +33,11 @@ static void test_64b_univalence(void) {
     assert(sizeof(FlowUiLayoutContainer64) == 64U && _Alignof(FlowUiLayoutContainer64) == 64U);
     assert(sizeof(FlowUiRegisterBank64) == 64U && _Alignof(FlowUiRegisterBank64) == 64U);
     assert(sizeof(FlowUiTextInput64) == 64U && _Alignof(FlowUiTextInput64) == 64U);
-    printf("PASS (11 x 64B)\n");
+    assert(sizeof(FlowFontAtlasGlyph64) == 64U && _Alignof(FlowFontAtlasGlyph64) == 64U);
+    assert(sizeof(FlowImeComposition64) == 64U && _Alignof(FlowImeComposition64) == 64U);
+    assert(sizeof(FlowHostWindowDesc64) == 64U && _Alignof(FlowHostWindowDesc64) == 64U);
+    assert(sizeof(FlowNativeDialogDesc64) == 64U && _Alignof(FlowNativeDialogDesc64) == 64U);
+    printf("PASS (15 x 64B)\n");
 }
 
 static void test_svg_ui_compilation(void) {
@@ -651,6 +655,45 @@ static void test_generic_register_bank_and_text_input64(void) {
            input.utf8_buf, input.byte_len, (unsigned)FLOW_UI_TEXT_INPUT_CAP);
 }
 
+static void test_font_atlas_ime_dpi_and_native_dialog(void) {
+    printf("  [Test 16/16] 64B System Font Glyph, CJK IME Bridge (Thm 19), High-DPI Window (Thm 20) & Native Dialog... ");
+
+    /* 1. System Font Glyph SDF Atlas Rasterizer (ASCII + CJK Double-Width) */
+    FlowFontAtlasGlyph64 g_ascii, g_cjk;
+    flow_font_glyph_rasterize64(0x0041U, &g_ascii); /* 'A' */
+    flow_font_glyph_rasterize64(0x6D41U, &g_cjk);   /* '流' (U+6D41) */
+    assert(g_ascii.glyph_mac != 0ULL && g_cjk.glyph_mac != 0ULL);
+    assert(g_cjk.advance_x_q16 == 65536 && g_cjk.advance_x_q16 > g_ascii.advance_x_q16);
+
+    /* 2. CJK IME Composition Pre-Edit & Commit into FlowUiTextInput64 (Theorem 19) */
+    FlowUiTextInput64 input;
+    FlowSvgUiNode64 node;
+    memset(&node, 0, sizeof(node));
+    flow_ui_text_input_init64(&input, 701U, 1U, "FLOW:");
+    FlowImeComposition64 ime;
+    flow_ime_composition_init64(&ime, 701U);
+    assert(flow_ime_composition_set_preedit64(&ime, "\xE6\xB5\x81\xE9\x87\x8F", 2U)); /* "流量" (6 UTF-8 bytes) */
+    assert(ime.ime_active == 1U && ime.preedit_len == 6U && ime.candidate_index == 2U);
+    assert(flow_ime_composition_commit_to_input64(&ime, &input, &node));
+    assert(ime.ime_active == 0U && ime.preedit_len == 0U && ime.committed_count == 1U);
+    assert(input.byte_len == 11U && strcmp(input.utf8_buf, "FLOW:\xE6\xB5\x81\xE9\x87\x8F") == 0);
+
+    /* 3. Cross-Platform Window & Per-Monitor High-DPI Scaling (Theorem 20: 1.0x vs 2.0x Retina) */
+    FlowHostWindowDesc64 win;
+    flow_host_window_init64(&win, FLOW_HOST_BACKEND_METAL_COCOA, 1920U, 1080U, 65536, 120U);
+    assert(win.fb_width_px == 1920U && win.fb_height_px == 1080U);
+    flow_host_window_apply_dpi64(&win, 131072); /* 2.0x Retina HiDPI */
+    assert(win.fb_width_px == 3840U && win.fb_height_px == 2160U && win.window_mac != 0ULL);
+
+    /* 4. Native OS File Dialog & Clipboard 64B Bridge */
+    FlowNativeDialogDesc64 dlg;
+    assert(flow_native_dialog_prepare64(&dlg, FLOW_DIALOG_OPEN_FILE, 0x03U, "assets/spaceship.glb"));
+    assert(dlg.status_code == 2U && strcmp(dlg.path_or_clip_utf8, "assets/spaceship.glb") == 0 && dlg.dialog_mac != 0ULL);
+
+    printf("PASS (CJK Advance=%d, IME=\"%s\", Retina=%ux%u, Dialog=%s)\n",
+           g_cjk.advance_x_q16, input.utf8_buf, win.fb_width_px, win.fb_height_px, dlg.path_or_clip_utf8);
+}
+
 int main(void) {
     printf("================================================================================\n");
     printf("  FLOW SVG-UI, Physical Glass, LaTeX SDF, Flex Layout & Story Director Suite\n");
@@ -670,8 +713,9 @@ int main(void) {
     test_story_finisher_execution_director();
     test_scene_transition_wipe_and_atomic_swap();
     test_generic_register_bank_and_text_input64();
+    test_font_atlas_ime_dpi_and_native_dialog();
     printf("================================================================================\n");
-    printf("  ALL 15 FLOW SVG-UI, GLASS, LATEX SDF, FLEX LAYOUT & WIDGET TESTS PASSED\n");
+    printf("  ALL 16 FLOW SVG-UI, GLASS, LATEX SDF, FLEX LAYOUT & DESKTOP ABI TESTS PASSED\n");
     printf("================================================================================\n");
     return 0;
 }

@@ -4,7 +4,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include "flow_hott_jet.h"
 #include "ricardian.h"
 
 /*

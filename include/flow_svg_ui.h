@@ -5,7 +5,6 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "flow_gpu_abi.h"
-#include "flow_hott_jet.h"
 #include "ricardian.h"
 
 /*
@@ -523,6 +522,110 @@ bool flow_ui_text_input_backspace64(FlowUiTextInput64 *input,
                                     FlowSvgUiNode64 *bound_node);
 void flow_ui_text_input_move_cursor64(FlowUiTextInput64 *input,
                                       int32_t delta);
+
+/*
+ * ============================================================================
+ * 10. System Font Glyph Atlas, CJK IME Composition, Host Window & Native OS ABI
+ * ============================================================================
+ */
+typedef struct __attribute__((aligned(64))) {
+    uint32_t codepoint;         /*  4B: Unicode codepoint (U+0000..U+10FFFF, incl. CJK) */
+    uint16_t atlas_u_q16;       /*  2B: Normalized atlas left U */
+    uint16_t atlas_v_q16;       /*  2B: Normalized atlas top V */
+    uint16_t atlas_w_q16;       /*  2B: Normalized atlas width */
+    uint16_t atlas_h_q16;       /*  2B: Normalized atlas height */
+    int32_t  advance_x_q16;     /*  4B: Horizontal advance in Q16 */
+    int32_t  bearing_x_q16;     /*  4B: Left side bearing in Q16 */
+    int32_t  bearing_y_q16;     /*  4B: Top baseline bearing in Q16 */
+    uint8_t  sdf_bitmap8x8[32]; /* 32B: Inline 8x8 4-bit quantized MSDF/alpha glyph cell */
+    uint64_t glyph_mac;         /*  8B: 64-bit glyph integrity MAC */
+} FlowFontAtlasGlyph64;
+
+FLOW_STATIC_ASSERT_UNIVALENT(FlowFontAtlasGlyph64, RicardianStateV4);
+_Static_assert(sizeof(FlowFontAtlasGlyph64) == 64U, "FlowFontAtlasGlyph64 must be 64 bytes");
+_Static_assert(_Alignof(FlowFontAtlasGlyph64) == 64U, "FlowFontAtlasGlyph64 must be 64-byte aligned");
+
+#define FLOW_IME_PREEDIT_CAP 35U
+
+typedef struct __attribute__((aligned(64))) {
+    uint32_t target_node_id;    /*  4B: Bound FlowUiTextInput64 node_id */
+    uint8_t  preedit_len;       /*  1B: Active UTF-8 byte length in preedit_utf8 (0..35) */
+    uint8_t  cursor_offset;     /*  1B: Caret byte offset within preedit_utf8 */
+    uint8_t  candidate_index;   /*  1B: Selected IME candidate index (0..9) */
+    uint8_t  ime_active;        /*  1B: 1 when OS IME composition window is active */
+    char     preedit_utf8[36];  /* 36B: Inline UTF-8 CJK/phonetic composition string */
+    int32_t  anchor_x_q16;      /*  4B: Candidate window X anchor in Q16 */
+    int32_t  anchor_y_q16;      /*  4B: Candidate window Y anchor in Q16 */
+    uint32_t committed_count;   /*  4B: Count of committed composition phrases */
+    uint64_t ime_mac;           /*  8B: 64-bit IME state MAC */
+} FlowImeComposition64;
+
+FLOW_STATIC_ASSERT_UNIVALENT(FlowImeComposition64, RicardianStateV4);
+_Static_assert(sizeof(FlowImeComposition64) == 64U, "FlowImeComposition64 must be 64 bytes");
+_Static_assert(_Alignof(FlowImeComposition64) == 64U, "FlowImeComposition64 must be 64-byte aligned");
+
+#define FLOW_HOST_BACKEND_METAL_COCOA  1U
+#define FLOW_HOST_BACKEND_WIN32_D3D12  2U
+#define FLOW_HOST_BACKEND_SDL3_VULKAN  3U
+#define FLOW_HOST_BACKEND_HEADLESS     4U
+
+typedef struct __attribute__((aligned(64))) {
+    uint32_t backend_api;        /*  4B: FLOW_HOST_BACKEND_* */
+    uint32_t logical_width_px;   /*  4B: Logical window width in points/DIPs */
+    uint32_t logical_height_px;  /*  4B: Logical window height in points/DIPs */
+    uint32_t fb_width_px;        /*  4B: Physical framebuffer width after DPI scale */
+    uint32_t fb_height_px;       /*  4B: Physical framebuffer height after DPI scale */
+    int32_t  dpi_scale_q16;      /*  4B: Per-Monitor DPI factor in Q16 (65536=1x, 131072=2x) */
+    uint32_t target_fps;         /*  4B: Target swapchain refresh rate */
+    uint32_t host_flags;         /*  4B: Bit0=VSync, Bit1=HDR, Bit2=Borderless, Bit3=IME */
+    int32_t  pointer_x_q16;      /*  4B: Normalized pointer X [-32768..+32768] */
+    int32_t  pointer_y_q16;      /*  4B: Normalized pointer Y [-32768..+32768] */
+    uint64_t frame_epoch;        /*  8B: Monotonic swapchain presentation epoch */
+    uint64_t native_handle_hash; /*  8B: Hash of NSWindow* / HWND / VkSurfaceKHR */
+    uint64_t window_mac;         /*  8B: 64-bit host window descriptor MAC */
+} FlowHostWindowDesc64;
+
+FLOW_STATIC_ASSERT_UNIVALENT(FlowHostWindowDesc64, RicardianStateV4);
+_Static_assert(sizeof(FlowHostWindowDesc64) == 64U, "FlowHostWindowDesc64 must be 64 bytes");
+_Static_assert(_Alignof(FlowHostWindowDesc64) == 64U, "FlowHostWindowDesc64 must be 64-byte aligned");
+
+#define FLOW_DIALOG_OPEN_FILE       1U
+#define FLOW_DIALOG_SAVE_FILE       2U
+#define FLOW_DIALOG_CLIPBOARD_COPY  3U
+#define FLOW_DIALOG_CLIPBOARD_PASTE 4U
+
+typedef struct __attribute__((aligned(64))) {
+    uint32_t dialog_kind;           /*  4B: FLOW_DIALOG_* */
+    uint32_t status_code;           /*  4B: 0=Idle, 1=Pending, 2=Accepted, 3=Cancelled */
+    uint32_t filter_mask;           /*  4B: Allowed extension mask (.wav/.glb/.svg/.ppm/.mp4) */
+    uint32_t payload_len;           /*  4B: Byte length of path_or_clip_utf8 (0..39) */
+    char     path_or_clip_utf8[40]; /* 40B: Inline selected path or clipboard UTF-8 text */
+    uint64_t dialog_mac;            /*  8B: 64-bit native dialog/clipboard MAC */
+} FlowNativeDialogDesc64;
+
+FLOW_STATIC_ASSERT_UNIVALENT(FlowNativeDialogDesc64, RicardianStateV4);
+_Static_assert(sizeof(FlowNativeDialogDesc64) == 64U, "FlowNativeDialogDesc64 must be 64 bytes");
+_Static_assert(_Alignof(FlowNativeDialogDesc64) == 64U, "FlowNativeDialogDesc64 must be 64-byte aligned");
+
+void flow_font_glyph_rasterize64(uint32_t codepoint, FlowFontAtlasGlyph64 *out_glyph);
+void flow_ime_composition_init64(FlowImeComposition64 *ime, uint32_t target_node_id);
+bool flow_ime_composition_set_preedit64(FlowImeComposition64 *ime,
+                                        const char *utf8_preedit,
+                                        uint8_t candidate_idx);
+bool flow_ime_composition_commit_to_input64(FlowImeComposition64 *ime,
+                                            FlowUiTextInput64 *input,
+                                            FlowSvgUiNode64 *bound_node);
+void flow_host_window_init64(FlowHostWindowDesc64 *win,
+                             uint32_t backend_api,
+                             uint32_t logical_w,
+                             uint32_t logical_h,
+                             int32_t dpi_scale_q16,
+                             uint32_t target_fps);
+void flow_host_window_apply_dpi64(FlowHostWindowDesc64 *win, int32_t new_dpi_scale_q16);
+bool flow_native_dialog_prepare64(FlowNativeDialogDesc64 *dlg,
+                                  uint32_t dialog_kind,
+                                  uint32_t filter_mask,
+                                  const char *payload_utf8);
 
 #endif /* FLOW_SVG_UI_H */
 

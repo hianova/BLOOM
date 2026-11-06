@@ -15,6 +15,12 @@
 
 #include <stdint.h>
 
+#ifndef FLOW_STATIC_ASSERT_UNIVALENT
+#define FLOW_STATIC_ASSERT_UNIVALENT(TypeA, TypeB)                                       \
+    _Static_assert(sizeof(TypeA) == sizeof(TypeB) && _Alignof(TypeA) == _Alignof(TypeB), \
+                   "HoTT Univalence violation: TypeA and TypeB are not layout-isomorphic")
+#endif
+
 typedef struct __attribute__((aligned(64))) {
     uint64_t reserve_a;       /* 8B: Constant-product AMM reserve A */
     uint64_t reserve_b;       /* 8B: Constant-product AMM reserve B */

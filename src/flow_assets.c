@@ -1,4 +1,6 @@
 #include "flow_assets.h"
+#include "flow_hott_jet.h"
+#include "ricardian.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -684,4 +686,96 @@ bool flow_asset_load_svg_icon_file(const char *svg_path,
     fclose(fp);
     s_svg_buf[n] = '\0';
     return flow_asset_compile_svg_icon64(s_svg_buf, glyph_id, style_id, out_glyph);
+}
+
+/* ============================================================================
+ * 5. Data-Driven 64-Byte GPU CSG Instruction Compiler & Program Evaluator
+ * ============================================================================ */
+
+void flow_asset_compile_glb_to_csg_op64(const FlowGlbMeshDesc64 *mesh,
+                                        uint32_t op_id,
+                                        uint32_t bool_op,
+                                        int32_t smooth_k_q16,
+                                        FlowGpuCsgOp64 *out_op) {
+    if (!out_op) {
+        return;
+    }
+    memset(out_op, 0, sizeof(*out_op));
+    out_op->op_id       = op_id;
+    out_op->prim_type   = FLOW_CSG_PRIM_GLB_AABB;
+    out_op->bool_op     = bool_op;
+    out_op->smooth_k_q16 = (smooth_k_q16 > 0) ? smooth_k_q16 : 0;
+    out_op->bevel_r_q16  = 1024;
+    out_op->active_stage_mask = 0x0FULL;
+    if (mesh) {
+        out_op->material_id = mesh->material_style_id;
+        for (size_t d = 0U; d < 3U; ++d) {
+            int64_t lo = (int64_t)mesh->aabb_min_q16[d];
+            int64_t hi = (int64_t)mesh->aabb_max_q16[d];
+            out_op->pos_q16[d] = (int32_t)((lo + hi) / 2LL);
+            int64_t span = hi - lo;
+            out_op->extents_q16[d] = (int32_t)((span > 0LL) ? (span / 2LL) : 1024LL);
+        }
+    }
+    out_op->csg_op_mac = flow_capsule64_calc_mac(out_op, 0x4353474F50363421ULL);
+}
+
+static int64_t eval_single_csg_prim_q16(const FlowGpuCsgOp64 *op,
+                                        int64_t px_q16,
+                                        int64_t py_q16,
+                                        int64_t pz_q16) {
+    int64_t lx = px_q16 - (int64_t)op->pos_q16[0];
+    int64_t ly = py_q16 - (int64_t)op->pos_q16[1];
+    int64_t lz = pz_q16 - (int64_t)op->pos_q16[2];
+    int64_t ax = (lx < 0LL) ? -lx : lx;
+    int64_t ay = (ly < 0LL) ? -ly : ly;
+    int64_t az = (lz < 0LL) ? -lz : lz;
+    if (op->prim_type == FLOW_CSG_PRIM_SPHERE) {
+        int64_t r = (op->extents_q16[0] > 0) ? (int64_t)op->extents_q16[0] : 65536LL;
+        int64_t max_c = ax;
+        if (ay > max_c) max_c = ay;
+        if (az > max_c) max_c = az;
+        return max_c - r;
+    }
+    int64_t dx = ax - (int64_t)op->extents_q16[0];
+    int64_t dy = ay - (int64_t)op->extents_q16[1];
+    int64_t dz = az - (int64_t)op->extents_q16[2];
+    int64_t max_in = dx;
+    if (dy > max_in) max_in = dy;
+    if (dz > max_in) max_in = dz;
+    int64_t out_x = (dx > 0LL) ? dx : 0LL;
+    int64_t out_y = (dy > 0LL) ? dy : 0LL;
+    int64_t out_z = (dz > 0LL) ? dz : 0LL;
+    int64_t inside = (max_in < 0LL) ? max_in : 0LL;
+    return (out_x + out_y + out_z) + inside - (int64_t)op->bevel_r_q16;
+}
+
+int64_t flow_asset_eval_csg_program_q16(const FlowGpuCsgOp64 *ops,
+                                        size_t op_count,
+                                        int64_t px_q16,
+                                        int64_t py_q16,
+                                        int64_t pz_q16) {
+    if (!ops || op_count == 0U) {
+        return 65536000LL;
+    }
+    int64_t acc = eval_single_csg_prim_q16(&ops[0], px_q16, py_q16, pz_q16);
+    for (size_t i = 1U; i < op_count; ++i) {
+        int64_t d = eval_single_csg_prim_q16(&ops[i], px_q16, py_q16, pz_q16);
+        uint32_t bop = ops[i].bool_op;
+        if (bop == FLOW_CSG_BOOL_SUBTRACT) {
+            int64_t neg_d = -d;
+            acc = (acc > neg_d) ? acc : neg_d;
+        } else if (bop == FLOW_CSG_BOOL_INTERSECT) {
+            acc = (acc > d) ? acc : d;
+        } else if (bop == FLOW_CSG_BOOL_SMOOTH_UNION && ops[i].smooth_k_q16 > 0) {
+            int64_t k = (int64_t)ops[i].smooth_k_q16;
+            int64_t diff = (acc > d) ? (acc - d) : (d - acc);
+            int64_t h = (k > diff) ? (k - diff) : 0LL;
+            int64_t min_d = (acc < d) ? acc : d;
+            acc = min_d - ((h * h) / (4LL * k));
+        } else {
+            acc = (acc < d) ? acc : d;
+        }
+    }
+    return acc;
 }

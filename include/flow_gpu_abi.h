@@ -25,7 +25,6 @@ using namespace metal;
 #endif
 #else
 #include <stdint.h>
-#include "flow_hott_jet.h"
 #include "ricardian.h"
 #endif
 
@@ -113,6 +112,34 @@ typedef struct __attribute__((aligned(64))) {
     int16_t  seg_coords_q8[20]; /* 40B: 5 segments x (x0, y0, x1, y1) in Q8.8 */
     uint64_t ternary_pos_mask;  /*  8B: 64-bit spatial quadrant bitmask */
 } FlowGpuGlyphDesc64;
+
+/*
+ * Shared 64-Byte Data-Driven GPU CSG Instruction Descriptor (CPU Prefab/GLB <-> Metal Raymarcher)
+ */
+#define FLOW_CSG_PRIM_BOX         0U
+#define FLOW_CSG_PRIM_SPHERE      1U
+#define FLOW_CSG_PRIM_CAPSULE     2U
+#define FLOW_CSG_PRIM_CYLINDER    3U
+#define FLOW_CSG_PRIM_TORUS       4U
+#define FLOW_CSG_PRIM_GLB_AABB    5U
+
+#define FLOW_CSG_BOOL_UNION        0U
+#define FLOW_CSG_BOOL_SUBTRACT     1U
+#define FLOW_CSG_BOOL_INTERSECT    2U
+#define FLOW_CSG_BOOL_SMOOTH_UNION 3U
+
+typedef struct __attribute__((aligned(64))) {
+    uint32_t op_id;             /*  4B: Unique CSG instruction ID */
+    uint32_t prim_type;         /*  4B: FLOW_CSG_PRIM_* */
+    uint32_t bool_op;           /*  4B: FLOW_CSG_BOOL_* */
+    uint32_t material_id;       /*  4B: Luxury finish / material index */
+    int32_t  pos_q16[3];        /* 12B: Local center offset (x, y, z) in Q16 */
+    int32_t  extents_q16[3];    /* 12B: Half-extents or (radius, half_h, minor_r) in Q16 */
+    int32_t  smooth_k_q16;      /*  4B: Smooth boolean blend radius k in Q16 */
+    int32_t  bevel_r_q16;       /*  4B: Edge rounding bevel radius in Q16 */
+    uint64_t active_stage_mask; /*  8B: Bitmask of stage layers where op is active */
+    uint64_t csg_op_mac;        /*  8B: 64-bit integrity MAC */
+} FlowGpuCsgOp64;
 
 /*
  * Shared 64-Byte Declarative SVG-UI Frontend Node Descriptor (CPU Compiler <-> Metal Shader)
@@ -244,6 +271,7 @@ FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuSlice1Camera64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuSlice2Relativity64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuSlice3DopamineAv64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuGlyphDesc64, RicardianStateV4);
+FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuCsgOp64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowSvgUiNode64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowEngineBus64, RicardianStateV4);
 _Static_assert(sizeof(FlowGpuSlice0Core64) == 64U, "Slice 0 must be 64B");
@@ -251,6 +279,7 @@ _Static_assert(sizeof(FlowGpuSlice1Camera64) == 64U, "Slice 1 must be 64B");
 _Static_assert(sizeof(FlowGpuSlice2Relativity64) == 64U, "Slice 2 must be 64B");
 _Static_assert(sizeof(FlowGpuSlice3DopamineAv64) == 64U, "Slice 3 must be 64B");
 _Static_assert(sizeof(FlowGpuGlyphDesc64) == 64U, "FlowGpuGlyphDesc64 must be 64B");
+_Static_assert(sizeof(FlowGpuCsgOp64) == 64U, "FlowGpuCsgOp64 must be 64B");
 _Static_assert(sizeof(FlowSvgUiNode64) == 64U, "FlowSvgUiNode64 must be 64B");
 _Static_assert(sizeof(FlowEngineBus64) == 64U, "FlowEngineBus64 must be 64B");
 _Static_assert(_Alignof(FlowEngineBus64) == 64U, "FlowEngineBus64 must be 64B aligned");

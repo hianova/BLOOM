@@ -345,6 +345,38 @@ theorem ui_register_bank_channel_lookup_sound
   · unfold evalRegisterBankChannelQ16
     by_cases h_clamp : rawValQ16 > 65536 <;> simp [h_clamp] <;> omega
 
+/-- 19. CJK IME Composition Commit into `FlowUiTextInput64` (`cap = 39` bytes):
+    Computes the post-commit UTF-8 byte length when committing `commitBytes` into a buffer
+    currently holding `curLen <= 39` bytes. -/
+def evalImeCommitByteLen (curLen : Nat) (commitBytes : Nat) : Nat :=
+  if curLen >= 39 then 39
+  else if curLen + commitBytes <= 39 then curLen + commitBytes
+  else 39
+
+/-- Theorem 19: Committing any CJK IME composition buffer into `FlowUiTextInput64`
+    strictly respects the 39-byte inline UTF-8 capacity ceiling (`<= 39`). -/
+theorem ime_commit_never_overflows_cap
+    (curLen commitBytes : Nat) :
+    evalImeCommitByteLen curLen commitBytes <= 39 := by
+  unfold evalImeCommitByteLen
+  by_cases h1 : curLen >= 39
+  · simp [h1]
+  · by_cases h2 : curLen + commitBytes <= 39 <;> simp [h1, h2]
+
+/-- 20. Per-Monitor High-DPI Physical Pixel Scaling (`(logicalPx * dpiScaleQ16) / 65536`). -/
+def evalDpiPhysicalPx (logicalPx : Nat) (dpiScaleQ16 : Nat) : Nat :=
+  (logicalPx * dpiScaleQ16) / 65536
+
+/-- Theorem 20: Per-monitor High-DPI physical pixel conversion is monotonically
+    non-decreasing with respect to the display scale factor `dpiScaleQ16`. -/
+theorem dpi_scale_monotonic
+    (logicalPx s1 s2 : Nat)
+    (h_scale : s1 <= s2) :
+    evalDpiPhysicalPx logicalPx s1 <= evalDpiPhysicalPx logicalPx s2 := by
+  unfold evalDpiPhysicalPx
+  have hMul : logicalPx * s1 <= logicalPx * s2 := Nat.mul_le_mul_left logicalPx h_scale
+  exact Nat.div_le_div_right hMul
+
 end FlowSvgUiFramework
 
 

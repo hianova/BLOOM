@@ -771,7 +771,24 @@ int main(void) {
     const char *w3c_svg = "<svg viewBox=\"0 0 24 24\"><path d=\"M 2 12 L 12 2 L 22 12 V 22 H 2 Z\"/></svg>";
     assert(flow_asset_compile_svg_icon64(w3c_svg, 301U, 1U, &svg_icon));
     assert(svg_icon.stroke_count == 5U && svg_icon.ternary_pos_mask != 0ULL);
-    printf("  ✓ Verified WAV PCM Mixer, GLB 2.0 Mesh Decoder (0-Float IEEE754->Q16) & W3C SVG <path> Compiler!\n");
+
+    /* Compile GLB 2.0 Mesh into Data-Driven 64B GPU CSG Instruction Stream & Evaluate Boolean Subtract */
+    assert(sizeof(FlowGpuCsgOp64) == 64U && _Alignof(FlowGpuCsgOp64) == 64U);
+    FlowGpuCsgOp64 csg_prog[2];
+    flow_asset_compile_glb_to_csg_op64(&glb_desc, 1U, FLOW_CSG_BOOL_UNION, 0, &csg_prog[0]);
+    FlowGlbMeshDesc64 cutter_glb = glb_desc;
+    cutter_glb.aabb_min_q16[0] = -16384;
+    cutter_glb.aabb_min_q16[1] = -16384;
+    cutter_glb.aabb_min_q16[2] = -16384;
+    cutter_glb.aabb_max_q16[0] = 16384;
+    cutter_glb.aabb_max_q16[1] = 16384;
+    cutter_glb.aabb_max_q16[2] = 16384;
+    flow_asset_compile_glb_to_csg_op64(&cutter_glb, 2U, FLOW_CSG_BOOL_SUBTRACT, 0, &csg_prog[1]);
+    /* Origin (0,0,0) was inside glb_desc (<0), but subtracted by cutter_glb -> carved hollow (>0)! */
+    int64_t d_carved_csg = flow_asset_eval_csg_program_q16(csg_prog, 2U, 0, 0, 0);
+    int64_t d_shell_csg  = flow_asset_eval_csg_program_q16(csg_prog, 2U, 49152, 0, 0);
+    assert(d_carved_csg > 0 && d_shell_csg < 0 && csg_prog[0].csg_op_mac != 0ULL);
+    printf("  ✓ Verified WAV PCM Mixer, GLB 2.0 Mesh Decoder, W3C SVG <path> & 64B GPU CSG Stream Evaluator!\n");
 
     printf("====================================================================\n");
     printf("✓ ALL 14 PROCEDURAL, LEAN-ABI & EXTERNAL ASSET TESTS PASSED (100%% SOUND)\n");

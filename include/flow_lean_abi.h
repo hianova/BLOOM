@@ -4,7 +4,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include "flow_hott_jet.h"
 #include "ricardian.h"
 
 /*
@@ -16,15 +15,12 @@
  *      Parses `.lean` specifications at runtime (`flow_lean_abi_load_file`)
  *      and executes state transitions directly through `FLOW` primitives
  *      (`FlowAbiPoly1D_eval_hysteresis`, `flow_cubical_step_neighbor`,
- *      `flow_jet2_ema_step`).
- *   2. Unified 64-Byte Capsule MAC & Hex128 Codec:
- *      Single canonical implementation replacing duplicated `splitmix64` and
- *      `hex128` functions across engine modules.
+ *      `flow_jet2_ema_step`) inside `src/lean_abi_bridge.c`.
+ *   2. Pure 64-Byte Packet Specification Header (0 `libflow_rt` header dependency):
+ *      Can be included in any C/C++/Metal/FFI translation unit without pulling
+ *      in inline assembly or OS thread headers.
  * ============================================================================
  */
-
-/* 1D Half-Space Hysteresis Polyhedron for Universal .lean <-> FLOW ABI */
-FLOW_QPOLY_DEFINE_EX(FlowAbiPoly1D, 1, 16, 2)
 
 /* Universal .lean <-> FLOW 64-Byte ABI Operator Opcodes */
 typedef enum {

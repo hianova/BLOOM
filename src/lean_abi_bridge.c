@@ -1,6 +1,10 @@
 #include "flow_lean_abi.h"
+#include "flow_hott_jet.h"
 #include <stdio.h>
 #include <string.h>
+
+/* 1D Half-Space Hysteresis Polyhedron for Universal .lean <-> FLOW ABI (Internal RT Engine) */
+FLOW_QPOLY_DEFINE_EX(FlowAbiPoly1D, 1, 16, 2)
 
 /*
  * ============================================================================

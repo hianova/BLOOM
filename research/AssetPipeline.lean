@@ -77,4 +77,13 @@ theorem svg_path_icon_segment_cap_safe (parsedCommands : Nat) :
   unfold capSvgPathStrokes maxGlyphStrokes
   split <;> omega
 
+/-- 5. Data-Driven 64-Byte GPU CSG Union Operator (`min(dAccum, dPrim)`). -/
+def evalCsgUnion (dAccum dPrim : Int) : Int :=
+  if dPrim < dAccum then dPrim else dAccum
+
+theorem csg_union_monotone_bound (dAccum dPrim : Int) :
+    evalCsgUnion dAccum dPrim <= dAccum ∧ evalCsgUnion dAccum dPrim <= dPrim := by
+  unfold evalCsgUnion
+  split <;> omega
+
 end Bloom.AssetPipeline
