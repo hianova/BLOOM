@@ -24,7 +24,6 @@ BLOOM 採用 **「算子與參數分離」** 的設計模式：將底層物理�
 - **POSIX Pipe FFmpeg 影視預演與 CMX 3600 `.edl` 分鏡輸出 (`FlowCinemaShot64`)**：
   - 支援 `24 fps` 鎖幀渲染搭配每幀 `2000` 取樣的 `48kHz` 純整數立體聲合成音軌，透過 POSIX Pipe 直接串流至 `ffmpeg` 輸出 `.mp4` 預演影片與剪輯軟體（DaVinci Resolve / Premiere）相容的 `.edl` 分鏡表，避免產生中間暫存圖檔。
 - **宣告式 64B SVG-UI、Flexbox 自動排版與單通道 LaTeX SDF**：支援標準 SVG `viewBox` / `<rect>` / `<circle>` 像素座標自動正規化、`O(N)` 64-Byte Flexbox/Stack 容器排版（`FlowUiLayoutContainer64`）、12 通道通用狀態暫存器庫（`FlowUiRegisterBank64`）、64-Byte 內嵌文字輸入元件（`FlowUiTextInput64`）、Beer-Lambert 透射光學 UI、無字型圖集之 64B LaTeX SDF 數學公式盒（`FlowLatexBoxNode64`）、過場運鏡控制器（`FlowNarrativeDirector64`），以及 `IOSurface` 零拷貝 OBS 擷取與獨立 `5KB` WebGL2 動態桌布匯出。
-- **工程路線圖與待辦事項**：關於邁向完整 Windows 11 (`Win32` + `D3D12`/`Vulkan`)、系統字型排版 (`CoreText`/`DirectWrite`) 與資料驅動 GPU CSG 緩衝區之後續規劃，請參閱 [`todo.md`](todo.md)。
 
 ---
 
