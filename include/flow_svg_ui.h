@@ -20,7 +20,8 @@
  * ============================================================================
  */
 
-#define FLOW_SVG_UI_MAX_NODES 8U
+#define FLOW_SVG_UI_GPU_BUS_SLOTS 8U
+#define FLOW_SVG_UI_MAX_NODES     64U
 
 /*
  * 64-Byte Declarative SVG-UI DOM & Interaction State Descriptor
@@ -399,49 +400,129 @@ bool flow_director_step_choreography64(FlowNarrativeDirector64 *dir,
 
 /*
  * ============================================================================
- * 11. 64-Byte Historical Issue Torture & Comparative Evaluation Harness
- *     (Replays & Crushes anthropics/claude-code Historical Pain Points)
+ * 11. 64-Byte Flexbox / Stack Auto-Layout Container, Generic Register Bank &
+ *     Interactive Text Input Widget State (General-Purpose Native App UI)
  * ============================================================================
- * Enforces Lean 4 Formal Invariants (Theorems 1, 2, 10, 11, 17, 18):
- *   - Category 1 (FLOW_ISSUE_CAT_OOM_SESSION): Long-session V8 heap OOM
- *     (#2099, #3178, #10592, #19100) -> O(1) 64B Ring Arena (0 Heap Calls).
- *   - Category 2 (FLOW_ISSUE_CAT_INK_FLICKER): React-Ink full-terminal clear &
- *     Flexbox reflow CPU spikes -> O(1) Q16 Anchor & Register Binding (0 Reflow).
- *   - Category 3 (FLOW_ISSUE_CAT_REGEX_STALL): Markdown/Regex/Segmenter stalls
- *     & streaming offset bugs (#21153) -> 256B ASCII Jump-Table DFA (0 Backtrack).
- *   - Category 4 (FLOW_ISSUE_CAT_TOOL_ZOMBIE): Hung background tool 100% CPU
- *     spin & glob permission bypass (#22198) -> 1-Tick Watchdog & Bitmask Gate.
+ * Enforces Lean 4 Formal Invariants (Theorems 13, 14, 17, 18):
+ *   - Row/Column Flex/Stack Monotonic Layout (`flex_stack_layout_monotonic_advance`)
+ *   - Standard SVG viewBox -> Q16 Normalization (`svg_viewbox_q16_normalization_bounded`)
+ *   - 64-Byte Inline Text Input Bounds Safety (`ui_text_input_cursor_in_bounds`)
+ *   - Generic Register Bank Channel Lookup (`ui_register_bank_channel_lookup_sound`)
  * ============================================================================
  */
-#define FLOW_ISSUE_CAT_OOM_SESSION  (1U << 0) /* #2099/#3178/#10592/#19100 Heap OOM */
-#define FLOW_ISSUE_CAT_INK_FLICKER  (1U << 1) /* Ink clearTerminal/Reflow Flicker */
-#define FLOW_ISSUE_CAT_REGEX_STALL  (1U << 2) /* #21153 Markdown/Regex/Segmenter Stall */
-#define FLOW_ISSUE_CAT_TOOL_ZOMBIE  (1U << 3) /* #22198 Hung Tool Spin & Glob Bypass */
-#define FLOW_ISSUE_CAT_ALL_FOUR     0x0FU
+#define FLOW_UI_LAYOUT_ROW             0U
+#define FLOW_UI_LAYOUT_COLUMN          1U
+
+#define FLOW_UI_JUSTIFY_START          0U
+#define FLOW_UI_JUSTIFY_CENTER         1U
+#define FLOW_UI_JUSTIFY_END            2U
+#define FLOW_UI_JUSTIFY_SPACE_BETWEEN  3U
+
+#define FLOW_UI_ALIGN_START            0U
+#define FLOW_UI_ALIGN_CENTER           1U
+#define FLOW_UI_ALIGN_END              2U
+#define FLOW_UI_ALIGN_STRETCH          3U
+
+#define FLOW_UI_OVERFLOW_VISIBLE       0U
+#define FLOW_UI_OVERFLOW_SCROLL_CLAMP  1U
+
+#define FLOW_UI_REGISTER_CHANNELS      12U
 
 typedef struct __attribute__((aligned(64))) {
-    uint32_t issue_category_mask;        /*  4B: Bitmask of replayed historical issue classes (0x0F) */
-    uint32_t replayed_session_events;    /*  4B: Total long-session events replayed in-place */
-    uint32_t peak_arena_bytes;           /*  4B: Peak ring arena footprint in bytes (64 * cap) */
-    uint32_t heap_alloc_calls;           /*  4B: Dynamic heap allocations executed (strictly 0) */
-    uint32_t viewport_reflow_mutations;  /*  4B: DOM node geometry mutations on resize (strictly 0) */
-    uint32_t dfa_adversarial_chars;      /*  4B: Adversarial Markdown/LaTeX chars parsed in 1 pass */
-    uint32_t dfa_backtrack_steps;        /*  4B: Regex/DFA backtracking steps (strictly 0) */
-    uint32_t watchdog_reclaimed_count;   /*  4B: Hung tool steps reclaimed in 1 tick by watchdog */
-    uint32_t permission_bypass_blocked;  /*  4B: Flag-reordered / compound permission bypasses blocked */
-    uint32_t lean_theorems_verified;     /*  4B: Count of formal Lean 4 invariants enforced (18) */
-    uint32_t p99_step_cost_ops;          /*  4B: Deterministic worst-case O(1) ops per event step */
-    uint32_t hash_chain_verified;        /*  4B: 1 if cryptographic flight-recorder ring verified */
-    uint64_t trajectory_equivalence_mac; /*  8B: Deterministic trajectory hash across all replays */
-    uint64_t audit_seal_mac;             /*  8B: 64-bit cryptographic audit report seal */
-} FlowIssueAuditReport64;
+    uint16_t direction;             /*  2B: FLOW_UI_LAYOUT_ROW (0) or COLUMN (1) */
+    uint16_t justify_mode;          /*  2B: FLOW_UI_JUSTIFY_* along main axis */
+    uint16_t align_items;           /*  2B: FLOW_UI_ALIGN_* along cross axis */
+    uint16_t overflow_mode;         /*  2B: FLOW_UI_OVERFLOW_* scroll clamping mode */
+    int32_t  origin_x_q16;          /*  4B: Container center X in Q16 */
+    int32_t  origin_y_q16;          /*  4B: Container center Y in Q16 */
+    int32_t  half_w_q16;            /*  4B: Container half-width in Q16 */
+    int32_t  half_h_q16;            /*  4B: Container half-height in Q16 */
+    int32_t  padding_q16;           /*  4B: Inner container padding in Q16 */
+    int32_t  gap_q16;               /*  4B: Gap between consecutive children in Q16 */
+    int32_t  scroll_offset_q16;     /*  4B: Current main-axis scroll offset in Q16 */
+    int32_t  content_extent_q16;    /*  4B: Total computed child extent along main axis */
+    int32_t  max_scroll_q16;        /*  4B: Maximum valid scroll offset >= 0 */
+    uint32_t child_count;           /*  4B: Number of child nodes laid out in pass */
+    uint64_t container_tile_mask;   /*  8B: Combined Wave64 screen tile bitmask of children */
+    uint64_t layout_mac;            /*  8B: Deterministic 64-bit layout state MAC */
+} FlowUiLayoutContainer64;
 
-FLOW_STATIC_ASSERT_UNIVALENT(FlowIssueAuditReport64, RicardianStateV4);
-_Static_assert(sizeof(FlowIssueAuditReport64) == 64U, "FlowIssueAuditReport64 must be 64 bytes");
-_Static_assert(_Alignof(FlowIssueAuditReport64) == 64U, "FlowIssueAuditReport64 must be 64-byte aligned");
+FLOW_STATIC_ASSERT_UNIVALENT(FlowUiLayoutContainer64, RicardianStateV4);
+_Static_assert(sizeof(FlowUiLayoutContainer64) == 64U, "FlowUiLayoutContainer64 must be 64 bytes");
+_Static_assert(_Alignof(FlowUiLayoutContainer64) == 64U, "FlowUiLayoutContainer64 must be 64-byte aligned");
 
-void flow_svg_ui_run_historical_issue_torture64(FlowIssueAuditReport64 *out_report,
-                                                uint32_t session_event_count);
+typedef struct __attribute__((aligned(64))) {
+    int32_t  channels_q16[FLOW_UI_REGISTER_CHANNELS]; /* 48B: 12 generic Q16 state channels [0..11] */
+    uint32_t dirty_channel_mask;                      /*  4B: Bitmask of channels updated since init */
+    uint32_t epoch_tick;                              /*  4B: Monotonic register bank update tick */
+    uint64_t bank_mac;                                /*  8B: Deterministic 64-bit register bank MAC */
+} FlowUiRegisterBank64;
+
+FLOW_STATIC_ASSERT_UNIVALENT(FlowUiRegisterBank64, RicardianStateV4);
+_Static_assert(sizeof(FlowUiRegisterBank64) == 64U, "FlowUiRegisterBank64 must be 64 bytes");
+_Static_assert(_Alignof(FlowUiRegisterBank64) == 64U, "FlowUiRegisterBank64 must be 64-byte aligned");
+
+#define FLOW_UI_TEXT_INPUT_CAP 39U
+
+typedef struct __attribute__((aligned(64))) {
+    char     utf8_buf[40];          /* 40B: Inline null-terminated UTF-8/ASCII buffer (max 39 chars) */
+    uint8_t  byte_len;              /*  1B: Active string length in bytes [0..39] */
+    uint8_t  cursor_byte_pos;       /*  1B: Caret byte offset in [0..byte_len] */
+    uint8_t  selection_anchor_pos;  /*  1B: Selection anchor offset in [0..byte_len] */
+    uint8_t  focused;               /*  1B: 1 if input widget currently holds keyboard focus */
+    uint32_t bound_node_id;         /*  4B: Target FlowSvgUiNode64.node_id synchronized on edit */
+    uint32_t action_id;             /*  4B: Action opcode dispatched on Enter/Submit */
+    uint32_t edit_revision;         /*  4B: Monotonic text edit counter */
+    uint64_t content_hash;          /*  8B: Deterministic 64-bit text & caret integrity hash */
+} FlowUiTextInput64;
+
+FLOW_STATIC_ASSERT_UNIVALENT(FlowUiTextInput64, RicardianStateV4);
+_Static_assert(sizeof(FlowUiTextInput64) == 64U, "FlowUiTextInput64 must be 64 bytes");
+_Static_assert(_Alignof(FlowUiTextInput64) == 64U, "FlowUiTextInput64 must be 64-byte aligned");
+
+/* Normalize standard SVG coordinate [0..view_extent] into Q16 [0..65536] (0 FloatOps) */
+int32_t flow_svg_ui_norm_viewbox_coord_q16(int32_t coord_px, int32_t view_extent_px);
+
+/* Initialize & Execute O(N) 64-Byte Flexbox / Stack Auto-Layout Pass (0 FloatOps, 0 Heap) */
+void flow_ui_layout_container_init64(FlowUiLayoutContainer64 *container,
+                                     uint16_t direction,
+                                     uint16_t justify_mode,
+                                     uint16_t align_items,
+                                     int32_t origin_x_q16,
+                                     int32_t origin_y_q16,
+                                     int32_t half_w_q16,
+                                     int32_t half_h_q16,
+                                     int32_t padding_q16,
+                                     int32_t gap_q16);
+
+void flow_ui_layout_container_apply64(FlowUiLayoutContainer64 *container,
+                                      FlowSvgUiNode64 *nodes,
+                                      size_t node_count,
+                                      int32_t scroll_delta_q16);
+
+/* Generic 12-Channel Telemetry Register Bank API */
+void flow_ui_register_bank_init64(FlowUiRegisterBank64 *bank);
+void flow_ui_register_bank_set_q16(FlowUiRegisterBank64 *bank,
+                                   uint32_t channel_id,
+                                   int32_t value_q16);
+int32_t flow_ui_register_bank_get_q16(const FlowUiRegisterBank64 *bank,
+                                      uint32_t channel_id);
+void flow_svg_ui_bind_register_bank64(FlowSvgUiNode64 *nodes,
+                                      size_t node_count,
+                                      const FlowUiRegisterBank64 *bank);
+
+/* 64-Byte Interactive Text Input Widget API */
+void flow_ui_text_input_init64(FlowUiTextInput64 *input,
+                               uint32_t bound_node_id,
+                               uint32_t action_id,
+                               const char *initial_text);
+bool flow_ui_text_input_insert_char64(FlowUiTextInput64 *input,
+                                      char ch,
+                                      FlowSvgUiNode64 *bound_node);
+bool flow_ui_text_input_backspace64(FlowUiTextInput64 *input,
+                                    FlowSvgUiNode64 *bound_node);
+void flow_ui_text_input_move_cursor64(FlowUiTextInput64 *input,
+                                      int32_t delta);
 
 #endif /* FLOW_SVG_UI_H */
 

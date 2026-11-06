@@ -1,4 +1,5 @@
 #include "flow_procedural_assets.h"
+#include "flow_lean_abi.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1039,17 +1040,14 @@ void flow_av_resolve_frame64(int32_t base_carrier_hz_q16,
     if (shifted_hz > (4000LL << 16U)) shifted_hz = (4000LL << 16U);
     out_av->doppler_carrier_freq_q16 = (int32_t)shifted_hz;
 
-    /* 2. Dual-Threshold SDF Cavity Helmholtz Resonance Hysteresis [12m enter, 20m exit] */
-    uint32_t latched = prev_cavity_latched ? 1U : 0U;
-    if (latched == 0U) {
-        if (sdf_dist_q16 <= FLOW_CAVITY_ENTER_DIST_Q16) {
-            latched = 1U;
-        }
-    } else {
-        if (sdf_dist_q16 >= FLOW_CAVITY_EXIT_DIST_Q16) {
-            latched = 0U;
-        }
-    }
+    /* 2. Dual-Threshold SDF Cavity Helmholtz Resonance Hysteresis via FLOW .lean ABI [12m, 20m] */
+    bool next_latched = flow_lean_abi_eval_hysteresis_lo(
+        sdf_dist_q16,
+        (int64_t)FLOW_CAVITY_ENTER_DIST_Q16,
+        (int64_t)FLOW_CAVITY_EXIT_DIST_Q16,
+        prev_cavity_latched != 0U
+    );
+    uint32_t latched = next_latched ? 1U : 0U;
     out_av->cavity_latched = latched;
 
     if (latched != 0U) {
@@ -1085,13 +1083,12 @@ void flow_av_resolve_frame64(int32_t base_carrier_hz_q16,
     out_av->finish_iridescence_q16 = (finish_iridescence_q16 > 0) ? finish_iridescence_q16 : 45875;
     out_av->finish_gold_vein_q16   = (finish_gold_vein_q16 > 0) ? finish_gold_vein_q16 : 32768;
 
-    /* 5. TRC <= 3.0 Hz Photosensitive Epilepsy Flash Guard */
-    int32_t max_trc = (int32_t)(3 * FLOW_Q16_ONE);
-    int32_t safe_strobe = (raw_strobe_hz_q16 < 0) ? 0 : raw_strobe_hz_q16;
-    if (safe_strobe > max_trc) {
-        safe_strobe = max_trc;
-    }
-    out_av->trc_safe_strobe_hz_q16 = safe_strobe;
+    /* 5. TRC <= 3.0 Hz Photosensitive Epilepsy Flash Guard via FLOW .lean ABI */
+    out_av->trc_safe_strobe_hz_q16 = (int32_t)flow_lean_abi_eval_clamp(
+        (int64_t)raw_strobe_hz_q16,
+        0LL,
+        3LL * FLOW_Q16_ONE
+    );
 
     /* 6. Zero-Drift Tri-Modal (Optical-Acoustic-Haptic) Phase Lock */
     out_av->trimodal_phase_q16      = shared_jet_phase_q16 & 0xFFFF;
@@ -1172,17 +1169,21 @@ FlowGenerativeSeedStyle64 flow_seed_style_derive64(uint64_t master_seed) {
     st.master_seed  = master_seed;
     st.archetype_id = (uint32_t)(h & 3ULL);
 
-    /* Enforce Oklab perceptual contrast Delta-L >= 26214 (0.40) */
+    /* Enforce Oklab perceptual contrast Delta-L >= 26214 (0.40) via FLOW .lean ABI */
     int32_t raw_dl = 18000 + (int32_t)((h >> 8U) & 0x7FFFU);
-    st.oklab_delta_l_q16 = (raw_dl < FLOW_OKLAB_MIN_DELTA_L_Q16)
-        ? FLOW_OKLAB_MIN_DELTA_L_Q16
-        : raw_dl;
+    st.oklab_delta_l_q16 = (int32_t)flow_lean_abi_eval_clamp(
+        (int64_t)raw_dl,
+        (int64_t)FLOW_OKLAB_MIN_DELTA_L_Q16,
+        65536LL
+    );
 
-    /* Enforce Negative Space ("計白當黑") ratio in [39321, 49152] (60%..75%) */
+    /* Enforce Negative Space ("計白當黑") ratio in [39321, 49152] (60%..75%) via FLOW .lean ABI */
     int32_t raw_neg = 36000 + (int32_t)((h >> 24U) & 0x3FFFU);
-    if (raw_neg < FLOW_NEG_SPACE_MIN_RATIO_Q16) raw_neg = FLOW_NEG_SPACE_MIN_RATIO_Q16;
-    if (raw_neg > FLOW_NEG_SPACE_MAX_RATIO_Q16) raw_neg = FLOW_NEG_SPACE_MAX_RATIO_Q16;
-    st.negative_space_ratio_q16 = raw_neg;
+    st.negative_space_ratio_q16 = (int32_t)flow_lean_abi_eval_clamp(
+        (int64_t)raw_neg,
+        (int64_t)FLOW_NEG_SPACE_MIN_RATIO_Q16,
+        (int64_t)FLOW_NEG_SPACE_MAX_RATIO_Q16
+    );
 
     if (st.archetype_id == FLOW_SEED_ARCHETYPE_SHANSHUI_INK) {
         /* 種子 A：寒江獨釣 / 極簡水墨 (Misty Celadon-Grey + Scorched Ink + Cinnabar Red Seal) */
@@ -1341,11 +1342,11 @@ bool flow_sovereign_gate_claim_lineage_plot(FlowSovereignGate64 *gate) {
 uint32_t flow_sovereign_gate_thermal_purge_x(FlowSovereignGate64 *gate) {
     if (!gate)
         return FLOW_THERMAL_AMBIENT_KELVIN;
-    if (gate->thermal_kelvin > FLOW_THERMAL_AMBIENT_KELVIN + FLOW_THERMAL_PURGE_DELTA_K) {
-        gate->thermal_kelvin -= FLOW_THERMAL_PURGE_DELTA_K;
-    } else {
-        gate->thermal_kelvin = FLOW_THERMAL_AMBIENT_KELVIN;
-    }
+    gate->thermal_kelvin = (uint32_t)flow_lean_abi_eval_floor_sub(
+        (int64_t)gate->thermal_kelvin,
+        (int64_t)FLOW_THERMAL_PURGE_DELTA_K,
+        (int64_t)FLOW_THERMAL_AMBIENT_KELVIN
+    );
     gate->state_mac = calc_sovereign_gate_mac(gate);
     return gate->thermal_kelvin;
 }

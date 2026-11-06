@@ -127,6 +127,51 @@ static uint32_t cursor_to_wave64_bit(int32_t x_q16, int32_t y_q16) {
     return (uint32_t)(r * 8 + c);
 }
 
+static bool has_svg_attr(const char *line, const char *attr_key) {
+    return strstr(line, attr_key) != NULL;
+}
+
+static void parse_svg_viewbox_wh(const char *line, int32_t *inout_w, int32_t *inout_h) {
+    const char *p = strstr(line, "viewBox");
+    if (!p) return;
+    p += 7;
+    while (*p == ' ' || *p == '=' || *p == '"') ++p;
+    int32_t vals[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 4; ++i) {
+        while (*p == ' ' || *p == ',') ++p;
+        int32_t sign = 1;
+        if (*p == '-') { sign = -1; ++p; }
+        int32_t v = 0;
+        bool ok = false;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10 + (int32_t)(*p - '0');
+            ok = true;
+            ++p;
+        }
+        if (*p == '.') {
+            ++p;
+            while (*p >= '0' && *p <= '9') ++p;
+        }
+        if (!ok) return;
+        vals[i] = v * sign;
+    }
+    if (vals[2] > 0 && vals[3] > 0) {
+        *inout_w = vals[2];
+        *inout_h = vals[3];
+    }
+}
+
+int32_t flow_svg_ui_norm_viewbox_coord_q16(int32_t coord_px, int32_t view_extent_px) {
+    if (view_extent_px <= 0 || coord_px <= 0) {
+        return 0;
+    }
+    if (coord_px >= view_extent_px) {
+        return 65536;
+    }
+    int64_t scaled = ((int64_t)coord_px * 65536LL) / (int64_t)view_extent_px;
+    return clamp_i32_ui((int32_t)scaled, 0, 65536);
+}
+
 size_t flow_svg_ui_compile_file(const char *svg_path,
                                 FlowSvgUiNode64 *out_nodes,
                                 size_t max_nodes,
@@ -153,10 +198,16 @@ size_t flow_svg_ui_compile_file(const char *svg_path,
     bool in_ui_elem = false;
     size_t count = 0U;
     uint64_t combined_mask = 0ULL;
+    int32_t view_w = 1920;
+    int32_t view_h = 1080;
 
     while (fgets(line_buf, (int)sizeof(line_buf), f) != NULL && count < max_nodes) {
+        if (strstr(line_buf, "<svg") != NULL || strstr(line_buf, "viewBox=") != NULL) {
+            parse_svg_viewbox_wh(line_buf, &view_w, &view_h);
+        }
         if (!in_ui_elem) {
-            if (strstr(line_buf, "data-ui-node=\"") != NULL) {
+            if (strstr(line_buf, "data-ui-node=\"") != NULL ||
+                strstr(line_buf, "data-ui-widget=\"") != NULL) {
                 in_ui_elem = true;
                 elem_buf[0] = '\0';
                 strncat(elem_buf, line_buf, sizeof(elem_buf) - strlen(elem_buf) - 1U);
@@ -167,15 +218,46 @@ size_t flow_svg_ui_compile_file(const char *svg_path,
 
         if (in_ui_elem && (strchr(line_buf, '>') != NULL)) {
             FlowSvgUiNode64 *n = &out_nodes[count];
-            n->node_id           = (uint32_t)parse_svg_attr_i32(elem_buf, "data-ui-node", (int32_t)(201U + count));
+            int32_t fallback_id = parse_svg_attr_i32(elem_buf, "data-ui-widget", (int32_t)(201U + count));
+            n->node_id           = (uint32_t)parse_svg_attr_i32(elem_buf, "data-ui-node", fallback_id);
             n->prim_type         = (uint32_t)parse_svg_attr_i32(elem_buf, "data-prim", (int32_t)FLOW_SVG_PRIM_RECT_GLASS);
             n->anchor_mode       = (uint32_t)parse_svg_attr_i32(elem_buf, "data-anchor", (int32_t)FLOW_SVG_ANCHOR_CENTER);
             n->bind_source       = (uint32_t)parse_svg_attr_i32(elem_buf, "data-bind", (int32_t)FLOW_SVG_BIND_NONE);
-            n->offset_x_q16      = parse_svg_attr_i32(elem_buf, "data-ox-q16", 0);
-            n->offset_y_q16      = parse_svg_attr_i32(elem_buf, "data-oy-q16", 0);
-            n->half_w_q16        = parse_svg_attr_i32(elem_buf, "data-hw-q16", 3276);
-            n->half_h_q16        = parse_svg_attr_i32(elem_buf, "data-hh-q16", 1638);
-            n->corner_radius_q16 = parse_svg_attr_i32(elem_buf, "data-rx-q16", 655);
+
+            if (has_svg_attr(elem_buf, "data-ox-q16") || has_svg_attr(elem_buf, "data-oy-q16")) {
+                n->offset_x_q16      = parse_svg_attr_i32(elem_buf, "data-ox-q16", 0);
+                n->offset_y_q16      = parse_svg_attr_i32(elem_buf, "data-oy-q16", 0);
+                n->half_w_q16        = parse_svg_attr_i32(elem_buf, "data-hw-q16", 3276);
+                n->half_h_q16        = parse_svg_attr_i32(elem_buf, "data-hh-q16", 1638);
+                n->corner_radius_q16 = parse_svg_attr_i32(elem_buf, "data-rx-q16", 655);
+            } else if (has_svg_attr(elem_buf, "cx=") && has_svg_attr(elem_buf, "cy=")) {
+                int32_t cx_px = parse_svg_attr_i32(elem_buf, "cx=", view_w / 2);
+                int32_t cy_px = parse_svg_attr_i32(elem_buf, "cy=", view_h / 2);
+                int32_t r_px  = parse_svg_attr_i32(elem_buf, "r=", 24);
+                int32_t nx    = flow_svg_ui_norm_viewbox_coord_q16(cx_px, view_w);
+                int32_t ny    = flow_svg_ui_norm_viewbox_coord_q16(cy_px, view_h);
+                int32_t nr    = (int32_t)(((int64_t)r_px * 24576LL) / (int64_t)(view_h > 0 ? view_h : 1080));
+                n->offset_x_q16      = nx - 32768;
+                n->offset_y_q16      = 24576 - ((ny * 49152) >> 16);
+                n->half_w_q16        = (nr > 0) ? nr : 1024;
+                n->half_h_q16        = (nr > 0) ? nr : 1024;
+                n->corner_radius_q16 = n->half_h_q16;
+            } else {
+                int32_t x_px  = parse_svg_attr_i32(elem_buf, "x=", 0);
+                int32_t y_px  = parse_svg_attr_i32(elem_buf, "y=", 0);
+                int32_t w_px  = parse_svg_attr_i32(elem_buf, "width=", 120);
+                int32_t h_px  = parse_svg_attr_i32(elem_buf, "height=", 48);
+                int32_t rx_px = parse_svg_attr_i32(elem_buf, "rx=", 8);
+                int32_t cx_px = x_px + (w_px / 2);
+                int32_t cy_px = y_px + (h_px / 2);
+                int32_t nx    = flow_svg_ui_norm_viewbox_coord_q16(cx_px, view_w);
+                int32_t ny    = flow_svg_ui_norm_viewbox_coord_q16(cy_px, view_h);
+                n->offset_x_q16      = nx - 32768;
+                n->offset_y_q16      = 24576 - ((ny * 49152) >> 16);
+                n->half_w_q16        = (int32_t)(((int64_t)w_px * 32768LL) / (int64_t)(view_w > 0 ? view_w : 1920));
+                n->half_h_q16        = (int32_t)(((int64_t)h_px * 24576LL) / (int64_t)(view_h > 0 ? view_h : 1080));
+                n->corner_radius_q16 = (int32_t)(((int64_t)rx_px * 24576LL) / (int64_t)(view_h > 0 ? view_h : 1080));
+            }
             n->scale_jet_v_q16   = 65536; /* 1.0x rest scale */
             n->scale_jet_d1_q16  = 0;
             n->bound_value_q16   = 32768;
@@ -1281,151 +1363,286 @@ bool flow_director_step_choreography64(FlowNarrativeDirector64 *dir,
 
 /*
  * ============================================================================
- * 11. 64-Byte Historical Issue Torture & Comparative Evaluation Harness
+ * 11. 64-Byte Flexbox / Stack Auto-Layout Container, Generic Register Bank &
+ *     Interactive Text Input Widget State (General-Purpose Native App UI)
  * ============================================================================
  */
-void flow_svg_ui_run_historical_issue_torture64(FlowIssueAuditReport64 *out_report,
-                                                uint32_t session_event_count) {
-    if (!out_report) {
+static uint64_t compute_layout_container_mac64(const FlowUiLayoutContainer64 *c) {
+    uint64_t h = 0x517CC1B727220A95ULL;
+    h ^= ((uint64_t)c->direction << 48U) | ((uint64_t)c->justify_mode << 32U) |
+         ((uint64_t)c->align_items << 16U) | (uint64_t)c->overflow_mode;
+    h ^= (uint64_t)(uint32_t)c->content_extent_q16 * 0x9E3779B97F4A7C15ULL;
+    h ^= (uint64_t)(uint32_t)c->scroll_offset_q16 * 0xBF58476D1CE4E5B9ULL;
+    h ^= (uint64_t)c->child_count * 0x94D049BB133111EBULL;
+    h ^= c->container_tile_mask;
+    return h ^ (h >> 31U);
+}
+
+void flow_ui_layout_container_init64(FlowUiLayoutContainer64 *container,
+                                     uint16_t direction,
+                                     uint16_t justify_mode,
+                                     uint16_t align_items,
+                                     int32_t origin_x_q16,
+                                     int32_t origin_y_q16,
+                                     int32_t half_w_q16,
+                                     int32_t half_h_q16,
+                                     int32_t padding_q16,
+                                     int32_t gap_q16) {
+    if (!container) return;
+    memset(container, 0, sizeof(*container));
+    container->direction         = (uint16_t)(direction & 1U);
+    container->justify_mode      = (uint16_t)(justify_mode & 3U);
+    container->align_items       = (uint16_t)(align_items & 3U);
+    container->overflow_mode     = FLOW_UI_OVERFLOW_SCROLL_CLAMP;
+    container->origin_x_q16      = origin_x_q16;
+    container->origin_y_q16      = origin_y_q16;
+    container->half_w_q16        = (half_w_q16 > 0) ? half_w_q16 : 8192;
+    container->half_h_q16        = (half_h_q16 > 0) ? half_h_q16 : 8192;
+    container->padding_q16       = (padding_q16 >= 0) ? padding_q16 : 0;
+    container->gap_q16           = (gap_q16 >= 0) ? gap_q16 : 0;
+    container->scroll_offset_q16 = 0;
+    container->layout_mac        = compute_layout_container_mac64(container);
+}
+
+void flow_ui_layout_container_apply64(FlowUiLayoutContainer64 *container,
+                                      FlowSvgUiNode64 *nodes,
+                                      size_t node_count,
+                                      int32_t scroll_delta_q16) {
+    if (!container || !nodes || node_count == 0U) {
         return;
     }
-    memset(out_report, 0, sizeof(*out_report));
+    bool is_row = (container->direction == FLOW_UI_LAYOUT_ROW);
+    int32_t main_half  = is_row ? container->half_w_q16 : container->half_h_q16;
+    int32_t cross_half = is_row ? container->half_h_q16 : container->half_w_q16;
+    int32_t pad        = (container->padding_q16 >= 0) ? container->padding_q16 : 0;
+    int32_t gap        = (container->gap_q16 >= 0) ? container->gap_q16 : 0;
 
-    uint32_t events = (session_event_count > 0U) ? session_event_count : 100000U;
-    FlowDebugLogEntry64 session_ring[64];
-    FlowPipelineTelemetry64 telemetry;
-    memset(session_ring, 0, sizeof(session_ring));
-    memset(&telemetry, 0, sizeof(telemetry));
+    int32_t children_span = 0;
+    for (size_t i = 0U; i < node_count; ++i) {
+        int32_t ch_half = is_row ? nodes[i].half_w_q16 : nodes[i].half_h_q16;
+        if (ch_half < 64) ch_half = 64;
+        children_span += (ch_half * 2);
+    }
+    int32_t total_gaps = (node_count > 1U) ? (int32_t)(node_count - 1U) * gap : 0;
+    int32_t content_ext = children_span + total_gaps + (pad * 2);
+    int32_t viewport_ext = main_half * 2;
+    int32_t max_scroll = (content_ext > viewport_ext) ? (content_ext - viewport_ext) : 0;
 
-    /* Compile baseline 8-node SVG-UI DOM once into fixed 64B array */
-    FlowSvgUiNode64 ui_nodes[FLOW_SVG_UI_MAX_NODES];
-    FlowSvgUiDomState64 dom;
-    size_t n_ui = flow_svg_ui_compile_file("specs/cockpit_hud.svg",
-                                           ui_nodes,
-                                           FLOW_SVG_UI_MAX_NODES,
-                                           &dom);
-    int32_t orig_hw[FLOW_SVG_UI_MAX_NODES];
-    int32_t orig_hh[FLOW_SVG_UI_MAX_NODES];
-    for (size_t k = 0U; k < n_ui; ++k) {
-        orig_hw[k] = ui_nodes[k].half_w_q16;
-        orig_hh[k] = ui_nodes[k].half_h_q16;
+    container->content_extent_q16 = content_ext;
+    container->max_scroll_q16     = max_scroll;
+    container->child_count        = (uint32_t)node_count;
+    container->scroll_offset_q16  = clamp_i32_ui(container->scroll_offset_q16 + scroll_delta_q16,
+                                                 0, max_scroll);
+
+    int32_t inner_ext = viewport_ext - (pad * 2);
+    int32_t free_space = (inner_ext > (children_span + total_gaps))
+        ? (inner_ext - (children_span + total_gaps))
+        : 0;
+    int32_t start_lead = pad;
+    int32_t eff_gap = gap;
+
+    if (container->justify_mode == FLOW_UI_JUSTIFY_CENTER) {
+        start_lead = pad + (free_space / 2);
+    } else if (container->justify_mode == FLOW_UI_JUSTIFY_END) {
+        start_lead = pad + free_space;
+    } else if (container->justify_mode == FLOW_UI_JUSTIFY_SPACE_BETWEEN && node_count > 1U) {
+        eff_gap = gap + (free_space / (int32_t)(node_count - 1U));
     }
 
-    uint64_t traj_hash = 0xCBF29CE484222325ULL;
-    uint32_t reflow_mutations = 0U;
-    uint32_t watchdog_reclaimed = 0U;
-    uint32_t perm_blocked = 0U;
+    int32_t inner_cross_half = (cross_half > pad) ? (cross_half - pad) : cross_half;
+    int32_t cursor_q16 = start_lead;
+    uint64_t mask_acc = 0ULL;
 
-    /* Category 1 + 2 + 4 Combined Long-Session Loop (Theorem 1, 2, 17, 18) */
-    static const uint32_t k_widths[4]  = { 1280U, 1920U, 3440U, 3840U };
-    static const uint32_t k_heights[4] = {  720U, 1080U, 1440U, 2160U };
-    const uint32_t timeout_budget_us   = 5000U;
-    const uint32_t granted_cap_mask    = 0x00000007U; /* Read | Write | LocalTest */
-
-    for (uint32_t step = 0U; step < events; ++step) {
-        /* 1. Append session event into fixed 64-slot ring (Theorem 17: 4096B ceiling, 0 Heap) */
-        flow_debug_log_append64(session_ring,
-                                64U,
-                                &telemetry,
-                                (uint64_t)(step + 1U) * 100ULL,
-                                (uint16_t)(step % 6U),
-                                (uint16_t)((step & 7U) + 1U),
-                                201U + (step & 7U),
-                                step & 3U,
-                                (int32_t)step,
-                                (int32_t)(step + 1U),
-                                0,
-                                0,
-                                16384U);
-
-        /* 2. Periodic Viewport Resize & Reactive Telemetry Binding (Crushes Ink Flicker) */
-        if ((step & 15U) == 0U && n_ui > 0U) {
-            uint32_t vp_idx = (step >> 4U) & 3U;
-            size_t node_idx = (size_t)(step % n_ui);
-            int32_t cx_q16 = 0, cy_q16 = 0;
-            flow_svg_ui_resolve_anchor_q16(&ui_nodes[node_idx],
-                                           k_widths[vp_idx],
-                                           k_heights[vp_idx],
-                                           &cx_q16,
-                                           &cy_q16);
-            flow_svg_ui_bind_telemetry_q16(ui_nodes,
-                                           n_ui,
-                                           700U + (step & 127U),
-                                           (int32_t)((step & 1023U) << 16),
-                                           step & 3U,
-                                           step & 3U,
-                                           step & 1U);
-            if (ui_nodes[node_idx].half_w_q16 != orig_hw[node_idx] ||
-                ui_nodes[node_idx].half_h_q16 != orig_hh[node_idx]) {
-                reflow_mutations++;
-            }
-            traj_hash ^= (uint64_t)(uint32_t)cx_q16 ^ ((uint64_t)(uint32_t)cy_q16 << 32U);
-            traj_hash *= 0x9E3779B97F4A7C15ULL;
-        }
-
-        /* 3. Tool Watchdog & Bitmask Permission Gate (Crushes #22198 Spin & Glob Bypass) */
-        if ((step & 63U) == 0U) {
-            uint32_t simulated_tool_us = ((step & 127U) == 0U) ? 8500U : 1200U;
-            if (simulated_tool_us >= timeout_budget_us) {
-                /* Theorem 18: 1-tick deterministic timeout reclamation */
-                watchdog_reclaimed++;
-            }
-            /* Simulate compound/flag-reordered privilege escalation bitmask (bit 7 = UnsandboxedNet) */
-            uint32_t requested_mask = ((step & 128U) != 0U) ? 0x00000083U : 0x00000003U;
-            if ((requested_mask & granted_cap_mask) != requested_mask) {
-                perm_blocked++;
+    for (size_t i = 0U; i < node_count; ++i) {
+        FlowSvgUiNode64 *n = &nodes[i];
+        if (container->align_items == FLOW_UI_ALIGN_STRETCH) {
+            if (is_row) {
+                n->half_h_q16 = inner_cross_half;
+            } else {
+                n->half_w_q16 = inner_cross_half;
             }
         }
+        int32_t ch_main_half  = is_row ? n->half_w_q16 : n->half_h_q16;
+        int32_t ch_cross_half = is_row ? n->half_h_q16 : n->half_w_q16;
+        if (ch_main_half < 64) ch_main_half = 64;
+
+        int32_t local_main_center = cursor_q16 + ch_main_half - container->scroll_offset_q16;
+        int32_t cross_offset = 0;
+        if (container->align_items == FLOW_UI_ALIGN_START) {
+            cross_offset = -inner_cross_half + ch_cross_half;
+        } else if (container->align_items == FLOW_UI_ALIGN_END) {
+            cross_offset = inner_cross_half - ch_cross_half;
+        }
+
+        if (is_row) {
+            n->offset_x_q16 = (container->origin_x_q16 - main_half) + local_main_center;
+            n->offset_y_q16 = container->origin_y_q16 - cross_offset;
+        } else {
+            /* Column flows top (+Y) to bottom (-Y) in screen Q16 coordinates */
+            n->offset_y_q16 = (container->origin_y_q16 + main_half) - local_main_center;
+            n->offset_x_q16 = container->origin_x_q16 + cross_offset;
+        }
+
+        n->tile_mask_wave64 = compute_node_wave64_mask(n->offset_x_q16,
+                                                       n->offset_y_q16,
+                                                       n->half_w_q16,
+                                                       n->half_h_q16);
+        mask_acc |= n->tile_mask_wave64;
+        cursor_q16 += (ch_main_half * 2) + eff_gap;
     }
 
-    /* Category 3: Pathological Markdown/LaTeX/UTF-8 DFA Stress (#21153 & Regex Backtracking) */
-    static const char *k_adversarial_md =
-        "Cost $100 ~ $200 (~$\\alpha$) 【測試_變數】 in flow_svg_ui_compile_file and v8_json_stringifier_oom "
-        "$\\gamma = \\frac{1}{\\sqrt{1 - \\beta^2}} \\ge \\alpha_0$ unclosed $999";
-    FlowLatexBoxNode64 latex_boxes[128];
-    uint32_t ident_suppressed = 0U;
-    uint32_t literal_dollars  = 0U;
-    uint32_t dfa_chars_total  = 0U;
-    uint32_t adv_len          = (uint32_t)strlen(k_adversarial_md);
+    container->container_tile_mask = mask_acc;
+    container->layout_mac          = compute_layout_container_mac64(container);
+}
 
-    for (uint32_t r = 0U; r < 64U; ++r) {
-        size_t compiled = flow_latex_dfa_compile_boxes64(k_adversarial_md,
-                                                         -25559,
-                                                         -20971,
-                                                         2048,
-                                                         0xFFD830U,
-                                                         latex_boxes,
-                                                         128U,
-                                                         &ident_suppressed,
-                                                         &literal_dollars);
-        if (compiled > 0U && ident_suppressed == 8U && literal_dollars == 3U) {
-            dfa_chars_total += adv_len;
-            traj_hash ^= latex_boxes[compiled - 1U].box_mac ^ latex_boxes[0].box_mac;
-            traj_hash *= 0xBF58476D1CE4E5B9ULL;
+static uint64_t compute_register_bank_mac64(const FlowUiRegisterBank64 *bank) {
+    uint64_t h = 0x9E3779B97F4A7C15ULL ^ ((uint64_t)bank->epoch_tick << 32U) ^ bank->dirty_channel_mask;
+    for (uint32_t i = 0U; i < FLOW_UI_REGISTER_CHANNELS; ++i) {
+        h ^= (uint64_t)(uint32_t)bank->channels_q16[i] * (0xBF58476D1CE4E5B9ULL + (uint64_t)i * 0x10001ULL);
+        h = (h << 13U) | (h >> 51U);
+    }
+    return h ^ (h >> 32U);
+}
+
+void flow_ui_register_bank_init64(FlowUiRegisterBank64 *bank) {
+    if (!bank) return;
+    memset(bank, 0, sizeof(*bank));
+    bank->bank_mac = compute_register_bank_mac64(bank);
+}
+
+void flow_ui_register_bank_set_q16(FlowUiRegisterBank64 *bank,
+                                   uint32_t channel_id,
+                                   int32_t value_q16) {
+    if (!bank || channel_id >= FLOW_UI_REGISTER_CHANNELS) {
+        return;
+    }
+    bank->channels_q16[channel_id] = value_q16;
+    bank->dirty_channel_mask      |= (1U << channel_id);
+    bank->epoch_tick              += 1U;
+    bank->bank_mac                 = compute_register_bank_mac64(bank);
+}
+
+int32_t flow_ui_register_bank_get_q16(const FlowUiRegisterBank64 *bank,
+                                      uint32_t channel_id) {
+    if (!bank || channel_id >= FLOW_UI_REGISTER_CHANNELS) {
+        return 0;
+    }
+    return bank->channels_q16[channel_id];
+}
+
+void flow_svg_ui_bind_register_bank64(FlowSvgUiNode64 *nodes,
+                                      size_t node_count,
+                                      const FlowUiRegisterBank64 *bank) {
+    if (!nodes || !bank) return;
+    for (size_t i = 0U; i < node_count; ++i) {
+        FlowSvgUiNode64 *n = &nodes[i];
+        uint32_t ch = n->bind_source;
+        if (ch == FLOW_SVG_BIND_NONE) {
+            continue;
+        }
+        int32_t raw = flow_ui_register_bank_get_q16(bank, ch);
+        if (n->prim_type == FLOW_SVG_PRIM_NUM_READOUT) {
+            n->bound_value_q16 = clamp_i32_ui(raw, 0, 999999);
+        } else {
+            n->bound_value_q16 = clamp_i32_ui(raw, 0, 65536);
         }
     }
+}
 
-    /* Directly verify cryptographic flight-recorder hash-chain on the wrapped 64-slot session_ring */
-    size_t active_ring_slots = (events < 64U) ? (size_t)events : 64U;
-    bool chain_ok = flow_debug_log_verify_chain64(session_ring, active_ring_slots);
+static uint64_t compute_text_input_hash64(const FlowUiTextInput64 *in) {
+    uint64_t h = 0xCBF29CE484222325ULL;
+    for (uint8_t i = 0U; i < in->byte_len && i < FLOW_UI_TEXT_INPUT_CAP; ++i) {
+        h ^= (uint64_t)(uint8_t)in->utf8_buf[i];
+        h *= 0x100000001B3ULL;
+    }
+    h ^= ((uint64_t)in->cursor_byte_pos << 32U) |
+         ((uint64_t)in->byte_len << 24U) |
+         (uint64_t)in->edit_revision;
+    return h;
+}
 
-    traj_hash ^= session_ring[(events - 1U) & 63U].chain_hash;
+static void sync_text_input_to_node(const FlowUiTextInput64 *in, FlowSvgUiNode64 *node) {
+    if (!in || !node) return;
+    node->bound_value_q16 = clamp_i32_ui(((int32_t)in->byte_len * 65536) / (int32_t)FLOW_UI_TEXT_INPUT_CAP,
+                                         0, 65536);
+}
 
-    out_report->issue_category_mask        = FLOW_ISSUE_CAT_ALL_FOUR;
-    out_report->replayed_session_events    = events;
-    out_report->peak_arena_bytes           = (uint32_t)sizeof(session_ring); /* 4096 Bytes */
-    out_report->heap_alloc_calls           = 0U;
-    out_report->viewport_reflow_mutations  = reflow_mutations;
-    out_report->dfa_adversarial_chars      = dfa_chars_total;
-    out_report->dfa_backtrack_steps        = 0U;
-    out_report->watchdog_reclaimed_count   = watchdog_reclaimed;
-    out_report->permission_bypass_blocked  = perm_blocked;
-    out_report->lean_theorems_verified     = 18U;
-    out_report->p99_step_cost_ops          = 1U; /* Strict O(1) per-event cost */
-    out_report->hash_chain_verified        = chain_ok ? 1U : 0U;
-    out_report->trajectory_equivalence_mac = traj_hash;
-    out_report->audit_seal_mac             = (traj_hash ^ 0x94D049BB133111EBULL) +
-                                             ((uint64_t)events << 16U) +
-                                             (uint64_t)out_report->peak_arena_bytes;
+void flow_ui_text_input_init64(FlowUiTextInput64 *input,
+                               uint32_t bound_node_id,
+                               uint32_t action_id,
+                               const char *initial_text) {
+    if (!input) return;
+    memset(input, 0, sizeof(*input));
+    input->bound_node_id = bound_node_id;
+    input->action_id     = action_id;
+    input->focused       = 1U;
+    input->edit_revision = 1U;
+    if (initial_text) {
+        uint8_t len = 0U;
+        while (initial_text[len] != '\0' && len < FLOW_UI_TEXT_INPUT_CAP) {
+            input->utf8_buf[len] = initial_text[len];
+            len++;
+        }
+        input->utf8_buf[len]        = '\0';
+        input->byte_len             = len;
+        input->cursor_byte_pos      = len;
+        input->selection_anchor_pos = len;
+    }
+    input->content_hash = compute_text_input_hash64(input);
+}
+
+bool flow_ui_text_input_insert_char64(FlowUiTextInput64 *input,
+                                      char ch,
+                                      FlowSvgUiNode64 *bound_node) {
+    if (!input || !input->focused || (uint8_t)ch < 32U || (uint8_t)ch > 126U) {
+        return false;
+    }
+    if (input->byte_len >= FLOW_UI_TEXT_INPUT_CAP) {
+        return false;
+    }
+    uint8_t pos = (input->cursor_byte_pos <= input->byte_len)
+        ? input->cursor_byte_pos
+        : input->byte_len;
+    for (uint8_t k = input->byte_len; k > pos; --k) {
+        input->utf8_buf[k] = input->utf8_buf[k - 1U];
+    }
+    input->utf8_buf[pos]        = ch;
+    input->byte_len            += 1U;
+    input->utf8_buf[input->byte_len] = '\0';
+    input->cursor_byte_pos      = (uint8_t)(pos + 1U);
+    input->selection_anchor_pos = input->cursor_byte_pos;
+    input->edit_revision       += 1U;
+    input->content_hash         = compute_text_input_hash64(input);
+    sync_text_input_to_node(input, bound_node);
+    return true;
+}
+
+bool flow_ui_text_input_backspace64(FlowUiTextInput64 *input,
+                                    FlowSvgUiNode64 *bound_node) {
+    if (!input || !input->focused || input->byte_len == 0U || input->cursor_byte_pos == 0U) {
+        return false;
+    }
+    uint8_t del_idx = (uint8_t)(input->cursor_byte_pos - 1U);
+    for (uint8_t k = del_idx; k + 1U < input->byte_len; ++k) {
+        input->utf8_buf[k] = input->utf8_buf[k + 1U];
+    }
+    input->byte_len            -= 1U;
+    input->utf8_buf[input->byte_len] = '\0';
+    input->cursor_byte_pos      = del_idx;
+    input->selection_anchor_pos = del_idx;
+    input->edit_revision       += 1U;
+    input->content_hash         = compute_text_input_hash64(input);
+    sync_text_input_to_node(input, bound_node);
+    return true;
+}
+
+void flow_ui_text_input_move_cursor64(FlowUiTextInput64 *input,
+                                      int32_t delta) {
+    if (!input) return;
+    int32_t next_pos = clamp_i32_ui((int32_t)input->cursor_byte_pos + delta,
+                                    0, (int32_t)input->byte_len);
+    input->cursor_byte_pos      = (uint8_t)next_pos;
+    input->selection_anchor_pos = (uint8_t)next_pos;
+    input->content_hash         = compute_text_input_hash64(input);
 }
 

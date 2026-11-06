@@ -397,7 +397,7 @@ static inline void flow_metal_renderer_update_bus_slot(FlowMetalRenderer *r,
 }
 
 static void flow_metal_sync_bus_slots(FlowMetalRenderer *r) {
-    for (uint32_t i = 0U; i < FLOW_SVG_UI_MAX_NODES; ++i) {
+    for (uint32_t i = 0U; i < FLOW_SVG_UI_GPU_BUS_SLOTS; ++i) {
         flow_metal_renderer_update_bus_slot(r, FLOW_BUS_SLOT_SVG_UI_0 + i, &s_live_svg_ui_nodes[i]);
     }
     flow_metal_renderer_update_bus_slot(r, FLOW_BUS_SLOT_WALLPAPER, &s_live_wallpaper);
@@ -889,8 +889,8 @@ static int run_4k_benchmark(bool export_ppm) {
                                                       FLOW_SVG_UI_MAX_NODES,
                                                       &s_live_svg_ui_dom);
         flow_broadcast_obs_init64(&s_live_obs_bridge, 0x4B01U, 0x4B02U, 0x4B03U);
-        printf("  ✓ FLOW SVG-UI DOM    : %zu / 8 reactive 64B nodes compiled (Liquid-Glass + OBS Bridge)\n",
-               compiled_ui);
+        printf("  ✓ FLOW SVG-UI DOM    : %zu / %u reactive 64B nodes compiled (Liquid-Glass + OBS Bridge)\n",
+               compiled_ui, (unsigned)FLOW_SVG_UI_MAX_NODES);
 
         enum { TOTAL_FRAMES = 100, WARMUP_FRAMES = 15, TIMED_CAP = TOTAL_FRAMES - WARMUP_FRAMES };
         double gpu_times_ms[TIMED_CAP];

@@ -1,5 +1,7 @@
 #include "flow_gpu_abi.h"
 #include "flow_procedural_assets.h"
+#include "flow_lean_abi.h"
+#include "flow_assets.h"
 #include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -664,8 +666,115 @@ int main(void) {
     printf("  ✓ 10,000 Headless Sessions Certified: 10000/10000 PASS (FirstFun<=%ums, Contrast=%d Q16, Flex=%ums)!\n",
            summary_jp.time_to_first_fun_ms, summary_jp.contrast_delta_q16, summary_jp.flex_window_ms);
 
+    /* 13. Direct .lean <-> FLOW 64-Byte ABI Bridge & Runtime Specification Loader */
+    printf("[Test 13/14] Direct .lean <-> FLOW 64B ABI Bridge & Runtime Spec Binding...\n");
+    FlowLeanClause64 abi_table[16];
+    flow_lean_abi_init_canonical_table(abi_table);
+
+    FlowLeanSpecMeta64 av_meta, sov_meta;
+    assert(flow_lean_abi_load_file("research/AudiovisualInvariants.lean", &av_meta, abi_table, 16U));
+    assert(av_meta.sorry_count == 0U && av_meta.theorem_count >= 10U && av_meta.def_count >= 8U);
+    assert(abi_table[FLOW_CLAUSE_AV_THERMAL_PURGE].param_a == 700LL);
+    assert(abi_table[FLOW_CLAUSE_AV_THERMAL_PURGE].param_b == 120LL);
+
+    assert(flow_lean_abi_load_file("research/SovereignQualityGates.lean", &sov_meta, abi_table, 16U));
+    assert(sov_meta.sorry_count == 0U && sov_meta.theorem_count >= 8U);
+    assert(abi_table[FLOW_CLAUSE_SOV_OKLAB_CONTRAST].param_a == 26214LL);
+    assert(abi_table[FLOW_CLAUSE_SOV_NEGATIVE_SPACE].param_a == 39321LL);
+    assert(abi_table[FLOW_CLAUSE_SOV_NEGATIVE_SPACE].param_b == 49152LL);
+
+    FlowLeanRegBank64 rbank;
+    flow_lean_abi_regbank_init64(&rbank);
+    /* Step thermal hysteresis (801K enter, 760K exit): 820K -> latched, 780K deadband -> stays latched, 750K -> unlatched */
+    rbank.regs_q16[0] = 820;
+    assert(flow_lean_abi_step_clause64(&abi_table[FLOW_CLAUSE_RICARDIAN_THERMAL_GATE], &rbank));
+    assert(rbank.regs_q16[0] == 1);
+    rbank.regs_q16[0] = 780;
+    assert(flow_lean_abi_step_clause64(&abi_table[FLOW_CLAUSE_RICARDIAN_THERMAL_GATE], &rbank));
+    assert(rbank.regs_q16[0] == 1);
+    rbank.regs_q16[0] = 750;
+    assert(flow_lean_abi_step_clause64(&abi_table[FLOW_CLAUSE_RICARDIAN_THERMAL_GATE], &rbank));
+    assert(rbank.regs_q16[0] == 0);
+
+    /* Step Harberger 70/30 conservation split on 10,000 units */
+    rbank.regs_q16[1] = 10000;
+    assert(flow_lean_abi_step_clause64(&abi_table[FLOW_CLAUSE_RICARDIAN_HARBERGER], &rbank));
+    assert(rbank.regs_q16[2] == 7000 && rbank.regs_q16[3] == 3000);
+    assert(rbank.regs_q16[2] + rbank.regs_q16[3] == 10000);
+    printf("  ✓ Verified .lean Runtime Parser & FLOW 64B ABI Execution (Hysteresis, Clamp, Split, FloorSub)!\n");
+
+    /* 14. Native 64-Byte External Asset Pipeline (WAV PCM Mixer, GLB 2.0 Mesh, W3C SVG <path>) */
+    printf("[Test 14/14] Native 64B External Asset Pipeline (WAV, GLB 2.0, W3C SVG <path>)...\n");
+    uint8_t test_wav[44 + 16];
+    memset(test_wav, 0, sizeof(test_wav));
+    memcpy(test_wav + 0,  "RIFF", 4);
+    uint32_t riff_sz = 36U + 16U;
+    memcpy(test_wav + 4,  &riff_sz, 4);
+    memcpy(test_wav + 8,  "WAVEfmt ", 8);
+    uint32_t fmt_sz = 16U, srate = 48000U, brate = 96000U, data_sz = 16U;
+    uint16_t ftag = 1U, nchan = 1U, balign = 2U, bps = 16U;
+    memcpy(test_wav + 16, &fmt_sz, 4);
+    memcpy(test_wav + 20, &ftag, 2);
+    memcpy(test_wav + 22, &nchan, 2);
+    memcpy(test_wav + 24, &srate, 4);
+    memcpy(test_wav + 28, &brate, 4);
+    memcpy(test_wav + 32, &balign, 2);
+    memcpy(test_wav + 34, &bps, 2);
+    memcpy(test_wav + 36, "data", 4);
+    memcpy(test_wav + 40, &data_sz, 4);
+    int16_t raw_samples[8] = { 4000, 8000, 12000, 16000, -16000, -12000, -8000, -4000 };
+    memcpy(test_wav + 44, raw_samples, 16);
+
+    int16_t decoded_mono[8] = {0};
+    FlowWavAssetDesc64 wav_desc;
+    assert(flow_asset_load_wav_bytes(test_wav, sizeof(test_wav), 10U, decoded_mono, 8U, &wav_desc));
+    assert(wav_desc.frame_count == 8U && wav_desc.sample_rate_hz == 48000U && decoded_mono[3] == 16000);
+
+    FlowAudioVoice64 voice;
+    int16_t stereo_mix[16] = {0};
+    flow_audio_voice_trigger64(&voice, 0U, &wav_desc, 65536, 0, 65536, false, 1ULL);
+    flow_audio_voice_mix_stereo_s16(&voice, decoded_mono, stereo_mix, 8U);
+    assert(stereo_mix[6] > 0 && stereo_mix[7] > 0);
+
+    /* Construct a valid glTF 2.0 Binary (.glb) with 2 vertices (-1.0,-1.0,-1.0) and (+2.0,+1.5,+1.0) */
+    const char *glb_json = "{\"asset\":{\"version\":\"2.0\"},\"accessors\":[{\"count\":2}]}   ";
+    uint32_t json_len = (uint32_t)strlen(glb_json); /* 56 bytes (4-byte aligned) */
+    uint32_t bin_len = 24U; /* 2 vertices x 12 bytes */
+    uint32_t glb_tot = 12U + 8U + json_len + 8U + bin_len;
+    uint8_t test_glb[128];
+    memset(test_glb, 0, sizeof(test_glb));
+    uint32_t glb_magic = FLOW_GLB_MAGIC_HEADER, glb_ver = 2U;
+    uint32_t chunk_json_t = FLOW_GLB_CHUNK_JSON, chunk_bin_t = FLOW_GLB_CHUNK_BIN;
+    memcpy(test_glb + 0,  &glb_magic, 4);
+    memcpy(test_glb + 4,  &glb_ver, 4);
+    memcpy(test_glb + 8,  &glb_tot, 4);
+    memcpy(test_glb + 12, &json_len, 4);
+    memcpy(test_glb + 16, &chunk_json_t, 4);
+    memcpy(test_glb + 20, glb_json, json_len);
+    size_t bin_off = 20U + json_len;
+    memcpy(test_glb + bin_off + 0, &bin_len, 4);
+    memcpy(test_glb + bin_off + 4, &chunk_bin_t, 4);
+    /* IEEE-754 bits: -1.0f = 0xBF800000, +2.0f = 0x40000000, +1.5f = 0x3FC00000, +1.0f = 0x3F800000 */
+    uint32_t vbits[6] = { 0xBF800000U, 0xBF800000U, 0xBF800000U, 0x40000000U, 0x3FC00000U, 0x3F800000U };
+    memcpy(test_glb + bin_off + 8, vbits, 24U);
+
+    int32_t glb_verts[4][3] = {{0}};
+    FlowGlbMeshDesc64 glb_desc;
+    assert(flow_asset_load_glb_bytes(test_glb, glb_tot, 20U, 1U, glb_verts, 4U, &glb_desc));
+    assert(glb_desc.vertex_count == 2U);
+    assert(glb_desc.aabb_min_q16[0] == -65536 && glb_desc.aabb_max_q16[0] == 131072);
+    assert(glb_desc.aabb_max_q16[1] == 98304  && glb_desc.aabb_max_q16[2] == 65536);
+    assert(flow_asset_eval_glb_sdf_q16(&glb_desc, 0, 0, 0) < 0); /* Origin is inside AABB! */
+
+    /* Compile standard W3C SVG <path> icon */
+    FlowGpuGlyphDesc64 svg_icon;
+    const char *w3c_svg = "<svg viewBox=\"0 0 24 24\"><path d=\"M 2 12 L 12 2 L 22 12 V 22 H 2 Z\"/></svg>";
+    assert(flow_asset_compile_svg_icon64(w3c_svg, 301U, 1U, &svg_icon));
+    assert(svg_icon.stroke_count == 5U && svg_icon.ternary_pos_mask != 0ULL);
+    printf("  ✓ Verified WAV PCM Mixer, GLB 2.0 Mesh Decoder (0-Float IEEE754->Q16) & W3C SVG <path> Compiler!\n");
+
     printf("====================================================================\n");
-    printf("✓ ALL 12 PROCEDURAL, MASTER-SEED, SOVEREIGN, TICKET & DOPAMINE TESTS PASSED (100%% SOUND)\n");
+    printf("✓ ALL 14 PROCEDURAL, LEAN-ABI & EXTERNAL ASSET TESTS PASSED (100%% SOUND)\n");
     printf("====================================================================\n");
     return 0;
 }

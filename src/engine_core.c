@@ -1,4 +1,5 @@
 #include "flow_game.h"
+#include "flow_lean_abi.h"
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -2028,52 +2029,20 @@ bool flow_save_restore_engine(FlowGameEngineState *engine,
 }
 
 void flow_save_encode_hex128(const FlowSaveCapsule64 *capsule, char out_hex[129]) {
-    if (!out_hex) {
-        return;
-    }
-    if (!capsule) {
-        memset(out_hex, '0', 128U);
-        out_hex[128] = '\0';
-        return;
-    }
-    static const char hex_lut[16] = {
-        '0', '1', '2', '3', '4', '5', '6', '7',
-        '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'
-    };
-    const uint8_t *bytes = (const uint8_t *)capsule;
-    for (size_t i = 0U; i < 64U; ++i) {
-        uint8_t b = bytes[i];
-        out_hex[i * 2U + 0U] = hex_lut[(b >> 4U) & 0x0FU];
-        out_hex[i * 2U + 1U] = hex_lut[b & 0x0FU];
-    }
-    out_hex[128] = '\0';
-}
-
-static int flow_save_hex_nibble(char c) {
-    if (c >= '0' && c <= '9') return (int)(c - '0');
-    if (c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
-    if (c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
-    return -1;
+    flow_capsule64_encode_hex128(capsule, out_hex);
 }
 
 bool flow_save_decode_hex128(const char hex[129], FlowSaveCapsule64 *out_capsule) {
     if (!hex || !out_capsule) {
         return false;
     }
+    if (hex[128] != '\0') {
+        memset(out_capsule, 0, sizeof(*out_capsule));
+        return false;
+    }
     FlowSaveCapsule64 candidate;
     memset(&candidate, 0, sizeof(candidate));
-    uint8_t *bytes = (uint8_t *)&candidate;
-
-    for (size_t i = 0U; i < 64U; ++i) {
-        int hi = flow_save_hex_nibble(hex[i * 2U + 0U]);
-        int lo = flow_save_hex_nibble(hex[i * 2U + 1U]);
-        if (hi < 0 || lo < 0) {
-            memset(out_capsule, 0, sizeof(*out_capsule));
-            return false;
-        }
-        bytes[i] = (uint8_t)(((uint32_t)hi << 4U) | (uint32_t)lo);
-    }
-    if (hex[128] != '\0') {
+    if (!flow_capsule64_decode_hex128(hex, &candidate)) {
         memset(out_capsule, 0, sizeof(*out_capsule));
         return false;
     }

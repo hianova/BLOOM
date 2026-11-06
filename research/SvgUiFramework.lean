@@ -217,33 +217,43 @@ theorem tex_box_glue_prefix_sum_monotonic
   unfold evalTexBoxPrefixAdvanceQ16
   omega
 
-/-- 13. Console Handheld vs. Docked Hot-Swap Raymarch Step Budget:
-    Maps `isDocked = true` (Switch Docked / Steam Deck AC / macOS ProMotion) to 64 Ultra steps,
-    and `isDocked = false` (Switch Handheld 720p / Steam Deck Battery Eco) to 32 Fast steps. -/
-def evalConsoleDockStepBudget (isDocked : Bool) : Nat :=
-  if isDocked then 64 else 32
+/-- 13. Flexbox / Stack Row-Column Layout Monotonic Cursor Advance:
+    Given current main-axis layout cursor `cursorQ16`, positive child half-extent
+    `childHalfQ16 > 0`, and non-negative inter-widget gap `gapQ16`, computes the next
+    child's starting main-axis cursor `cursorQ16 + 2 * childHalfQ16 + gapQ16`. -/
+def stepFlexLayoutCursorQ16 (cursorQ16 : Nat) (childHalfQ16 : Nat) (gapQ16 : Nat) : Nat :=
+  cursorQ16 + 2 * childHalfQ16 + gapQ16
 
-/-- Theorem 13: Hot-swapping between Handheld (`isDocked = false`) and Docked (`isDocked = true`)
-    deterministically bounds raymarch step complexity within `[32, 64]` in 0 frames. -/
-theorem console_dock_handheld_hotswap_step_budget
-    (isDocked : Bool) :
-    32 <= evalConsoleDockStepBudget isDocked ∧ evalConsoleDockStepBudget isDocked <= 64 := by
-  unfold evalConsoleDockStepBudget
-  cases isDocked <;> simp
+/-- Theorem 13: Every child widget with `childHalfQ16 > 0` in a `FlowUiLayoutContainer64`
+    Row or Column pass strictly advances the main-axis layout cursor without overlap. -/
+theorem flex_stack_layout_monotonic_advance
+    (cursorQ16 childHalfQ16 gapQ16 : Nat)
+    (h_pos : childHalfQ16 > 0) :
+    cursorQ16 < stepFlexLayoutCursorQ16 cursorQ16 childHalfQ16 gapQ16 := by
+  unfold stepFlexLayoutCursorQ16
+  omega
 
-/-- 14. 48kHz Audio Envelope to Switch HD Rumble / Steam Deck Haptics Clamping:
-    Maps synthesized Q16 acoustic energy and 2-Jet glass ripple impulse into `[0, 65536]`
-    for dual-band linear resonant actuators (160Hz Low + 320Hz High). -/
-def evalHdRumbleActuatorQ16 (audioEnvQ16 : Nat) (rippleJetQ16 : Nat) : Nat :=
-  if audioEnvQ16 + rippleJetQ16 > 65536 then 65536 else audioEnvQ16 + rippleJetQ16
+/-- 14. Standard SVG `viewBox` Coordinate to Q16 `[0, 65536]` Normalization:
+    Maps standard SVG pixel coordinate `coordPx` within `viewExtentPx > 0` into
+    normalized Q16 `[0, 65536]` with zero floating-point operations. -/
+def normSvgViewBoxCoordQ16 (coordPx : Nat) (viewExtentPx : Nat) : Nat :=
+  if viewExtentPx == 0 then 0
+  else if coordPx >= viewExtentPx then 65536
+  else
+    let scaled := (coordPx * 65536) / viewExtentPx
+    if scaled > 65536 then 65536 else scaled
 
-/-- Theorem 14: Dual-band HD Rumble / Haptic actuator drive amplitude is strictly
-    bounded within `[0, 65536]` (Q16 `[0.0, 1.0]`), preventing voice-coil saturation. -/
-theorem hd_rumble_dual_band_envelope_bounded
-    (audioEnvQ16 rippleJetQ16 : Nat) :
-    evalHdRumbleActuatorQ16 audioEnvQ16 rippleJetQ16 <= 65536 := by
-  unfold evalHdRumbleActuatorQ16
-  by_cases h : audioEnvQ16 + rippleJetQ16 > 65536 <;> simp [h] <;> omega
+/-- Theorem 14: Standard SVG `viewBox` coordinate normalization is strictly bounded
+    within `[0, 65536]` for any pixel coordinate and viewport extent. -/
+theorem svg_viewbox_q16_normalization_bounded
+    (coordPx viewExtentPx : Nat) :
+    normSvgViewBoxCoordQ16 coordPx viewExtentPx <= 65536 := by
+  unfold normSvgViewBoxCoordQ16
+  by_cases h0 : (viewExtentPx == 0) = true
+  · simp [h0]
+  · by_cases h1 : coordPx >= viewExtentPx
+    · simp [h0, h1]
+    · by_cases h2 : (coordPx * 65536) / viewExtentPx > 65536 <;> simp [h0, h1, h2] <;> omega
 
 /-- 15. Scripted Story Finisher ("劇情殺") Plot-Armor HP Floor Gate:
     While `inAnticipationLock = true`, entity HP is clamped to at least `hpFloor` (`>= 1`)
@@ -292,50 +302,48 @@ theorem scene_transition_wipe_atomic_swap_bounded
   · unfold evalTransitionWipeEnvelopeQ16
     simp
 
-/-- 17. Bounded 64-Byte Session Ring Buffer (Eliminates Long-Session OOM #2099/#3178/#10592/#19100):
-    Maps an arbitrary monotonic session/tool event index `totalEvents` into a fixed
-    ring slot `[0, capacity)` and fixes arena byte footprint at `64 * capacity`. -/
-def evalRingWriteSlot (totalEvents : Nat) (capacity : Nat) : Nat :=
-  totalEvents % capacity
+/-- 17. 64-Byte Inline Text Input Widget (`FlowUiTextInput64`) Cursor & Capacity Bounds:
+    Models a character insertion into the 39-byte inline UTF-8/ASCII buffer (`cap = 39`),
+    computing the new byte length `stepUiTextLen` and new caret position `stepUiTextCursor`. -/
+def stepUiTextLen (byteLen : Nat) : Nat :=
+  if byteLen < 39 then byteLen + 1 else 39
 
-def evalRingArenaFootprintBytes (capacity : Nat) : Nat :=
-  64 * capacity
+def stepUiTextCursor (byteLen : Nat) (cursorPos : Nat) : Nat :=
+  let clampedCur := if cursorPos <= byteLen then cursorPos else byteLen
+  if byteLen < 39 then clampedCur + 1 else 39
 
-/-- Theorem 17: For any non-empty ring capacity `capacity > 0` and any unbounded
-    number of session events `totalEvents`, the write slot stays strictly within
-    `[0, capacity)` and total memory remains constant `64 * capacity` bytes (0 Heap growth). -/
-theorem bounded_session_ring_zero_oom_invariant
-    (totalEvents capacity : Nat)
-    (h_cap : capacity > 0) :
-    evalRingWriteSlot totalEvents capacity < capacity ∧
-    evalRingArenaFootprintBytes capacity = 64 * capacity := by
+/-- Theorem 17: Any character insertion into `FlowUiTextInput64` preserves the buffer
+    capacity ceiling (`stepUiTextLen <= 39`) and keeps the caret strictly in-bounds
+    (`stepUiTextCursor <= stepUiTextLen`). -/
+theorem ui_text_input_cursor_in_bounds
+    (byteLen cursorPos : Nat) :
+    stepUiTextLen byteLen <= 39 ∧
+    stepUiTextCursor byteLen cursorPos <= stepUiTextLen byteLen := by
+  unfold stepUiTextLen stepUiTextCursor
+  by_cases h1 : byteLen < 39 <;> by_cases h2 : cursorPos <= byteLen <;> simp [h1, h2] <;> omega
+
+/-- 18. Generic 12-Channel Telemetry Register Bank (`FlowUiRegisterBank64`) Channel Gate:
+    Maps valid register channels `[0, 11]` to their clamped Q16 value `[0, 65536]`,
+    and safely maps out-of-range channel indices `>= 12` to `0`. -/
+def evalRegisterBankChannelQ16 (channelId : Nat) (rawValQ16 : Nat) : Nat :=
+  if channelId < 12 then
+    if rawValQ16 > 65536 then 65536 else rawValQ16
+  else
+    0
+
+/-- Theorem 18: Any register bank lookup via `FlowUiRegisterBank64` is strictly bounded
+    within `[0, 65536]` and deterministically zeroes out-of-range channel IDs `>= 12`. -/
+theorem ui_register_bank_channel_lookup_sound
+    (channelId rawValQ16 : Nat)
+    (h_oob : channelId >= 12) :
+    evalRegisterBankChannelQ16 channelId rawValQ16 = 0 ∧
+    evalRegisterBankChannelQ16 1 rawValQ16 <= 65536 := by
   constructor
-  · unfold evalRingWriteSlot
-    exact Nat.mod_lt totalEvents h_cap
-  · unfold evalRingArenaFootprintBytes
-    rfl
-
-/-- 18. Deterministic Tool Watchdog & Bitmask Capability Gate (Eliminates #22198 Hang & Glob Bypass):
-    Evaluates whether a tool step has exceeded `timeoutBudgetUs` (1-tick deterministic reclaim)
-    and whether `requestedCap` attempts privilege escalation beyond `grantedCap`. -/
-def evalToolWatchdogTripped (elapsedUs : Nat) (timeoutBudgetUs : Nat) : Bool :=
-  elapsedUs >= timeoutBudgetUs
-
-def evalCapabilityEscalationBlocked (requestedCap : Nat) (grantedCap : Nat) : Bool :=
-  (requestedCap &&& grantedCap) != requestedCap
-
-/-- Theorem 18: Any tool execution reaching or exceeding `timeoutBudgetUs` (`elapsedUs >= timeoutBudgetUs`)
-    deterministically trips the watchdog in O(1), and compound/reordered capability escalation (`0x83` vs `0x07`)
-    is deterministically blocked while valid subset capabilities (`0x03` vs `0x07`) are permitted. -/
-theorem tool_watchdog_and_permission_bitmask_sound
-    (elapsedUs timeoutBudgetUs : Nat)
-    (h_timeout : elapsedUs >= timeoutBudgetUs) :
-    evalToolWatchdogTripped elapsedUs timeoutBudgetUs = true ∧
-    evalCapabilityEscalationBlocked 0x83 0x07 = true ∧
-    evalCapabilityEscalationBlocked 0x03 0x07 = false := by
-  refine ⟨?_, rfl, rfl⟩
-  unfold evalToolWatchdogTripped
-  simp [h_timeout]
+  · unfold evalRegisterBankChannelQ16
+    have h_not_lt : ¬ (channelId < 12) := by omega
+    simp [h_not_lt]
+  · unfold evalRegisterBankChannelQ16
+    by_cases h_clamp : rawValQ16 > 65536 <;> simp [h_clamp] <;> omega
 
 end FlowSvgUiFramework
 

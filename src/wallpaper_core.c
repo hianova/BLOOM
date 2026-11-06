@@ -1,32 +1,14 @@
 #include "flow_wallpaper.h"
+#include "flow_lean_abi.h"
 #include <stdio.h>
 #include <string.h>
 
-static inline uint64_t wp_splitmix64(uint64_t x) {
-    x += 0x9E3779B97F4A7C15ULL;
-    x = (x ^ (x >> 30U)) * 0xBF58476D1CE4E5B9ULL;
-    x = (x ^ (x >> 27U)) * 0x94D049BB133111EBULL;
-    return x ^ (x >> 31U);
-}
-
 static uint64_t calc_wallpaper_mac64(const FlowWallpaperState64 *wp) {
-    uint64_t h = 0x57414C4C50415052ULL ^ wp->master_seed;
-    h = wp_splitmix64(h ^ (((uint64_t)(uint32_t)wp->cursor_x_q16 << 32U) | (uint32_t)wp->cursor_y_q16));
-    h = wp_splitmix64(h ^ (((uint64_t)(uint32_t)wp->parallax_offset_x_q16 << 32U) | (uint32_t)wp->parallax_offset_y_q16));
-    h = wp_splitmix64(h ^ (((uint64_t)(uint32_t)wp->audio_reactive_env_q16 << 32U) | (uint32_t)wp->occlusion_ratio_q16));
-    h = wp_splitmix64(h ^ (((uint64_t)wp->battery_percent << 32U) | wp->ac_power_connected));
-    h = wp_splitmix64(h ^ (((uint64_t)wp->power_mode << 32U) | wp->target_frame_interval_us));
-    h = wp_splitmix64(h ^ (((uint64_t)wp->vcam_preset_id << 32U) | wp->finish_and_flags));
-    return (h == 0ULL) ? 1ULL : h;
+    return flow_capsule64_calc_mac(wp, 0x57414C4C50415052ULL);
 }
 
 static uint64_t calc_host_config_mac64(const FlowDesktopHostConfig64 *host) {
-    uint64_t h = 0x484F535443464736ULL ^ host->native_window_handle;
-    h = wp_splitmix64(h ^ (((uint64_t)host->os_platform_id << 32U) | host->desktop_z_level));
-    h = wp_splitmix64(h ^ (((uint64_t)host->screen_width_px << 32U) | host->screen_height_px));
-    h = wp_splitmix64(h ^ (((uint64_t)host->click_through_enabled << 32U) | host->stationary_all_spaces));
-    h = wp_splitmix64(h ^ (((uint64_t)host->audio_muted_by_default << 32U) | host->active_refresh_hz));
-    return (h == 0ULL) ? 1ULL : h;
+    return flow_capsule64_calc_mac(host, 0x484F535443464736ULL);
 }
 
 void flow_wallpaper_init64(FlowWallpaperState64 *wp,
@@ -102,23 +84,23 @@ bool flow_wallpaper_step_governor64(FlowWallpaperState64 *wp,
     bool prev_paused = (wp->power_mode == FLOW_WP_POWER_PAUSED_0HZ);
     bool prev_eco    = (wp->power_mode == FLOW_WP_POWER_BATTERY_30HZ);
 
-    /* 1. Dual-Threshold Occlusion Pause Hysteresis ([75%, 90%] = [49152, 58982] Q16) */
-    bool next_paused = prev_paused;
-    if (occlusion_ratio_q16 >= FLOW_WP_OCCLUSION_PAUSE_ENTER_Q16) {
-        next_paused = true;
-    } else if (occlusion_ratio_q16 <= FLOW_WP_OCCLUSION_PAUSE_EXIT_Q16) {
-        next_paused = false;
-    }
+    /* 1. Dual-Threshold Occlusion Pause Hysteresis via FLOW .lean ABI (FlowAbiPoly1D + Kan) */
+    bool next_paused = flow_lean_abi_eval_hysteresis_hi(
+        (int64_t)occlusion_ratio_q16,
+        (int64_t)FLOW_WP_OCCLUSION_PAUSE_ENTER_Q16,
+        (int64_t)FLOW_WP_OCCLUSION_PAUSE_EXIT_Q16,
+        prev_paused
+    );
 
-    /* 2. Dual-Threshold Battery Eco Hysteresis ([40%, 50%]) */
-    bool next_eco = prev_eco;
-    if (ac_power_connected) {
-        next_eco = false;
-    } else if (battery_percent <= FLOW_WP_BATTERY_ECO_ENTER_PCT) {
-        next_eco = true;
-    } else if (battery_percent >= FLOW_WP_BATTERY_ECO_EXIT_PCT) {
-        next_eco = false;
-    }
+    /* 2. Dual-Threshold Battery Eco Hysteresis via FLOW .lean ABI (FlowAbiPoly1D + Kan) */
+    bool next_eco = ac_power_connected
+        ? false
+        : flow_lean_abi_eval_hysteresis_lo(
+            (int64_t)battery_percent,
+            (int64_t)FLOW_WP_BATTERY_ECO_ENTER_PCT,
+            (int64_t)FLOW_WP_BATTERY_ECO_EXIT_PCT,
+            prev_eco
+        );
 
     if (next_paused) {
         wp->power_mode = FLOW_WP_POWER_PAUSED_0HZ;
@@ -171,14 +153,17 @@ void flow_wallpaper_step_parallax_q16(FlowWallpaperState64 *wp,
     int32_t target_px = desktop_cursor_x_q16 >> 2;
     int32_t target_py = desktop_cursor_y_q16 >> 2;
 
-    /* Critically-damped 2-Jet EMA step: offset += (target - offset) >> 2 */
-    int32_t next_px = wp->parallax_offset_x_q16 + ((target_px - wp->parallax_offset_x_q16) >> 2);
-    int32_t next_py = wp->parallax_offset_y_q16 + ((target_py - wp->parallax_offset_y_q16) >> 2);
-
-    if (next_px < -FLOW_WP_MAX_PARALLAX_Q16) next_px = -FLOW_WP_MAX_PARALLAX_Q16;
-    if (next_px >  FLOW_WP_MAX_PARALLAX_Q16) next_px =  FLOW_WP_MAX_PARALLAX_Q16;
-    if (next_py < -FLOW_WP_MAX_PARALLAX_Q16) next_py = -FLOW_WP_MAX_PARALLAX_Q16;
-    if (next_py >  FLOW_WP_MAX_PARALLAX_Q16) next_py =  FLOW_WP_MAX_PARALLAX_Q16;
+    /* Critically-damped 2-Jet EMA step + .lean ABI interval clamp */
+    int32_t next_px = (int32_t)flow_lean_abi_eval_clamp(
+        wp->parallax_offset_x_q16 + ((target_px - wp->parallax_offset_x_q16) >> 2),
+        -(int64_t)FLOW_WP_MAX_PARALLAX_Q16,
+        (int64_t)FLOW_WP_MAX_PARALLAX_Q16
+    );
+    int32_t next_py = (int32_t)flow_lean_abi_eval_clamp(
+        wp->parallax_offset_y_q16 + ((target_py - wp->parallax_offset_y_q16) >> 2),
+        -(int64_t)FLOW_WP_MAX_PARALLAX_Q16,
+        (int64_t)FLOW_WP_MAX_PARALLAX_Q16
+    );
 
     wp->parallax_offset_x_q16 = next_px;
     wp->parallax_offset_y_q16 = next_py;
@@ -196,42 +181,17 @@ void flow_wallpaper_step_parallax_q16(FlowWallpaperState64 *wp,
 }
 
 void flow_wallpaper_encode_hex128(const FlowWallpaperState64 *wp, char out_hex[129]) {
-    static const char kHexDigits[16] = {
-        '0','1','2','3','4','5','6','7','8','9','A','B','C','D','E','F'
-    };
     if (!wp || !out_hex)
         return;
-    const uint8_t *bytes = (const uint8_t *)wp;
-    for (size_t i = 0U; i < 64U; ++i) {
-        out_hex[i * 2U + 0U] = kHexDigits[(bytes[i] >> 4U) & 0x0FU];
-        out_hex[i * 2U + 1U] = kHexDigits[bytes[i] & 0x0FU];
-    }
-    out_hex[128] = '\0';
-}
-
-static int hex_nibble_val(char c) {
-    if (c >= '0' && c <= '9') return (int)(c - '0');
-    if (c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
-    if (c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
-    return -1;
+    flow_capsule64_encode_hex128(wp, out_hex);
 }
 
 bool flow_wallpaper_decode_hex128(const char *hex_str, FlowWallpaperState64 *out_wp) {
     if (!hex_str || !out_wp)
         return false;
-    for (size_t i = 0U; i < 128U; ++i) {
-        if (hex_str[i] == '\0')
-            return false;
-    }
     FlowWallpaperState64 tmp;
-    uint8_t *bytes = (uint8_t *)&tmp;
-    for (size_t i = 0U; i < 64U; ++i) {
-        int hi = hex_nibble_val(hex_str[i * 2U + 0U]);
-        int lo = hex_nibble_val(hex_str[i * 2U + 1U]);
-        if (hi < 0 || lo < 0)
-            return false;
-        bytes[i] = (uint8_t)((hi << 4) | lo);
-    }
+    if (!flow_capsule64_decode_hex128(hex_str, &tmp))
+        return false;
     if (!flow_wallpaper_verify_mac64(&tmp))
         return false;
     *out_wp = tmp;
