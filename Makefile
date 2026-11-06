@@ -1,8 +1,8 @@
 # ==============================================================================
-# BLOOM v1.0.0: Clean-Slate 100% Pure C17 / Metal Engine Makefile (Zero C++)
+# BLOOM v1.1.0: Clean-Slate 100% Pure C17 / Metal Engine Makefile (Zero C++)
 # ==============================================================================
 CC ?= clang
-BLOOM_VERSION := $(shell tr -d '[:space:]' < VERSION 2>/dev/null || echo "1.0.0")
+BLOOM_VERSION := $(shell tr -d '[:space:]' < VERSION 2>/dev/null || echo "1.1.0")
 
 CFLAGS = -std=c17 -Wall -Wextra -Werror -O2 -pthread \
          -DBLOOM_VERSION_STRING=\"$(BLOOM_VERSION)\" \

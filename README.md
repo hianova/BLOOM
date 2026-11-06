@@ -1,4 +1,4 @@
-# BLOOM (v1.0.0) — 64-Byte 定點物理光學、程序化資產與影視預演引擎
+# BLOOM (v1.1.0) — 64-Byte 定點物理光學、程序化資產與影視預演引擎
 
 **BLOOM**（原專案代號 `flow_game`）是一套以 100% 純 C17（`-std=c17 -Wall -Wextra -Werror -O2`）與 Apple Metal 建構的**定點物理模擬、程序化 SDF/CSG 幾何渲染、64-Byte UI 排版與影視預演（Previz）管線基礎庫**，底層建構於 [`FLOW v4`](../FLOW)（`libflow_rt.a`）與 `Ricardian v4`（[`include/ricardian.h`](include/ricardian.h)）。
 
@@ -46,7 +46,7 @@ make test
 # 僅編譯核心二進位執行檔（build/bloom）
 make
 
-# 查詢引擎版本（BLOOM v1.0.0）
+# 查詢引擎版本（BLOOM v1.1.0）
 ./build/bloom --version
 
 # 執行 Gate 0 FLOWY 形式化與硬體稽核（64B 矩陣、LLVM IR、Metal AIR、Lean 4 定理證明驗證）

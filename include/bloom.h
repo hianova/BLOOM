@@ -3,7 +3,7 @@
 
 /*
  * ============================================================================
- * BLOOM v1.0.0: Clean-Slate 100% Pure C17 / Metal Simulation & UI Engine
+ * BLOOM v1.1.0: Clean-Slate 100% Pure C17 / Metal Simulation & UI Engine
  * ============================================================================
  * Master umbrella header for the BLOOM engine (superseding legacy flow_game).
  * ============================================================================
