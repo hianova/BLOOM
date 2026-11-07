@@ -44,13 +44,13 @@
 #define BLOOM_VERSION_MAJOR 1U
 #endif
 #ifndef BLOOM_VERSION_MINOR
-#define BLOOM_VERSION_MINOR 1U
+#define BLOOM_VERSION_MINOR 2U
 #endif
 #ifndef BLOOM_VERSION_PATCH
 #define BLOOM_VERSION_PATCH 0U
 #endif
 #ifndef BLOOM_VERSION_STRING
-#define BLOOM_VERSION_STRING "1.0.0"
+#define BLOOM_VERSION_STRING "1.2.0"
 #endif
 
 /* Viewport Tile Partitioning for 4K (3840x2160) */

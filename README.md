@@ -1,6 +1,6 @@
-# BLOOM (v1.1.0) — 64-Byte 定點物理光學、程序化資產與影視預演引擎
+# BLOOM — 64-Byte 定點物理光學、程序化資產與影視預演引擎
 
-**BLOOM**（原專案代號 `flow_game`）是一套以 100% 純 C17（`-std=c17 -Wall -Wextra -Werror -O2`）與 Apple Metal 建構的**定點物理模擬、程序化 SDF/CSG 幾何渲染、64-Byte UI 排版與影視預演（Previz）管線基礎庫**，底層建構於 [`FLOW v4`](../FLOW)（`libflow_rt.a`）與 `Ricardian v4`（[`include/ricardian.h`](include/ricardian.h)）。
+**BLOOM**（原專案代號 `flow_game`）是一套以 100% 純 C17（`-std=c17 -Wall -Wextra -Werror -O2`）與 Apple Metal 建構的**定點物理模擬、程序化 SDF/CSG 幾何渲染、64-Byte UI 排版與影視預演（Previz）管線基礎庫**，底層建構於 [`FLOW`](../FLOW)（`libflow_rt.a`）與 `Ricardian`（[`include/ricardian.h`](include/ricardian.h)）。
 
 ---
 
@@ -11,18 +11,18 @@ BLOOM 採用 **「算子與參數分離」** 的設計模式：將底層物理�
 - **100% Pure C17 / Zero Float Drift / Zero Heap**：核心模擬邏輯皆為純 C17（`FloatOps: 0 | HeapCalls: 0`），採用 Q16.16 / Q48.16 定點數與 2-Jet 自動微分（`FlowJet2`），確保跨平台、跨執行緒與網路同步具備 **Bit-for-Bit 確定性**，並編譯為靜態函式庫 `build/libbloom.a` 供下游專案直接連結。
 - **零編譯期 `.lean` $\leftrightarrow$ `FLOW` 64-Byte ABI 直接路由 (`include/flow_lean_abi.h`)**：
   - 執行期直接解析 `research/*.lean` 形式化規格檔（`flow_lean_abi_load_file`），提取常數與狀態轉移條件並綁定為 64-byte `FlowLeanClause64` 算子描述子。
-  - 直接驅動底層 `FLOW` 核心算子（`FlowAbiPoly1D_eval_hysteresis` + `flow_cubical_step_neighbor` Kan 同倫驗證、`flow_jet2_ema_step` 二階阻尼、守恆比例拆分、区间鉗制與配額閘門），無須在 C 端重複手寫 `if/else` 膠水碼。
+  - 直接驅動底層 `FLOW` 核心算子（`FlowAbiPoly1D_eval_hysteresis` + `flow_cubical_step_neighbor` Kan 同倫驗證、`flow_jet2_ema_step` 二階阻尼、守恆比例拆分、區間鉗制與配額閘門），無須在 C 端重複手寫 `if/else` 膠水碼。
 - **原生 64-Byte 外部資產與資料驅動 CSG 管線 (`include/flow_assets.h` / `include/flow_gpu_abi.h`)**：
   - **純 Wire-Format 封包標頭與執行期解耦**：公開封包與跨語言 ABI 標頭（`flow_lean_abi.h`、`flow_gpu_abi.h`、`flow_svg_ui.h`、`flow_wallpaper.h`）僅依賴標準 `<stdint.h>` / `<stdbool.h>`，將 `FLOW` 執行期算子封裝於 `.c` 實作層，支援跨語言與 GPU Shader Zero-Copy 映射。
   - **RIFF/WAVE (`.wav`) 載入與多軌相對論都卜勒混音 (`FlowWavAssetDesc64` / `FlowAudioVoice64`)**：支援 8/16/24/32-bit PCM 與 IEEE-754 float32 音訊載入、立體聲相位平移與相對論都卜勒變速混音。
-  - **glTF 2.0 Binary (`.glb`) 3D 模型解析與資料驅動 GPU CSG 指令串流 (`FlowGlbMeshDesc64` / `FlowGpuCsgOp64`)**：以純整數位移（`flow_ieee754_bits_to_q16`，0 浮點指令）解析 `.glb` 二進位頂點緩衝區，並可編譯為 64-byte 資料驅動 CSG 布林指令串流（Union / Subtract / Intersect / Smooth-Union，`flow_asset_compile_glb_to_csg_op64`、`flow_asset_eval_csg_program_q16`）。
+  - **glTF Binary (`.glb`) 3D 模型解析與資料驅動 GPU CSG 指令串流 (`FlowGlbMeshDesc64` / `FlowGpuCsgOp64`)**：以純整數位移（`flow_ieee754_bits_to_q16`，0 浮點指令）解析 `.glb` 二進位頂點緩衝區，並可編譯為 64-byte 資料驅動 CSG 布林指令串流（Union / Subtract / Intersect / Smooth-Union，`flow_asset_compile_glb_to_csg_op64`、`flow_asset_eval_csg_program_q16`）。
   - **標準 W3C SVG `<path>` 圖示編譯 (`flow_asset_compile_svg_icon64`)**：支援解析標準美術匯出之 `<path d="M... L... H... V... Z"/>` 與 `viewBox` 為 64-byte GPU 向量圖示（`FlowGpuGlyphDesc64`）。
   - **64-Byte 定點對偶四元數骨骼蒙皮 (`FlowGpuJointDq64`)、無指標線性 BVH 空間加速樹 (`FlowGpuBvhNode64`) 與稀疏 $4 \times 4 \times 4$ SDF 體素磚 (`FlowGpuSdfBrick64`)**：
     - 以純整數 `Q16.16` 實作體積守恆之對偶四元數（Dual-Quaternion $\hat{q} = q_r + \epsilon q_d$）剛體變換、最短弧混合（`flow_joint_dq64_blend`）與多關節平滑肌肉包絡（`flow_skeleton_eval_sdf_q16`），徹底消除傳統線性矩陣蒙皮（LBS）之關節扭轉體積塌縮與浮點誤差。
     - 支援 60-bit 3D Morton Z-Order 空間編碼（`flow_bvh_morton3d_q16`）、無指標線性陣列 BVH 建構（`flow_bvh_build_from_csg64`）與 $O(\log N)$ AABB 下界剪枝查詢（`flow_bvh_eval_csg_q16`）。
     - 將 $4 \times 4 \times 4 = 64$ 個 4-bit 量化符號距離體素（Bias `8` 對應零等值面）連同 3D 座標原點、體素步長與 MAC 完整封裝進單一 64-byte 快取線（`flow_sdf_brick64_pack`），支援純整數三線性插值取樣（`flow_sdf_brick64_sample_trilinear_q16`）。
 - **統一 64-Byte 記憶體映射 `.flow` 容器與雙軌串流色域輸出介面 (`include/flow_image64.h` / `FlowStreamEgress64`)**：
-  - 將分散的設定檔（TOML）、結構化資料（JSON/CSV）與視覺/3D 預製件（PDF/SVG/GLB/骨骼/BVH/SDF 磚）統一收斂為單一 2 的冪次方 64-Byte 快取線區塊陣列（`FlowImageHeader64` + `FlowImageBlock64`，Magic `"FLOWIMG4"`）。
+  - 將分散的設定檔（TOML）、結構化資料（JSON/CSV）與視覺/3D 預製件（PDF/SVG/GLB/骨骼/BVH/SDF 磚）統一收斂為單一 2 的冪次方 64-Byte 快取線區塊陣列（`FlowImageHeader64` + `FlowImageBlock64`）。
   - 支援 `flow_image64_mmap_readonly` 零解析（Zero-Parse / Zero-Malloc）直接記憶體映射、`flow_image64_get_block_masked`（$\mathbb{Z}/2^k\mathbb{Z}$ 位元遮罩）與網路分片邊下邊播組裝（`flow_image64_stream_ingest_block`），保證亂序或損毀偏移量下 `0` 越界 Segfault，且相容 `-ffreestanding` 裸機環境。
   - **64-Byte 串流與色域輸出閘門 (`FlowStreamEgress64`)**：引擎內部統一以物理色溫（Kelvin）與感知正交空間 **OKLab (`Q16.16`)** 運算，輸出邊界透過 `flow_stream_egress64_map_oklab_to_rgb_q16`（支援 `ITU-R BT.709 / sRGB`、`Display P3`、`ITU-R BT.2020 PQ`、`ACEScg`，D65 白點嚴格守恆）與 `flow_stream_egress64_rgb_to_yuv420_bt709`（Studio-Swing `YCbCr`）轉譯至外部直播或影視管線。
 - **64-Byte Cache-Line Univalence 與 $O(1)$ 狀態回滾**：引擎狀態、Prefab 資產（`FlowPrefabDesc64`）、色票配置（`FlowMoodboardPrefab64`）、攝影機分鏡（`FlowCinemaShot64`）與 GPU ABI 均對齊 64-byte Cache Line，支援透過 64B Shadow 雙緩衝進行常數時間狀態回滾（Atomic Rollback）。
@@ -32,7 +32,7 @@ BLOOM 採用 **「算子與參數分離」** 的設計模式：將底層物理�
   - 內建四組程序化物理光學場景：**Stage 0 相對論飛行器與黑體輻射腔**、**Stage 1 車窗凝露與 2-Jet 水滴折射**、**Stage 2 3D 空間雜湊點雲迴廊**、**Stage 3 等軸 3D CSG 地質與水體剖面**。
 - **POSIX Pipe FFmpeg 影視預演與 CMX 3600 `.edl` 分鏡輸出 (`FlowCinemaShot64`)**：
   - 支援 `24 fps` 鎖幀渲染搭配每幀 `2000` 取樣的 `48kHz` 純整數立體聲合成音軌，透過 POSIX Pipe 直接串流至 `ffmpeg` 輸出 `.mp4` 預演影片與剪輯軟體（DaVinci Resolve / Premiere）相容的 `.edl` 分鏡表，避免產生中間暫存圖檔。
-- **宣告式 64B SVG-UI、CJK IME 輸入法橋接、跨平台 HiDPI 視窗與單通道 LaTeX SDF**：支援標準 SVG `viewBox` / `<rect>` / `<circle>` 像素座標自動正規化、`O(N)` 64-Byte Flexbox/Stack 容器排版（`FlowUiLayoutContainer64`）、12 通道通用狀態暫存器庫（`FlowUiRegisterBank64`）、64-Byte 內嵌文字輸入元件（`FlowUiTextInput64`）、64-Byte 系統字型圖集描述子（`FlowFontAtlasGlyph64`）與 CJK 輸入法組字橋接（`FlowImeComposition64`）、跨平台 HiDPI 視窗與原生檔案對話框描述子（`FlowHostWindowDesc64` / `FlowNativeDialogDesc64`）、Beer-Lambert 透射光學 UI、無字型圖集之 64B LaTeX SDF 數學公式盒（`FlowLatexBoxNode64`）、過場運鏡控制器（`FlowNarrativeDirector64`），以及 `IOSurface` 零拷貝 OBS 擷取與獨立 `5KB` WebGL2 動態桌布匯出。
+- **宣告式 64B SVG-UI、CJK IME 輸入法橋接、跨平台 HiDPI 視窗與單通道 LaTeX SDF**：支援標準 SVG `viewBox` / `<rect>` / `<circle>` 像素座標自動正規化、`O(N)` 64-Byte Flexbox/Stack 容器排版（`FlowUiLayoutContainer64`）、12 通道通用狀態暫存器庫（`FlowUiRegisterBank64`）、64-Byte 內嵌文字輸入元件（`FlowUiTextInput64`）、64-Byte 系統字型圖集描述子（`FlowFontAtlasGlyph64`）與 CJK 輸入法組字橋接（`FlowImeComposition64`）、跨平台 HiDPI 視窗與原生檔案對話框描述子（`FlowHostWindowDesc64` / `FlowNativeDialogDesc64`）、Beer-Lambert 透射光學 UI、無字型圖集之 64B LaTeX SDF 數學公式盒（`FlowLatexBoxNode64`）、過場運鏡控制器（`FlowNarrativeDirector64`），以及 `IOSurface` 零拷貝 OBS 擷取與獨立 `5KB` WebGL 動態桌布匯出。
 
 ---
 
@@ -42,19 +42,19 @@ BLOOM 採用 **「算子與參數分離」** 的設計模式：將底層物理�
 
 本專案依賴 Clang C17 編譯器與 Apple Metal API，並引用上層目錄之工具鏈：
 - `FLOW` 執行期函式庫：`../FLOW/build/libflow_rt.a`
-- `FLOWY` Gate 0 跨層稽核工具：`../flowy/build/flowy`
+- `FLOWY` Gate 0 跨層稽核工具：`../FLOWY/build/flowy`
 - `FFmpeg`（選用，用於 `--cinema-reel` / `--cinema-out` 預演影片輸出）：`/opt/homebrew/bin/ffmpeg`
 
 #### 快速建置指令
 
 ```bash
-# 編譯所有模組並執行 8 道驗證閘門（Gate 0 FLOWY 跨層稽核 + Gate 1..6 共 53 項單元測試 + Gate 7 4K Metal 基準測試）
+# 編譯所有模組並執行 8 道驗證閘門（Gate 0 FLOWY 跨層稽核 + Gate 1..6 共 55 項單元測試 + Gate 7 4K Metal 基準測試）
 make test
 
 # 僅編譯核心二進位執行檔（build/bloom）
 make
 
-# 查詢引擎版本（BLOOM v1.1.0）
+# 查詢引擎版本
 ./build/bloom --version
 
 # 執行 Gate 0 FLOWY 形式化與硬體稽核（64B 矩陣、LLVM IR、Metal AIR、Lean 4 定理證明驗證）
@@ -102,7 +102,7 @@ make clean
 # 8. 啟動無頭伺服器模擬（6,000 ticks @ 60Hz，0 GPU / 0 MB VRAM，10 萬實體調度）
 ./build/bloom --headless
 
-# 9. 啟動 macOS 桌面背景動態桌布或匯出 5KB WebGL2 網頁桌布
+# 9. 啟動 macOS 桌面背景動態桌布或匯出 5KB WebGL 網頁桌布
 ./build/bloom --wallpaper --wallpaper-audio
 ./build/bloom --wallpaper-export build/flow_wallpaper_web.html
 ```
@@ -116,7 +116,7 @@ make clean
 ```bash
 ./build/test-bloom              # Gate 1：連續碰撞防穿隧、相對論度規、UDP 快照、QSBR 與調速器 (10 項測試)
 ./build/test-prefab-ssot        # Gate 2：64B CSG/SDF 預製件、材質參數與參考圖轉 Prefab (9 項測試)
-./build/test-procedural-assets  # Gate 3：程序化幾何、SVG HUD、物件互動屬性與視覺回饋狀態機 (7 項測試)
+./build/test-procedural-assets  # Gate 3：程序化幾何、對偶四元數骨骼蒙皮、BVH、SDF 體素磚、雙軌色域串流、SVG HUD (9 項測試)
 ./build/test-cine-camera        # Gate 4：FlowCineRig64 攝影機、薄透鏡景深、24fps EDL 與 48kHz 鎖幀 (7 項測試)
 ./build/test-wallpaper-engine   # Gate 5：動態桌布雙門檻遲滯休眠、低電量調速與 Web 匯出 (5 項測試)
 ./build/test-svg-ui             # Gate 6：宣告式 64B SVG-UI、Flexbox 排版、通用暫存器、文字輸入、LaTeX SDF 與過場控制 (15 項測試)
