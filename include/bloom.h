@@ -18,6 +18,7 @@
 #include "flow_gpu_abi.h"
 #include "flow_wallpaper.h"
 #include "flow_svg_ui.h"
+#include "flow_image64.h"
 #include "flow_shader_portability.h"
 
 #endif /* BLOOM_H */
