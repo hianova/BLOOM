@@ -83,6 +83,32 @@ FLOW_GPU_INLINE float eval_sdd_glyph(constant FlowGpuGlyphDesc64 &g, float2 p_no
     return d;
 }
 
+FLOW_GPU_INLINE float3 transform_point_dq64(constant FlowGpuJointDq64 &j, float3 p) {
+    float4 qr = float4(float(j.q_real_q16[0]), float(j.q_real_q16[1]), float(j.q_real_q16[2]), float(j.q_real_q16[3])) * (1.0f / 65536.0f);
+    float4 qd = float4(float(j.q_dual_q16[0]), float(j.q_dual_q16[1]), float(j.q_dual_q16[2]), float(j.q_dual_q16[3])) * (1.0f / 65536.0f);
+    float3 u = qr.yzw;
+    float3 t = 2.0f * (-qd.x * u + qr.x * qd.yzw - cross(qd.yzw, u));
+    float3 p_rot = p + 2.0f * cross(u, cross(u, p) + qr.x * p);
+    return p_rot + t;
+}
+
+FLOW_GPU_INLINE float eval_bvh_node_aabb64(constant FlowGpuBvhNode64 &n, float3 p) {
+    float3 bmin = float3(float(n.aabb_min_q16[0]), float(n.aabb_min_q16[1]), float(n.aabb_min_q16[2])) * (1.0f / 65536.0f);
+    float3 bmax = float3(float(n.aabb_max_q16[0]), float(n.aabb_max_q16[1]), float(n.aabb_max_q16[2])) * (1.0f / 65536.0f);
+    float3 d = max(max(bmin - p, p - bmax), float3(0.0f));
+    return max(d.x, max(d.y, d.z));
+}
+
+FLOW_GPU_INLINE float sample_sdf_brick64(constant FlowGpuSdfBrick64 &b, float3 p) {
+    float3 orig = float3(float(b.origin_q16[0]), float(b.origin_q16[1]), float(b.origin_q16[2])) * (1.0f / 65536.0f);
+    float step = max(float(b.voxel_step_q16) * (1.0f / 65536.0f), 1e-4f);
+    float3 uvw = clamp((p - orig) / step, 0.0f, 3.0f);
+    uint3 idx = min(uint3(uvw), uint3(2U));
+    uint shift = (idx.y * 4U + idx.x) * 4U;
+    int nibble = int((b.sdf_z_planes[idx.z] >> shift) & 0xFULL) - 8;
+    return float(nibble) * (step * 0.25f);
+}
+
 struct MicroSceneCtx {
     float2 rot_cs;
     float3 drop1;

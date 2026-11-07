@@ -779,3 +779,510 @@ int64_t flow_asset_eval_csg_program_q16(const FlowGpuCsgOp64 *ops,
     }
     return acc;
 }
+
+/* ============================================================================
+ * 6. 64-Byte Dual-Quaternion Q16 Skeletal Skinning & Capsule Rig
+ * ============================================================================ */
+
+void flow_joint_dq64_make(FlowGpuJointDq64 *out_joint,
+                          uint32_t joint_id,
+                          uint32_t parent_id,
+                          const int32_t q_real_q16[4],
+                          const int32_t trans_q16[3],
+                          int32_t bone_len_q16,
+                          int32_t bone_radius_q16,
+                          int32_t smooth_k_q16,
+                          uint32_t material_id) {
+    if (!out_joint) {
+        return;
+    }
+    memset(out_joint, 0, sizeof(*out_joint));
+    out_joint->joint_id        = joint_id;
+    out_joint->parent_id       = parent_id;
+    out_joint->bone_len_q16    = (bone_len_q16 > 0) ? bone_len_q16 : 65536;
+    out_joint->bone_radius_q16 = (bone_radius_q16 > 0) ? bone_radius_q16 : 8192;
+    out_joint->smooth_k_q16    = (smooth_k_q16 > 0) ? smooth_k_q16 : 4096;
+    out_joint->material_id     = material_id;
+
+    int64_t rw = q_real_q16 ? (int64_t)q_real_q16[0] : 65536LL;
+    int64_t rx = q_real_q16 ? (int64_t)q_real_q16[1] : 0LL;
+    int64_t ry = q_real_q16 ? (int64_t)q_real_q16[2] : 0LL;
+    int64_t rz = q_real_q16 ? (int64_t)q_real_q16[3] : 0LL;
+
+    flow_asset_u128 sq = (flow_asset_u128)((flow_asset_i128)rw * rw +
+                                           (flow_asset_i128)rx * rx +
+                                           (flow_asset_i128)ry * ry +
+                                           (flow_asset_i128)rz * rz);
+    int64_t norm = (int64_t)flow_asm_isqrt_u128(sq);
+    if (norm <= 0LL) {
+        rw = 65536LL;
+        rx = ry = rz = 0LL;
+    } else {
+        rw = (rw * 65536LL) / norm;
+        rx = (rx * 65536LL) / norm;
+        ry = (ry * 65536LL) / norm;
+        rz = (rz * 65536LL) / norm;
+    }
+    out_joint->q_real_q16[0] = (int32_t)rw;
+    out_joint->q_real_q16[1] = (int32_t)rx;
+    out_joint->q_real_q16[2] = (int32_t)ry;
+    out_joint->q_real_q16[3] = (int32_t)rz;
+
+    int64_t tx = trans_q16 ? (int64_t)trans_q16[0] : 0LL;
+    int64_t ty = trans_q16 ? (int64_t)trans_q16[1] : 0LL;
+    int64_t tz = trans_q16 ? (int64_t)trans_q16[2] : 0LL;
+
+    /* Dual quaternion q_d = 0.5 * (0, tx, ty, tz) * (rw, rx, ry, rz) in Q16.16 */
+    out_joint->q_dual_q16[0] = (int32_t)((-tx * rx - ty * ry - tz * rz) / 131072LL);
+    out_joint->q_dual_q16[1] = (int32_t)(( tx * rw + ty * rz - tz * ry) / 131072LL);
+    out_joint->q_dual_q16[2] = (int32_t)((-tx * rz + ty * rw + tz * rx) / 131072LL);
+    out_joint->q_dual_q16[3] = (int32_t)(( tx * ry - ty * rx + tz * rw) / 131072LL);
+    out_joint->joint_mac     = flow_capsule64_calc_mac(out_joint, 0x4A4F494E54445136ULL);
+}
+
+void flow_joint_dq64_blend(const FlowGpuJointDq64 *joint_a,
+                           const FlowGpuJointDq64 *joint_b,
+                           int32_t weight_a_q16,
+                           FlowGpuJointDq64 *out_blended) {
+    if (!joint_a || !joint_b || !out_blended) {
+        return;
+    }
+    *out_blended = *joint_a;
+    int64_t wa = flow_lean_abi_eval_clamp((int64_t)weight_a_q16, 0LL, 65536LL);
+    int64_t wb = 65536LL - wa;
+
+    /* Shortest-arc hemisphere alignment on S^3 */
+    int64_t dot = 0LL;
+    for (size_t k = 0U; k < 4U; ++k) {
+        dot += (int64_t)joint_a->q_real_q16[k] * (int64_t)joint_b->q_real_q16[k];
+    }
+    int64_t sign_b = (dot < 0LL) ? -1LL : 1LL;
+
+    int64_t raw_r[4];
+    int64_t raw_d[4];
+    flow_asset_u128 sq = 0U;
+    for (size_t k = 0U; k < 4U; ++k) {
+        raw_r[k] = ((int64_t)joint_a->q_real_q16[k] * wa +
+                    sign_b * (int64_t)joint_b->q_real_q16[k] * wb) / 65536LL;
+        raw_d[k] = ((int64_t)joint_a->q_dual_q16[k] * wa +
+                    sign_b * (int64_t)joint_b->q_dual_q16[k] * wb) / 65536LL;
+        sq += (flow_asset_u128)((flow_asset_i128)raw_r[k] * (flow_asset_i128)raw_r[k]);
+    }
+    int64_t norm = (int64_t)flow_asm_isqrt_u128(sq);
+    if (norm <= 0LL) {
+        norm = 65536LL;
+        raw_r[0] = 65536LL;
+        raw_r[1] = raw_r[2] = raw_r[3] = 0LL;
+    }
+    for (size_t k = 0U; k < 4U; ++k) {
+        out_blended->q_real_q16[k] = (int32_t)((raw_r[k] * 65536LL) / norm);
+        out_blended->q_dual_q16[k] = (int32_t)((raw_d[k] * 65536LL) / norm);
+    }
+    out_blended->bone_len_q16    = (int32_t)(((int64_t)joint_a->bone_len_q16 * wa +
+                                              (int64_t)joint_b->bone_len_q16 * wb) / 65536LL);
+    out_blended->bone_radius_q16 = (int32_t)(((int64_t)joint_a->bone_radius_q16 * wa +
+                                              (int64_t)joint_b->bone_radius_q16 * wb) / 65536LL);
+    out_blended->joint_mac       = flow_capsule64_calc_mac(out_blended, 0x4A4F494E54445136ULL);
+}
+
+void flow_joint_dq64_transform_point_q16(const FlowGpuJointDq64 *joint,
+                                         const int32_t in_pt_q16[3],
+                                         int32_t out_pt_q16[3]) {
+    if (!in_pt_q16 || !out_pt_q16) {
+        return;
+    }
+    if (!joint) {
+        out_pt_q16[0] = in_pt_q16[0];
+        out_pt_q16[1] = in_pt_q16[1];
+        out_pt_q16[2] = in_pt_q16[2];
+        return;
+    }
+    int64_t rw = (int64_t)joint->q_real_q16[0];
+    int64_t rx = (int64_t)joint->q_real_q16[1];
+    int64_t ry = (int64_t)joint->q_real_q16[2];
+    int64_t rz = (int64_t)joint->q_real_q16[3];
+
+    int64_t dw = (int64_t)joint->q_dual_q16[0];
+    int64_t dx = (int64_t)joint->q_dual_q16[1];
+    int64_t dy = (int64_t)joint->q_dual_q16[2];
+    int64_t dz = (int64_t)joint->q_dual_q16[3];
+
+    /* Reconstruct translation t = 2 * q_dual * conj(q_real) in Q16.16 */
+    int64_t tx = ((-dw * rx + dx * rw - dy * rz + dz * ry) * 2LL) / 65536LL;
+    int64_t ty = ((-dw * ry + dx * rz + dy * rw - dz * rx) * 2LL) / 65536LL;
+    int64_t tz = ((-dw * rz - dx * ry + dy * rx + dz * rw) * 2LL) / 65536LL;
+
+    int64_t px = (int64_t)in_pt_q16[0];
+    int64_t py = (int64_t)in_pt_q16[1];
+    int64_t pz = (int64_t)in_pt_q16[2];
+
+    /* Rotate p by unit quaternion q_real: p_rot = p + 2 * u x (u x p + rw * p) */
+    int64_t cx = (ry * pz - rz * py) / 65536LL;
+    int64_t cy = (rz * px - rx * pz) / 65536LL;
+    int64_t cz = (rx * py - ry * px) / 65536LL;
+
+    int64_t wx = cx + (rw * px) / 65536LL;
+    int64_t wy = cy + (rw * py) / 65536LL;
+    int64_t wz = cz + (rw * pz) / 65536LL;
+
+    int64_t rpx = px + ((ry * wz - rz * wy) * 2LL) / 65536LL;
+    int64_t rpy = py + ((rz * wx - rx * wz) * 2LL) / 65536LL;
+    int64_t rpz = pz + ((rx * wy - ry * wx) * 2LL) / 65536LL;
+
+    out_pt_q16[0] = (int32_t)(rpx + tx);
+    out_pt_q16[1] = (int32_t)(rpy + ty);
+    out_pt_q16[2] = (int32_t)(rpz + tz);
+}
+
+static int64_t eval_capsule_seg_q16(int64_t px, int64_t py, int64_t pz,
+                                    const int32_t a[3], const int32_t b[3],
+                                    int32_t radius_q16) {
+    int64_t pax = px - (int64_t)a[0];
+    int64_t pay = py - (int64_t)a[1];
+    int64_t paz = pz - (int64_t)a[2];
+    int64_t bax = (int64_t)b[0] - (int64_t)a[0];
+    int64_t bay = (int64_t)b[1] - (int64_t)a[1];
+    int64_t baz = (int64_t)b[2] - (int64_t)a[2];
+
+    flow_asset_i128 dot_pa_ba = (flow_asset_i128)pax * bax +
+                                (flow_asset_i128)pay * bay +
+                                (flow_asset_i128)paz * baz;
+    flow_asset_i128 dot_ba_ba = (flow_asset_i128)bax * bax +
+                                (flow_asset_i128)bay * bay +
+                                (flow_asset_i128)baz * baz;
+    int64_t h_q16 = 0LL;
+    if (dot_ba_ba > 0) {
+        flow_asset_i128 raw_h = (dot_pa_ba * (flow_asset_i128)65536LL) / dot_ba_ba;
+        if (raw_h < 0) {
+            h_q16 = 0LL;
+        } else if (raw_h > 65536) {
+            h_q16 = 65536LL;
+        } else {
+            h_q16 = (int64_t)raw_h;
+        }
+    }
+    int64_t dx = pax - (bax * h_q16) / 65536LL;
+    int64_t dy = pay - (bay * h_q16) / 65536LL;
+    int64_t dz = paz - (baz * h_q16) / 65536LL;
+    flow_asset_u128 sq = (flow_asset_u128)((flow_asset_i128)dx * dx +
+                                           (flow_asset_i128)dy * dy +
+                                           (flow_asset_i128)dz * dz);
+    int64_t dist = (int64_t)flow_asm_isqrt_u128(sq);
+    return dist - (int64_t)radius_q16;
+}
+
+int64_t flow_skeleton_eval_sdf_q16(const FlowGpuJointDq64 *joints,
+                                   size_t joint_count,
+                                   int64_t px_q16,
+                                   int64_t py_q16,
+                                   int64_t pz_q16) {
+    if (!joints || joint_count == 0U) {
+        return 65536000LL;
+    }
+    int64_t acc = 65536000LL;
+    for (size_t i = 0U; i < joint_count; ++i) {
+        int32_t local_zero[3] = { 0, 0, 0 };
+        int32_t local_tip[3]  = { 0, joints[i].bone_len_q16, 0 };
+        int32_t world_a[3], world_b[3];
+        flow_joint_dq64_transform_point_q16(&joints[i], local_zero, world_a);
+        flow_joint_dq64_transform_point_q16(&joints[i], local_tip,  world_b);
+
+        int64_t d = eval_capsule_seg_q16(
+            px_q16, py_q16, pz_q16, world_a, world_b, joints[i].bone_radius_q16
+        );
+        if (i == 0U) {
+            acc = d;
+        } else {
+            int64_t k = (joints[i].smooth_k_q16 > 0) ? (int64_t)joints[i].smooth_k_q16 : 0LL;
+            if (k > 0LL) {
+                int64_t diff = (acc > d) ? (acc - d) : (d - acc);
+                int64_t h = (k > diff) ? (k - diff) : 0LL;
+                int64_t min_d = (acc < d) ? acc : d;
+                acc = min_d - ((h * h) / (4LL * k));
+            } else {
+                acc = (acc < d) ? acc : d;
+            }
+        }
+    }
+    return acc;
+}
+
+/* ============================================================================
+ * 7. 64-Byte Pointer-Free Linear BVH Spatial Acceleration Tree
+ * ============================================================================ */
+
+static uint64_t expand_bits_10_to_30(uint32_t v) {
+    uint64_t x = (uint64_t)(v & 0x3FFU);
+    x = (x | (x << 16U)) & 0x030000FFULL;
+    x = (x | (x <<  8U)) & 0x0300F00FULL;
+    x = (x | (x <<  4U)) & 0x030C30C3ULL;
+    x = (x | (x <<  2U)) & 0x09249249ULL;
+    return x;
+}
+
+uint64_t flow_bvh_morton3d_q16(int32_t x_q16, int32_t y_q16, int32_t z_q16) {
+    /* Normalize Q16 coordinates in [-512.0, +512.0] to 10-bit [0..1023] per axis */
+    int64_t nx = ((int64_t)x_q16 >> 16U) + 512LL;
+    int64_t ny = ((int64_t)y_q16 >> 16U) + 512LL;
+    int64_t nz = ((int64_t)z_q16 >> 16U) + 512LL;
+    uint32_t ux = (uint32_t)flow_lean_abi_eval_clamp(nx, 0LL, 1023LL);
+    uint32_t uy = (uint32_t)flow_lean_abi_eval_clamp(ny, 0LL, 1023LL);
+    uint32_t uz = (uint32_t)flow_lean_abi_eval_clamp(nz, 0LL, 1023LL);
+    return (expand_bits_10_to_30(ux) << 0U) |
+           (expand_bits_10_to_30(uy) << 1U) |
+           (expand_bits_10_to_30(uz) << 2U);
+}
+
+static uint32_t build_bvh_recursive(const FlowGpuCsgOp64 *ops,
+                                    uint32_t first_prim,
+                                    uint32_t prim_count,
+                                    FlowGpuBvhNode64 *out_nodes,
+                                    uint32_t *inout_used,
+                                    uint32_t max_nodes) {
+    if (*inout_used >= max_nodes || prim_count == 0U) {
+        return 0U;
+    }
+    uint32_t idx = (*inout_used)++;
+    FlowGpuBvhNode64 *node = &out_nodes[idx];
+    memset(node, 0, sizeof(*node));
+    node->node_id = idx;
+
+    if (prim_count == 1U || (*inout_used + 2U > max_nodes)) {
+        node->is_leaf        = 1U;
+        node->left_or_first  = first_prim;
+        node->right_or_count = prim_count;
+        for (size_t d = 0U; d < 3U; ++d) {
+            int32_t pad = (ops[first_prim].bevel_r_q16 > 0) ? ops[first_prim].bevel_r_q16 : 0;
+            node->aabb_min_q16[d] = ops[first_prim].pos_q16[d] - ops[first_prim].extents_q16[d] - pad;
+            node->aabb_max_q16[d] = ops[first_prim].pos_q16[d] + ops[first_prim].extents_q16[d] + pad;
+            for (uint32_t k = 1U; k < prim_count; ++k) {
+                const FlowGpuCsgOp64 *op = &ops[first_prim + k];
+                int32_t p_pad = (op->bevel_r_q16 > 0) ? op->bevel_r_q16 : 0;
+                int32_t lo = op->pos_q16[d] - op->extents_q16[d] - p_pad;
+                int32_t hi = op->pos_q16[d] + op->extents_q16[d] + p_pad;
+                if (lo < node->aabb_min_q16[d]) node->aabb_min_q16[d] = lo;
+                if (hi > node->aabb_max_q16[d]) node->aabb_max_q16[d] = hi;
+            }
+        }
+        node->morton_key64 = flow_bvh_morton3d_q16(
+            ops[first_prim].pos_q16[0], ops[first_prim].pos_q16[1], ops[first_prim].pos_q16[2]
+        );
+        node->active_stage_mask = ops[first_prim].active_stage_mask;
+        node->bvh_mac = flow_capsule64_calc_mac(node, 0x4256484E4F444536ULL);
+        return idx;
+    }
+
+    uint32_t half = prim_count / 2U;
+    uint32_t left_idx  = build_bvh_recursive(ops, first_prim, half, out_nodes, inout_used, max_nodes);
+    uint32_t right_idx = build_bvh_recursive(ops, first_prim + half, prim_count - half, out_nodes, inout_used, max_nodes);
+
+    node->is_leaf        = 0U;
+    node->left_or_first  = left_idx;
+    node->right_or_count = right_idx;
+    for (size_t d = 0U; d < 3U; ++d) {
+        int32_t l_min = out_nodes[left_idx].aabb_min_q16[d];
+        int32_t r_min = out_nodes[right_idx].aabb_min_q16[d];
+        int32_t l_max = out_nodes[left_idx].aabb_max_q16[d];
+        int32_t r_max = out_nodes[right_idx].aabb_max_q16[d];
+        node->aabb_min_q16[d] = (l_min <= r_min) ? l_min : r_min;
+        node->aabb_max_q16[d] = (l_max >= r_max) ? l_max : r_max;
+    }
+    int32_t cx = (int32_t)(((int64_t)node->aabb_min_q16[0] + (int64_t)node->aabb_max_q16[0]) / 2LL);
+    int32_t cy = (int32_t)(((int64_t)node->aabb_min_q16[1] + (int64_t)node->aabb_max_q16[1]) / 2LL);
+    int32_t cz = (int32_t)(((int64_t)node->aabb_min_q16[2] + (int64_t)node->aabb_max_q16[2]) / 2LL);
+    node->morton_key64      = flow_bvh_morton3d_q16(cx, cy, cz);
+    node->active_stage_mask = out_nodes[left_idx].active_stage_mask | out_nodes[right_idx].active_stage_mask;
+    node->bvh_mac           = flow_capsule64_calc_mac(node, 0x4256484E4F444536ULL);
+    return idx;
+}
+
+size_t flow_bvh_build_from_csg64(const FlowGpuCsgOp64 *ops,
+                                 size_t op_count,
+                                 FlowGpuBvhNode64 *out_nodes,
+                                 size_t max_nodes) {
+    if (!ops || op_count == 0U || !out_nodes || max_nodes == 0U) {
+        return 0U;
+    }
+    uint32_t used = 0U;
+    (void)build_bvh_recursive(ops, 0U, (uint32_t)op_count, out_nodes, &used, (uint32_t)max_nodes);
+    return (size_t)used;
+}
+
+static int64_t bvh_node_lower_bound_q16(const FlowGpuBvhNode64 *node,
+                                        int64_t px_q16,
+                                        int64_t py_q16,
+                                        int64_t pz_q16) {
+    int64_t dx = 0LL, dy = 0LL, dz = 0LL;
+    if (px_q16 < (int64_t)node->aabb_min_q16[0]) dx = (int64_t)node->aabb_min_q16[0] - px_q16;
+    else if (px_q16 > (int64_t)node->aabb_max_q16[0]) dx = px_q16 - (int64_t)node->aabb_max_q16[0];
+
+    if (py_q16 < (int64_t)node->aabb_min_q16[1]) dy = (int64_t)node->aabb_min_q16[1] - py_q16;
+    else if (py_q16 > (int64_t)node->aabb_max_q16[1]) dy = py_q16 - (int64_t)node->aabb_max_q16[1];
+
+    if (pz_q16 < (int64_t)node->aabb_min_q16[2]) dz = (int64_t)node->aabb_min_q16[2] - pz_q16;
+    else if (pz_q16 > (int64_t)node->aabb_max_q16[2]) dz = pz_q16 - (int64_t)node->aabb_max_q16[2];
+
+    /* Max-norm lower bound <= Euclidean/Manhattan distance outside AABB */
+    int64_t m = dx;
+    if (dy > m) m = dy;
+    if (dz > m) m = dz;
+    return m;
+}
+
+int64_t flow_bvh_eval_csg_q16(const FlowGpuBvhNode64 *nodes,
+                              size_t node_count,
+                              const FlowGpuCsgOp64 *ops,
+                              size_t op_count,
+                              int64_t px_q16,
+                              int64_t py_q16,
+                              int64_t pz_q16,
+                              uint32_t *out_visited_leaves) {
+    if (out_visited_leaves) {
+        *out_visited_leaves = 0U;
+    }
+    if (!nodes || node_count == 0U || !ops || op_count == 0U) {
+        return 65536000LL;
+    }
+    int64_t best_d = 65536000LL;
+    uint32_t stack[64];
+    uint32_t sp = 0U;
+    stack[sp++] = 0U;
+    uint32_t visited = 0U;
+
+    while (sp > 0U) {
+        uint32_t idx = stack[--sp];
+        if (idx >= (uint32_t)node_count) {
+            continue;
+        }
+        const FlowGpuBvhNode64 *node = &nodes[idx];
+        int64_t lb = bvh_node_lower_bound_q16(node, px_q16, py_q16, pz_q16);
+        if (lb > best_d && best_d < 65536000LL) {
+            continue; /* O(log N) branch pruning! */
+        }
+        if (node->is_leaf != 0U) {
+            visited++;
+            uint32_t first = node->left_or_first;
+            uint32_t count = node->right_or_count;
+            for (uint32_t k = 0U; k < count && (first + k) < (uint32_t)op_count; ++k) {
+                int64_t d = eval_single_csg_prim_q16(&ops[first + k], px_q16, py_q16, pz_q16);
+                if (d < best_d) {
+                    best_d = d;
+                }
+            }
+        } else {
+            uint32_t l_idx = node->left_or_first;
+            uint32_t r_idx = node->right_or_count;
+            int64_t lb_l = (l_idx < (uint32_t)node_count)
+                               ? bvh_node_lower_bound_q16(&nodes[l_idx], px_q16, py_q16, pz_q16)
+                               : 65536000LL;
+            int64_t lb_r = (r_idx < (uint32_t)node_count)
+                               ? bvh_node_lower_bound_q16(&nodes[r_idx], px_q16, py_q16, pz_q16)
+                               : 65536000LL;
+            /* Push farther child first so nearer child is popped & narrows best_d first */
+            if (lb_l <= lb_r) {
+                if (sp < 64U) stack[sp++] = r_idx;
+                if (sp < 64U) stack[sp++] = l_idx;
+            } else {
+                if (sp < 64U) stack[sp++] = l_idx;
+                if (sp < 64U) stack[sp++] = r_idx;
+            }
+        }
+    }
+    if (out_visited_leaves) {
+        *out_visited_leaves = visited;
+    }
+    return best_d;
+}
+
+/* ============================================================================
+ * 8. 64-Byte Sparse 4x4x4 High-Frequency SDF Voxel Brick
+ * ============================================================================ */
+
+void flow_sdf_brick64_pack(FlowGpuSdfBrick64 *out_brick,
+                           uint32_t brick_id,
+                           uint32_t material_id,
+                           const int32_t origin_q16[3],
+                           int32_t voxel_step_q16,
+                           const int8_t sdf_offsets_i8[64]) {
+    if (!out_brick) {
+        return;
+    }
+    memset(out_brick, 0, sizeof(*out_brick));
+    out_brick->brick_id       = brick_id;
+    out_brick->material_id    = material_id;
+    out_brick->origin_q16[0]  = origin_q16 ? origin_q16[0] : 0;
+    out_brick->origin_q16[1]  = origin_q16 ? origin_q16[1] : 0;
+    out_brick->origin_q16[2]  = origin_q16 ? origin_q16[2] : 0;
+    out_brick->voxel_step_q16 = (voxel_step_q16 > 0) ? voxel_step_q16 : 16384;
+
+    for (uint32_t z = 0U; z < 4U; ++z) {
+        uint64_t plane = 0ULL;
+        for (uint32_t y = 0U; y < 4U; ++y) {
+            for (uint32_t x = 0U; x < 4U; ++x) {
+                int64_t raw = sdf_offsets_i8 ? (int64_t)sdf_offsets_i8[z * 16U + y * 4U + x] : 0LL;
+                int64_t clamped = flow_lean_abi_eval_clamp(raw, -8LL, 7LL);
+                uint64_t nibble = (uint64_t)(clamped + 8LL) & 0xFULL;
+                uint32_t shift  = (y * 4U + x) * 4U;
+                plane |= (nibble << shift);
+            }
+        }
+        out_brick->sdf_z_planes[z] = plane;
+    }
+    out_brick->brick_mac = flow_capsule64_calc_mac(out_brick, 0x534446425249434BULL);
+}
+
+static int64_t sample_brick_voxel_q16(const FlowGpuSdfBrick64 *brick,
+                                      uint32_t x, uint32_t y, uint32_t z) {
+    uint32_t shift = (y * 4U + x) * 4U;
+    int64_t nibble = (int64_t)((brick->sdf_z_planes[z] >> shift) & 0xFULL) - 8LL;
+    /* Scale [-8, +7] by (voxel_step_q16 / 4) so 1 nibble = 1/4 voxel step */
+    return (nibble * (int64_t)brick->voxel_step_q16) / 4LL;
+}
+
+int64_t flow_sdf_brick64_sample_trilinear_q16(const FlowGpuSdfBrick64 *brick,
+                                              int64_t px_q16,
+                                              int64_t py_q16,
+                                              int64_t pz_q16) {
+    if (!brick || brick->voxel_step_q16 <= 0) {
+        return 65536000LL;
+    }
+    int64_t step = (int64_t)brick->voxel_step_q16;
+    int64_t u_q16 = ((px_q16 - (int64_t)brick->origin_q16[0]) * 65536LL) / step;
+    int64_t v_q16 = ((py_q16 - (int64_t)brick->origin_q16[1]) * 65536LL) / step;
+    int64_t w_q16 = ((pz_q16 - (int64_t)brick->origin_q16[2]) * 65536LL) / step;
+
+    int64_t max_grid = 3LL * 65536LL;
+    int64_t cu = flow_lean_abi_eval_clamp(u_q16, 0LL, max_grid);
+    int64_t cv = flow_lean_abi_eval_clamp(v_q16, 0LL, max_grid);
+    int64_t cw = flow_lean_abi_eval_clamp(w_q16, 0LL, max_grid);
+
+    uint32_t ix = (uint32_t)(cu >> 16U);
+    uint32_t iy = (uint32_t)(cv >> 16U);
+    uint32_t iz = (uint32_t)(cw >> 16U);
+    if (ix > 2U) ix = 2U;
+    if (iy > 2U) iy = 2U;
+    if (iz > 2U) iz = 2U;
+
+    int64_t fx = cu - ((int64_t)ix << 16U);
+    int64_t fy = cv - ((int64_t)iy << 16U);
+    int64_t fz = cw - ((int64_t)iz << 16U);
+
+    int64_t c000 = sample_brick_voxel_q16(brick, ix,     iy,     iz);
+    int64_t c100 = sample_brick_voxel_q16(brick, ix + 1, iy,     iz);
+    int64_t c010 = sample_brick_voxel_q16(brick, ix,     iy + 1, iz);
+    int64_t c110 = sample_brick_voxel_q16(brick, ix + 1, iy + 1, iz);
+    int64_t c001 = sample_brick_voxel_q16(brick, ix,     iy,     iz + 1);
+    int64_t c101 = sample_brick_voxel_q16(brick, ix + 1, iy,     iz + 1);
+    int64_t c011 = sample_brick_voxel_q16(brick, ix,     iy + 1, iz + 1);
+    int64_t c111 = sample_brick_voxel_q16(brick, ix + 1, iy + 1, iz + 1);
+
+    int64_t c00 = (c000 * (65536LL - fx) + c100 * fx) / 65536LL;
+    int64_t c10 = (c010 * (65536LL - fx) + c110 * fx) / 65536LL;
+    int64_t c01 = (c001 * (65536LL - fx) + c101 * fx) / 65536LL;
+    int64_t c11 = (c011 * (65536LL - fx) + c111 * fx) / 65536LL;
+
+    int64_t c0 = (c00 * (65536LL - fy) + c10 * fy) / 65536LL;
+    int64_t c1 = (c01 * (65536LL - fy) + c11 * fy) / 65536LL;
+
+    return (c0 * (65536LL - fz) + c1 * fz) / 65536LL;
+}

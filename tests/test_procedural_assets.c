@@ -790,8 +790,78 @@ int main(void) {
     assert(d_carved_csg > 0 && d_shell_csg < 0 && csg_prog[0].csg_op_mac != 0ULL);
     printf("  ✓ Verified WAV PCM Mixer, GLB 2.0 Mesh Decoder, W3C SVG <path> & 64B GPU CSG Stream Evaluator!\n");
 
+    /* 15. 64B Dual-Quaternion Q16 Skinning, Pointer-Free Linear BVH & Sparse 4x4x4 SDF Brick */
+    printf("[Test 15/15] 64B Dual-Quaternion Q16 Skinning, Linear BVH Tree & Sparse 4x4x4 SDF Brick...\n");
+    assert(sizeof(FlowGpuJointDq64) == 64U && _Alignof(FlowGpuJointDq64) == 64U);
+    assert(sizeof(FlowGpuBvhNode64) == 64U && _Alignof(FlowGpuBvhNode64) == 64U);
+    assert(sizeof(FlowGpuSdfBrick64) == 64U && _Alignof(FlowGpuSdfBrick64) == 64U);
+
+    /* 15a. Dual-Quaternion Q16 Rigid Transform & Volume-Preserving Blend */
+    FlowGpuJointDq64 joint_root, joint_elbow, joint_blended;
+    int32_t q_ident[4] = { 65536, 0, 0, 0 };
+    int32_t t_root[3]  = { 0, 65536, 0 };    /* (0, +1.0, 0) */
+    int32_t t_elbow[3] = { 0, 196608, 0 };   /* (0, +3.0, 0) */
+    flow_joint_dq64_make(&joint_root,  0U, 0xFFFFFFFFU, q_ident, t_root,  131072, 16384, 8192, 1U);
+    flow_joint_dq64_make(&joint_elbow, 1U, 0U,          q_ident, t_elbow, 131072, 16384, 8192, 1U);
+    flow_joint_dq64_blend(&joint_root, &joint_elbow, 32768, &joint_blended); /* 50/50 blend */
+
+    int32_t p_local[3] = { 0, 0, 0 };
+    int32_t p_world[3] = { 0, 0, 0 };
+    flow_joint_dq64_transform_point_q16(&joint_blended, p_local, p_world);
+    assert(p_world[1] >= 131070 && p_world[1] <= 131074); /* Midpoint y = +2.0 (131072 Q16) */
+    assert(joint_blended.q_real_q16[0] == 65536);         /* Unit norm preserved (0 volume collapse)! */
+
+    FlowGpuJointDq64 skel[2] = { joint_root, joint_elbow };
+    int64_t d_bone_in  = flow_skeleton_eval_sdf_q16(skel, 2U, 0, 131072, 0);
+    int64_t d_bone_out = flow_skeleton_eval_sdf_q16(skel, 2U, 327680, 131072, 0);
+    assert(d_bone_in < 0 && d_bone_out > 0);
+
+    /* 15b. 64-Byte Pointer-Free Linear BVH Tree & O(log N) Branch Culling */
+    FlowGpuCsgOp64 scene_ops[8];
+    for (uint32_t i = 0U; i < 8U; ++i) {
+        FlowGlbMeshDesc64 m = glb_desc;
+        int32_t base_x = (int32_t)(i * 20U) * 65536;
+        m.aabb_min_q16[0] = base_x - 32768;
+        m.aabb_max_q16[0] = base_x + 32768;
+        m.aabb_min_q16[1] = -32768;
+        m.aabb_max_q16[1] =  32768;
+        m.aabb_min_q16[2] = -32768;
+        m.aabb_max_q16[2] =  32768;
+        flow_asset_compile_glb_to_csg_op64(&m, i + 1U, FLOW_CSG_BOOL_UNION, 0, &scene_ops[i]);
+    }
+    FlowGpuBvhNode64 bvh_nodes[16];
+    size_t bvh_count = flow_bvh_build_from_csg64(scene_ops, 8U, bvh_nodes, 16U);
+    assert(bvh_count == 15U); /* Complete binary tree over 8 leaves = 15 nodes */
+    assert(bvh_nodes[0].aabb_min_q16[0] <= scene_ops[0].pos_q16[0]);
+    assert(bvh_nodes[0].aabb_max_q16[0] >= scene_ops[7].pos_q16[0]);
+
+    uint32_t visited_leaves = 0U;
+    int64_t d_bvh  = flow_bvh_eval_csg_q16(bvh_nodes, bvh_count, scene_ops, 8U, 0, 0, 0, &visited_leaves);
+    int64_t d_flat = flow_asset_eval_csg_program_q16(scene_ops, 8U, 0, 0, 0);
+    assert(d_bvh == d_flat && d_bvh < 0);
+    assert(visited_leaves < 8U); /* Distant BVH branches pruned in O(log N)! */
+
+    /* 15c. 64-Byte Sparse 4x4x4 SDF Voxel Brick Pack & Trilinear Sample */
+    int8_t brick_vox[64];
+    for (uint32_t z = 0U; z < 4U; ++z) {
+        for (uint32_t y = 0U; y < 4U; ++y) {
+            for (uint32_t x = 0U; x < 4U; ++x) {
+                /* Signed gradient along X: x=0..1 inside (<0), x=2..3 outside (>0) */
+                brick_vox[z * 16U + y * 4U + x] = (int8_t)((int32_t)x * 4 - 6);
+            }
+        }
+    }
+    FlowGpuSdfBrick64 sdf_brick;
+    int32_t brick_orig[3] = { 0, 0, 0 };
+    flow_sdf_brick64_pack(&sdf_brick, 1U, 2U, brick_orig, 65536, brick_vox);
+    int64_t d_brick_in  = flow_sdf_brick64_sample_trilinear_q16(&sdf_brick, 16384, 65536, 65536);
+    int64_t d_brick_out = flow_sdf_brick64_sample_trilinear_q16(&sdf_brick, 163840, 65536, 65536);
+    assert(d_brick_in < 0 && d_brick_out > 0 && sdf_brick.brick_mac != 0ULL);
+    printf("  ✓ Verified 64B Dual-Quaternion Skinning, Linear BVH (%u/8 leaves visited) & Sparse 4x4x4 SDF Brick!\n",
+           visited_leaves);
+
     printf("====================================================================\n");
-    printf("✓ ALL 14 PROCEDURAL, LEAN-ABI & EXTERNAL ASSET TESTS PASSED (100%% SOUND)\n");
+    printf("✓ ALL 15 PROCEDURAL, LEAN-ABI & EXTERNAL ASSET TESTS PASSED (100%% SOUND)\n");
     printf("====================================================================\n");
     return 0;
 }

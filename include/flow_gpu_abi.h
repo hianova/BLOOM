@@ -142,6 +142,51 @@ typedef struct __attribute__((aligned(64))) {
 } FlowGpuCsgOp64;
 
 /*
+ * Shared 64-Byte Dual-Quaternion Q16 Skeletal Joint & Capsule Skinning Descriptor
+ * Volume-preserving rigid transformation q_hat = q_real + eps * q_dual in Q16.16.
+ */
+typedef struct __attribute__((aligned(64))) {
+    uint32_t joint_id;          /*  4B: Joint index (0..63) */
+    uint32_t parent_id;         /*  4B: Parent joint index (0xFFFFFFFF = root) */
+    int32_t  q_real_q16[4];     /* 16B: Unit rotation quaternion (w, x, y, z) in Q16 */
+    int32_t  q_dual_q16[4];     /* 16B: Dual translation-rotation (dw, dx, dy, dz) in Q16 */
+    int32_t  bone_len_q16;      /*  4B: Capsule bone segment length in Q16 */
+    int32_t  bone_radius_q16;   /*  4B: Capsule skin envelope radius in Q16 */
+    int32_t  smooth_k_q16;      /*  4B: Smooth-union muscle blend radius k in Q16 */
+    uint32_t material_id;       /*  4B: Bound surface finish / Art Bible style ID */
+    uint64_t joint_mac;         /*  8B: 64-bit integrity MAC */
+} FlowGpuJointDq64;
+
+/*
+ * Shared 64-Byte Pointer-Free Linear BVH Spatial Acceleration Node
+ * Enables O(log N) spatial culling over CSG/GLB/SDF primitives with 0 pointers.
+ */
+typedef struct __attribute__((aligned(64))) {
+    uint32_t node_id;           /*  4B: Linear BVH node index (0 = root) */
+    uint32_t left_or_first;     /*  4B: Left child node index (internal) or first prim index (leaf) */
+    uint32_t right_or_count;    /*  4B: Right child node index (internal) or prim count (leaf) */
+    uint32_t is_leaf;           /*  4B: 1 = leaf node, 0 = internal split node */
+    int32_t  aabb_min_q16[3];   /* 12B: Enclosing AABB minimum (x, y, z) in Q16 */
+    int32_t  aabb_max_q16[3];   /* 12B: Enclosing AABB maximum (x, y, z) in Q16 */
+    uint64_t morton_key64;      /*  8B: 64-bit 3D Morton Z-order spatial curve key */
+    uint64_t active_stage_mask; /*  8B: 64-bit active stage / visibility sieve mask */
+    uint64_t bvh_mac;           /*  8B: 64-bit integrity MAC */
+} FlowGpuBvhNode64;
+
+/*
+ * Shared 64-Byte Sparse 4x4x4 High-Frequency SDF Voxel Brick
+ * Packs 64 signed 4-bit distance nibbles (1 uint64_t per 4x4 Z-slice) + 3D anchor in 64B.
+ */
+typedef struct __attribute__((aligned(64))) {
+    uint32_t brick_id;          /*  4B: Unique sparse SDF brick ID */
+    uint32_t material_id;       /*  4B: Bound surface finish / Art Bible style ID */
+    int32_t  origin_q16[3];     /* 12B: Brick minimum corner (x, y, z) in Q16 */
+    int32_t  voxel_step_q16;    /*  4B: Voxel cell spacing in Q16 */
+    uint64_t sdf_z_planes[4];   /* 32B: 4 Z-slices x 16 nibbles (4x4x4 = 64 voxels, bias 8) */
+    uint64_t brick_mac;         /*  8B: 64-bit integrity MAC */
+} FlowGpuSdfBrick64;
+
+/*
  * Shared 64-Byte Declarative SVG-UI Frontend Node Descriptor (CPU Compiler <-> Metal Shader)
  */
 #define FLOW_SVG_PRIM_GLYPH_LINES  0U /* Vector line-segment icon (<g><line>) */
@@ -241,23 +286,31 @@ typedef struct __attribute__((aligned(64))) {
 #define FLOW_BUS_SLOT_OBS_BRIDGE      11U  /* FlowBroadcastObsBridge64 */
 #define FLOW_BUS_SLOT_STORY_DIRECTOR  12U  /* FlowNarrativeDirector64 ("劇情殺" & "過渡動畫") */
 #define FLOW_BUS_SLOT_MOODBOARD       13U  /* FlowMoodboardPrefab64 (Moodboard-to-Prefab Stage & Swatches) */
-#define FLOW_BUS_SLOT_CUSTOM_14       14U  /* Future Plugin Slot 14 */
-#define FLOW_BUS_SLOT_CUSTOM_15       15U  /* Future Plugin Slot 15 */
+#define FLOW_BUS_SLOT_BVH_ROOT        14U  /* FlowGpuBvhNode64 Root Node (64B Linear BVH Tree) */
+#define FLOW_BUS_SLOT_SKINNING_DQ     15U  /* FlowGpuJointDq64 Root Joint (64B Dual-Quaternion Rig) */
+#define FLOW_BUS_SLOT_CUSTOM_14       14U  /* Alias for Slot 14 */
+#define FLOW_BUS_SLOT_CUSTOM_15       15U  /* Alias for Slot 15 */
 
 #ifdef __METAL_VERSION__
 typedef union __attribute__((aligned(64))) {
-    FlowSvgUiNode64 svg_node;
-    uint4           u32_quads[4];
-    ulong           u64_octets[8];
-    float4          f32_quads[4];
+    FlowSvgUiNode64   svg_node;
+    FlowGpuJointDq64  joint_dq;
+    FlowGpuBvhNode64  bvh_node;
+    FlowGpuSdfBrick64 sdf_brick;
+    uint4             u32_quads[4];
+    ulong             u64_octets[8];
+    float4            f32_quads[4];
 } FlowEngineBus64;
 #else
 typedef union __attribute__((aligned(64))) {
-    uint8_t          raw_bytes[64];
-    uint32_t         raw_u32[16];
-    uint64_t         raw_u64[8];
-    RicardianStateV4 ricardian;
-    FlowSvgUiNode64  svg_node;
+    uint8_t           raw_bytes[64];
+    uint32_t          raw_u32[16];
+    uint64_t          raw_u64[8];
+    RicardianStateV4  ricardian;
+    FlowSvgUiNode64   svg_node;
+    FlowGpuJointDq64  joint_dq;
+    FlowGpuBvhNode64  bvh_node;
+    FlowGpuSdfBrick64 sdf_brick;
 } FlowEngineBus64;
 #endif
 
@@ -272,6 +325,9 @@ FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuSlice2Relativity64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuSlice3DopamineAv64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuGlyphDesc64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuCsgOp64, RicardianStateV4);
+FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuJointDq64, RicardianStateV4);
+FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuBvhNode64, RicardianStateV4);
+FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuSdfBrick64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowSvgUiNode64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowEngineBus64, RicardianStateV4);
 _Static_assert(sizeof(FlowGpuSlice0Core64) == 64U, "Slice 0 must be 64B");
@@ -280,6 +336,9 @@ _Static_assert(sizeof(FlowGpuSlice2Relativity64) == 64U, "Slice 2 must be 64B");
 _Static_assert(sizeof(FlowGpuSlice3DopamineAv64) == 64U, "Slice 3 must be 64B");
 _Static_assert(sizeof(FlowGpuGlyphDesc64) == 64U, "FlowGpuGlyphDesc64 must be 64B");
 _Static_assert(sizeof(FlowGpuCsgOp64) == 64U, "FlowGpuCsgOp64 must be 64B");
+_Static_assert(sizeof(FlowGpuJointDq64) == 64U, "FlowGpuJointDq64 must be 64B");
+_Static_assert(sizeof(FlowGpuBvhNode64) == 64U, "FlowGpuBvhNode64 must be 64B");
+_Static_assert(sizeof(FlowGpuSdfBrick64) == 64U, "FlowGpuSdfBrick64 must be 64B");
 _Static_assert(sizeof(FlowSvgUiNode64) == 64U, "FlowSvgUiNode64 must be 64B");
 _Static_assert(sizeof(FlowEngineBus64) == 64U, "FlowEngineBus64 must be 64B");
 _Static_assert(_Alignof(FlowEngineBus64) == 64U, "FlowEngineBus64 must be 64B aligned");

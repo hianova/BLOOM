@@ -173,4 +173,60 @@ int64_t flow_asset_eval_csg_program_q16(const FlowGpuCsgOp64 *ops,
                                         int64_t py_q16,
                                         int64_t pz_q16);
 
+/* 5. 64-Byte Dual-Quaternion Q16 Skeletal Skinning & Capsule Rig API */
+void flow_joint_dq64_make(FlowGpuJointDq64 *out_joint,
+                          uint32_t joint_id,
+                          uint32_t parent_id,
+                          const int32_t q_real_q16[4],
+                          const int32_t trans_q16[3],
+                          int32_t bone_len_q16,
+                          int32_t bone_radius_q16,
+                          int32_t smooth_k_q16,
+                          uint32_t material_id);
+
+void flow_joint_dq64_blend(const FlowGpuJointDq64 *joint_a,
+                           const FlowGpuJointDq64 *joint_b,
+                           int32_t weight_a_q16,
+                           FlowGpuJointDq64 *out_blended);
+
+void flow_joint_dq64_transform_point_q16(const FlowGpuJointDq64 *joint,
+                                         const int32_t in_pt_q16[3],
+                                         int32_t out_pt_q16[3]);
+
+int64_t flow_skeleton_eval_sdf_q16(const FlowGpuJointDq64 *joints,
+                                   size_t joint_count,
+                                   int64_t px_q16,
+                                   int64_t py_q16,
+                                   int64_t pz_q16);
+
+/* 6. 64-Byte Pointer-Free Linear BVH Spatial Acceleration Tree API */
+uint64_t flow_bvh_morton3d_q16(int32_t x_q16, int32_t y_q16, int32_t z_q16);
+
+size_t flow_bvh_build_from_csg64(const FlowGpuCsgOp64 *ops,
+                                 size_t op_count,
+                                 FlowGpuBvhNode64 *out_nodes,
+                                 size_t max_nodes);
+
+int64_t flow_bvh_eval_csg_q16(const FlowGpuBvhNode64 *nodes,
+                              size_t node_count,
+                              const FlowGpuCsgOp64 *ops,
+                              size_t op_count,
+                              int64_t px_q16,
+                              int64_t py_q16,
+                              int64_t pz_q16,
+                              uint32_t *out_visited_leaves);
+
+/* 7. 64-Byte Sparse 4x4x4 High-Frequency SDF Voxel Brick API */
+void flow_sdf_brick64_pack(FlowGpuSdfBrick64 *out_brick,
+                           uint32_t brick_id,
+                           uint32_t material_id,
+                           const int32_t origin_q16[3],
+                           int32_t voxel_step_q16,
+                           const int8_t sdf_offsets_i8[64]);
+
+int64_t flow_sdf_brick64_sample_trilinear_q16(const FlowGpuSdfBrick64 *brick,
+                                              int64_t px_q16,
+                                              int64_t py_q16,
+                                              int64_t pz_q16);
+
 #endif /* FLOW_ASSETS_H */

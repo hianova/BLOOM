@@ -86,4 +86,58 @@ theorem csg_union_monotone_bound (dAccum dPrim : Int) :
   unfold evalCsgUnion
   split <;> omega
 
+/-- 6. Dual-Quaternion Q16 Skinning (DQS) Weight Partition of Unity & Midpoint Blend. -/
+def calcDqsComplementWeight (w0 : Nat) : Nat :=
+  if w0 <= q16One then q16One - w0 else 0
+
+def evalDqsMidpointBlend (q0 q1 : Int) : Int :=
+  (q0 + q1) / 2
+
+theorem dqs_weights_partition_of_unity (w0 : Nat) (h : w0 <= q16One) :
+    w0 + calcDqsComplementWeight w0 = q16One := by
+  unfold calcDqsComplementWeight q16One at *
+  split <;> omega
+
+theorem dqs_midpoint_identity_pose (q : Int) :
+    evalDqsMidpointBlend q q = q := by
+  unfold evalDqsMidpointBlend
+  omega
+
+/-- 7. 64-Byte Linear BVH Parent AABB Enclosure Invariant (`O(log N)` Culling Soundness). -/
+def bvhUnionMin (minA minB : Int) : Int :=
+  if minA <= minB then minA else minB
+
+def bvhUnionMax (maxA maxB : Int) : Int :=
+  if maxA >= maxB then maxA else maxB
+
+theorem bvh_parent_aabb_encloses_children
+    (minA maxA minB maxB : Int) (hA : minA <= maxA) (hB : minB <= maxB) :
+    bvhUnionMin minA minB <= minA ∧
+    bvhUnionMin minA minB <= minB ∧
+    maxA <= bvhUnionMax maxA maxB ∧
+    maxB <= bvhUnionMax maxA maxB ∧
+    bvhUnionMin minA minB <= bvhUnionMax maxA maxB := by
+  unfold bvhUnionMin bvhUnionMax
+  split <;> split <;> omega
+
+/-- 8. Sparse 4x4x4 SDF Voxel Brick 4-Bit Nibble Quantization (`[-8, +7]`, `8 -> 0`). -/
+def sdfNibbleBias : Int := 8
+
+def decodeSdfNibble (nibble : Int) : Int :=
+  if nibble < 0 then 0 - sdfNibbleBias
+  else if nibble > 15 then 15 - sdfNibbleBias
+  else nibble - sdfNibbleBias
+
+theorem sdf_brick_nibble_bounded (nibble : Int) :
+    -8 <= decodeSdfNibble nibble ∧ decodeSdfNibble nibble <= 7 := by
+  unfold decodeSdfNibble sdfNibbleBias
+  split
+  · omega
+  · split <;> omega
+
+theorem sdf_brick_zero_isosurface_exact :
+    decodeSdfNibble 8 = 0 := by
+  unfold decodeSdfNibble sdfNibbleBias
+  rfl
+
 end Bloom.AssetPipeline

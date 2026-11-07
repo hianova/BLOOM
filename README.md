@@ -17,6 +17,10 @@ BLOOM 採用 **「算子與參數分離」** 的設計模式：將底層物理�
   - **RIFF/WAVE (`.wav`) 載入與多軌相對論都卜勒混音 (`FlowWavAssetDesc64` / `FlowAudioVoice64`)**：支援 8/16/24/32-bit PCM 與 IEEE-754 float32 音訊載入、立體聲相位平移與相對論都卜勒變速混音。
   - **glTF 2.0 Binary (`.glb`) 3D 模型解析與資料驅動 GPU CSG 指令串流 (`FlowGlbMeshDesc64` / `FlowGpuCsgOp64`)**：以純整數位移（`flow_ieee754_bits_to_q16`，0 浮點指令）解析 `.glb` 二進位頂點緩衝區，並可編譯為 64-byte 資料驅動 CSG 布林指令串流（Union / Subtract / Intersect / Smooth-Union，`flow_asset_compile_glb_to_csg_op64`、`flow_asset_eval_csg_program_q16`）。
   - **標準 W3C SVG `<path>` 圖示編譯 (`flow_asset_compile_svg_icon64`)**：支援解析標準美術匯出之 `<path d="M... L... H... V... Z"/>` 與 `viewBox` 為 64-byte GPU 向量圖示（`FlowGpuGlyphDesc64`）。
+  - **64-Byte 定點對偶四元數骨骼蒙皮 (`FlowGpuJointDq64`)、無指標線性 BVH 空間加速樹 (`FlowGpuBvhNode64`) 與稀疏 $4 \times 4 \times 4$ SDF 體素磚 (`FlowGpuSdfBrick64`)**：
+    - 以純整數 `Q16.16` 實作體積守恆之對偶四元數（Dual-Quaternion $\hat{q} = q_r + \epsilon q_d$）剛體變換、最短弧混合（`flow_joint_dq64_blend`）與多關節平滑肌肉包絡（`flow_skeleton_eval_sdf_q16`），徹底消除傳統線性矩陣蒙皮（LBS）之關節扭轉體積塌縮與浮點誤差。
+    - 支援 60-bit 3D Morton Z-Order 空間編碼（`flow_bvh_morton3d_q16`）、無指標線性陣列 BVH 建構（`flow_bvh_build_from_csg64`）與 $O(\log N)$ AABB 下界剪枝查詢（`flow_bvh_eval_csg_q16`）。
+    - 將 $4 \times 4 \times 4 = 64$ 個 4-bit 量化符號距離體素（Bias `8` 對應零等值面）連同 3D 座標原點、體素步長與 MAC 完整封裝進單一 64-byte 快取線（`flow_sdf_brick64_pack`），支援純整數三線性插值取樣（`flow_sdf_brick64_sample_trilinear_q16`）。
 - **統一 64-Byte 記憶體映射 `.flow` 容器格式 (`include/flow_image64.h`)**：
   - 將分散的設定檔（TOML）、結構化資料（JSON/CSV）與視覺/3D 預製件（PDF/SVG/GLB）統一收斂為單一 2 的冪次方 64-Byte 快取線區塊陣列（`FlowImageHeader64` + `FlowImageBlock64`，Magic `"FLOWIMG4"`）。
   - 支援 `flow_image64_mmap_readonly` 零解析（Zero-Parse / Zero-Malloc）直接記憶體映射，並透過 `flow_image64_get_block_masked`（$\mathbb{Z}/2^k\mathbb{Z}$ 位元遮罩）保證損毀偏移量下 `0` 越界 Segfault，且相容 `-ffreestanding` 裸機環境。
