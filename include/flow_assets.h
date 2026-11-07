@@ -229,4 +229,22 @@ int64_t flow_sdf_brick64_sample_trilinear_q16(const FlowGpuSdfBrick64 *brick,
                                               int64_t py_q16,
                                               int64_t pz_q16);
 
+/* 8. 64-Byte Color-Gamut & Streaming Egress API (OKLab -> Rec.709/P3/Rec.2020 & YUV420p) */
+void flow_stream_egress64_init(FlowStreamEgress64 *out_egress,
+                               uint32_t stream_id,
+                               uint32_t target_gamut,
+                               uint32_t stream_format,
+                               uint32_t target_fps);
+
+void flow_stream_egress64_map_oklab_to_rgb_q16(const FlowStreamEgress64 *egress,
+                                               int32_t l_q16,
+                                               int32_t a_q16,
+                                               int32_t b_q16,
+                                               int32_t out_rgb_q16[3]);
+
+void flow_stream_egress64_rgb_to_yuv420_bt709(const int32_t rgb_q16[3],
+                                              uint8_t *out_y,
+                                              uint8_t *out_u,
+                                              uint8_t *out_v);
+
 #endif /* FLOW_ASSETS_H */

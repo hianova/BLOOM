@@ -1286,3 +1286,139 @@ int64_t flow_sdf_brick64_sample_trilinear_q16(const FlowGpuSdfBrick64 *brick,
 
     return (c0 * (65536LL - fz) + c1 * fz) / 65536LL;
 }
+
+/* ============================================================================
+ * 9. 64-Byte Color-Gamut & Streaming Egress (OKLab -> Rec.709/P3/Rec.2020 & YUV)
+ * ============================================================================ */
+
+void flow_stream_egress64_init(FlowStreamEgress64 *out_egress,
+                               uint32_t stream_id,
+                               uint32_t target_gamut,
+                               uint32_t stream_format,
+                               uint32_t target_fps) {
+    if (!out_egress) {
+        return;
+    }
+    memset(out_egress, 0, sizeof(*out_egress));
+    out_egress->stream_id     = stream_id;
+    out_egress->target_gamut  = target_gamut;
+    out_egress->stream_format = stream_format;
+    out_egress->target_fps    = (target_fps > 0U) ? target_fps : 60U;
+
+    if (target_gamut == FLOW_GAMUT_DISPLAY_P3) {
+        /* LMS -> Display P3 (each row sums to 65536 = D65 white point preserved) */
+        out_egress->gamut_row0_q16[0] =  204976;
+        out_egress->gamut_row0_q16[1] = -150580;
+        out_egress->gamut_row0_q16[2] =   11140;
+        out_egress->gamut_row1_q16[0] =  -69206;
+        out_egress->gamut_row1_q16[1] =  156238;
+        out_egress->gamut_row1_q16[2] =  -21496;
+        out_egress->gamut_row2_q16[0] =   -7995;
+        out_egress->gamut_row2_q16[1] =  -37290;
+        out_egress->gamut_row2_q16[2] =  110821;
+        out_egress->peak_nits         = 500;
+    } else if (target_gamut == FLOW_GAMUT_REC2020_PQ) {
+        /* LMS -> ITU-R BT.2020 (each row sums to 65536 = D65 white point preserved) */
+        out_egress->gamut_row0_q16[0] =  159646;
+        out_egress->gamut_row0_q16[1] = -104202;
+        out_egress->gamut_row0_q16[2] =   10092;
+        out_egress->gamut_row1_q16[0] =  -57344;
+        out_egress->gamut_row1_q16[1] =  141558;
+        out_egress->gamut_row1_q16[2] =  -18678;
+        out_egress->gamut_row2_q16[0] =   -6554;
+        out_egress->gamut_row2_q16[1] =  -28180;
+        out_egress->gamut_row2_q16[2] =  100270;
+        out_egress->peak_nits         = 1000;
+    } else if (target_gamut == FLOW_GAMUT_ACES_CG) {
+        /* LMS -> Academy ACEScg AP1 (each row sums to 65536 = D65 white point preserved) */
+        out_egress->gamut_row0_q16[0] =  163840;
+        out_egress->gamut_row0_q16[1] = -108134;
+        out_egress->gamut_row0_q16[2] =    9830;
+        out_egress->gamut_row1_q16[0] =  -58982;
+        out_egress->gamut_row1_q16[1] =  144179;
+        out_egress->gamut_row1_q16[2] =  -19661;
+        out_egress->gamut_row2_q16[0] =   -6554;
+        out_egress->gamut_row2_q16[1] =  -29491;
+        out_egress->gamut_row2_q16[2] =  101581;
+        out_egress->peak_nits         = 1000;
+    } else {
+        /* Default: LMS -> ITU-R BT.709 / sRGB (each row sums to 65536) */
+        out_egress->gamut_row0_q16[0] =  267181;
+        out_egress->gamut_row0_q16[1] = -216740;
+        out_egress->gamut_row0_q16[2] =   15095;
+        out_egress->gamut_row1_q16[0] =  -83129;
+        out_egress->gamut_row1_q16[1] =  170914;
+        out_egress->gamut_row1_q16[2] =  -22249;
+        out_egress->gamut_row2_q16[0] =    -275;
+        out_egress->gamut_row2_q16[1] =  -46099;
+        out_egress->gamut_row2_q16[2] =  111910;
+        out_egress->peak_nits         = 100;
+    }
+    out_egress->egress_mac = flow_capsule64_calc_mac(out_egress, 0x4547524553533634ULL);
+}
+
+static int64_t cube_q16(int64_t x_q16) {
+    int64_t sq = (x_q16 * x_q16) / 65536LL;
+    return (sq * x_q16) / 65536LL;
+}
+
+void flow_stream_egress64_map_oklab_to_rgb_q16(const FlowStreamEgress64 *egress,
+                                               int32_t l_q16,
+                                               int32_t a_q16,
+                                               int32_t b_q16,
+                                               int32_t out_rgb_q16[3]) {
+    if (!out_rgb_q16) {
+        return;
+    }
+    int64_t L = (int64_t)l_q16;
+    int64_t A = (int64_t)a_q16;
+    int64_t B = (int64_t)b_q16;
+
+    /* OKLab (L, a, b) -> non-linear cone response (l', m', s') in Q16.16 */
+    int64_t lp = L + ( 25974LL * A + 14143LL * B) / 65536LL;
+    int64_t mp = L + ( -6918LL * A -  4185LL * B) / 65536LL;
+    int64_t sp = L + ( -5864LL * A - 84639LL * B) / 65536LL;
+
+    int64_t l_lin = cube_q16(lp);
+    int64_t m_lin = cube_q16(mp);
+    int64_t s_lin = cube_q16(sp);
+
+    if (!egress) {
+        out_rgb_q16[0] = (int32_t)flow_lean_abi_eval_clamp(l_lin, 0LL, 65536LL);
+        out_rgb_q16[1] = (int32_t)flow_lean_abi_eval_clamp(m_lin, 0LL, 65536LL);
+        out_rgb_q16[2] = (int32_t)flow_lean_abi_eval_clamp(s_lin, 0LL, 65536LL);
+        return;
+    }
+
+    int64_t r = ((int64_t)egress->gamut_row0_q16[0] * l_lin +
+                 (int64_t)egress->gamut_row0_q16[1] * m_lin +
+                 (int64_t)egress->gamut_row0_q16[2] * s_lin) / 65536LL;
+    int64_t g = ((int64_t)egress->gamut_row1_q16[0] * l_lin +
+                 (int64_t)egress->gamut_row1_q16[1] * m_lin +
+                 (int64_t)egress->gamut_row1_q16[2] * s_lin) / 65536LL;
+    int64_t b = ((int64_t)egress->gamut_row2_q16[0] * l_lin +
+                 (int64_t)egress->gamut_row2_q16[1] * m_lin +
+                 (int64_t)egress->gamut_row2_q16[2] * s_lin) / 65536LL;
+
+    out_rgb_q16[0] = (int32_t)flow_lean_abi_eval_clamp(r, 0LL, 65536LL);
+    out_rgb_q16[1] = (int32_t)flow_lean_abi_eval_clamp(g, 0LL, 65536LL);
+    out_rgb_q16[2] = (int32_t)flow_lean_abi_eval_clamp(b, 0LL, 65536LL);
+}
+
+void flow_stream_egress64_rgb_to_yuv420_bt709(const int32_t rgb_q16[3],
+                                              uint8_t *out_y,
+                                              uint8_t *out_u,
+                                              uint8_t *out_v) {
+    int64_t r8 = rgb_q16 ? ((flow_lean_abi_eval_clamp((int64_t)rgb_q16[0], 0LL, 65536LL) * 255LL) / 65536LL) : 0LL;
+    int64_t g8 = rgb_q16 ? ((flow_lean_abi_eval_clamp((int64_t)rgb_q16[1], 0LL, 65536LL) * 255LL) / 65536LL) : 0LL;
+    int64_t b8 = rgb_q16 ? ((flow_lean_abi_eval_clamp((int64_t)rgb_q16[2], 0LL, 65536LL) * 255LL) / 65536LL) : 0LL;
+
+    /* ITU-R BT.709 Studio-Swing YCbCr: Y in [16..235], Cb/Cr in [16..240] */
+    int64_t y = 16LL  + (( 47LL * r8 + 157LL * g8 +  16LL * b8 + 128LL) >> 8U);
+    int64_t u = 128LL + ((-25LL * r8 -  87LL * g8 + 112LL * b8 + 128LL) >> 8U);
+    int64_t v = 128LL + ((112LL * r8 - 102LL * g8 -  10LL * b8 + 128LL) >> 8U);
+
+    if (out_y) *out_y = (uint8_t)flow_lean_abi_eval_clamp(y, 16LL, 235LL);
+    if (out_u) *out_u = (uint8_t)flow_lean_abi_eval_clamp(u, 16LL, 240LL);
+    if (out_v) *out_v = (uint8_t)flow_lean_abi_eval_clamp(v, 16LL, 240LL);
+}

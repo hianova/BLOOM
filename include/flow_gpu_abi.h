@@ -187,6 +187,32 @@ typedef struct __attribute__((aligned(64))) {
 } FlowGpuSdfBrick64;
 
 /*
+ * Shared 64-Byte Color-Gamut & Streaming Egress Descriptor
+ * Maps internal OKLab / Kelvin radiance into target standard gamut & stream framing.
+ */
+#define FLOW_GAMUT_REC709_SRGB 0U /* ITU-R BT.709 / sRGB (100 nits SDR) */
+#define FLOW_GAMUT_DISPLAY_P3  1U /* DCI-P3 / Apple Display P3 (500 nits) */
+#define FLOW_GAMUT_REC2020_PQ  2U /* ITU-R BT.2020 + SMPTE ST 2084 PQ (1000..10000 nits HDR) */
+#define FLOW_GAMUT_ACES_CG     3U /* Academy ACEScg AP1 Cinema Working Space */
+
+#define FLOW_STREAM_FMT_FLOW64_NATIVE 0U /* 64-Byte .flow block & UDP state stream (~30 kbps) */
+#define FLOW_STREAM_FMT_YUV420P_PIPE  1U /* BT.709 YUV420p POSIX pipe for FFmpeg / RTMP / SRT */
+#define FLOW_STREAM_FMT_RGB24_PIPE    2U /* Lossless RGB24 POSIX pipe for cinema mastering */
+#define FLOW_STREAM_FMT_IOSURFACE_SHM 3U /* Zero-copy macOS IOSurface + OBS Studio SHM ring */
+
+typedef struct __attribute__((aligned(64))) {
+    uint32_t stream_id;          /*  4B: Stream channel ID */
+    uint32_t target_gamut;       /*  4B: FLOW_GAMUT_* target color gamut */
+    uint32_t stream_format;      /*  4B: FLOW_STREAM_FMT_* output transport mode */
+    uint32_t target_fps;         /*  4B: Target stream frame rate (24, 30, 60, 120) */
+    int32_t  gamut_row0_q16[3];  /* 12B: 3x3 linear LMS/XYZ -> target RGB matrix row 0 in Q16 */
+    int32_t  gamut_row1_q16[3];  /* 12B: 3x3 linear LMS/XYZ -> target RGB matrix row 1 in Q16 */
+    int32_t  gamut_row2_q16[3];  /* 12B: 3x3 linear LMS/XYZ -> target RGB matrix row 2 in Q16 */
+    int32_t  peak_nits;          /*  4B: Peak display luminance in nits (100, 500, 1000, 10000) */
+    uint64_t egress_mac;         /*  8B: 64-bit integrity MAC */
+} FlowStreamEgress64;
+
+/*
  * Shared 64-Byte Declarative SVG-UI Frontend Node Descriptor (CPU Compiler <-> Metal Shader)
  */
 #define FLOW_SVG_PRIM_GLYPH_LINES  0U /* Vector line-segment icon (<g><line>) */
@@ -328,6 +354,7 @@ FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuCsgOp64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuJointDq64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuBvhNode64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuSdfBrick64, RicardianStateV4);
+FLOW_STATIC_ASSERT_UNIVALENT(FlowStreamEgress64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowSvgUiNode64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowEngineBus64, RicardianStateV4);
 _Static_assert(sizeof(FlowGpuSlice0Core64) == 64U, "Slice 0 must be 64B");
@@ -339,6 +366,7 @@ _Static_assert(sizeof(FlowGpuCsgOp64) == 64U, "FlowGpuCsgOp64 must be 64B");
 _Static_assert(sizeof(FlowGpuJointDq64) == 64U, "FlowGpuJointDq64 must be 64B");
 _Static_assert(sizeof(FlowGpuBvhNode64) == 64U, "FlowGpuBvhNode64 must be 64B");
 _Static_assert(sizeof(FlowGpuSdfBrick64) == 64U, "FlowGpuSdfBrick64 must be 64B");
+_Static_assert(sizeof(FlowStreamEgress64) == 64U, "FlowStreamEgress64 must be 64B");
 _Static_assert(sizeof(FlowSvgUiNode64) == 64U, "FlowSvgUiNode64 must be 64B");
 _Static_assert(sizeof(FlowEngineBus64) == 64U, "FlowEngineBus64 must be 64B");
 _Static_assert(_Alignof(FlowEngineBus64) == 64U, "FlowEngineBus64 must be 64B aligned");

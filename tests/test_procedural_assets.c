@@ -2,6 +2,7 @@
 #include "flow_procedural_assets.h"
 #include "flow_lean_abi.h"
 #include "flow_assets.h"
+#include "flow_image64.h"
 #include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -860,8 +861,57 @@ int main(void) {
     printf("  ✓ Verified 64B Dual-Quaternion Skinning, Linear BVH (%u/8 leaves visited) & Sparse 4x4x4 SDF Brick!\n",
            visited_leaves);
 
+    /* 16. 64B Color-Gamut Egress (OKLab -> Rec.709/P3/Rec.2020 & YUV420p) + Progressive .flow Block Stream */
+    printf("[Test 16/16] 64B Color-Gamut Egress (Rec.709/P3/Rec.2020/YUV) & Progressive .flow Stream...\n");
+    assert(sizeof(FlowStreamEgress64) == 64U && _Alignof(FlowStreamEgress64) == 64U);
+
+    FlowStreamEgress64 eg_709, eg_p3, eg_2020;
+    flow_stream_egress64_init(&eg_709,  1U, FLOW_GAMUT_REC709_SRGB, FLOW_STREAM_FMT_YUV420P_PIPE,  60U);
+    flow_stream_egress64_init(&eg_p3,   2U, FLOW_GAMUT_DISPLAY_P3,  FLOW_STREAM_FMT_IOSURFACE_SHM, 120U);
+    flow_stream_egress64_init(&eg_2020, 3U, FLOW_GAMUT_REC2020_PQ,  FLOW_STREAM_FMT_FLOW64_NATIVE, 60U);
+
+    int32_t rgb_white_709[3], rgb_white_p3[3], rgb_white_2020[3];
+    flow_stream_egress64_map_oklab_to_rgb_q16(&eg_709,  65536, 0, 0, rgb_white_709);
+    flow_stream_egress64_map_oklab_to_rgb_q16(&eg_p3,   65536, 0, 0, rgb_white_p3);
+    flow_stream_egress64_map_oklab_to_rgb_q16(&eg_2020, 65536, 0, 0, rgb_white_2020);
+    /* D65 White (L=1.0, a=0, b=0) maps to exact (65536, 65536, 65536) across all gamuts! */
+    assert(rgb_white_709[0]  == 65536 && rgb_white_709[1]  == 65536 && rgb_white_709[2]  == 65536);
+    assert(rgb_white_p3[0]   == 65536 && rgb_white_p3[1]   == 65536 && rgb_white_p3[2]   == 65536);
+    assert(rgb_white_2020[0] == 65536 && rgb_white_2020[1] == 65536 && rgb_white_2020[2] == 65536);
+
+    uint8_t y_w = 0, u_w = 0, v_w = 0;
+    flow_stream_egress64_rgb_to_yuv420_bt709(rgb_white_709, &y_w, &u_w, &v_w);
+    assert(y_w == 235U && u_w == 128U && v_w == 128U); /* Studio-swing BT.709 white = (235, 128, 128) */
+
+    /* Progressive 8-block (512B) .flow stream assembly (out-of-order network arrival) */
+    FlowImageBlock64 src_stream[8], dst_arena[8];
+    memset(src_stream, 0, sizeof(src_stream));
+    memset(dst_arena,  0, sizeof(dst_arena));
+    src_stream[0].header.magic             = FLOW_IMAGE64_MAGIC;
+    src_stream[0].header.block_cap_mask    = 7ULL; /* 8 blocks = 2^3 */
+    src_stream[0].header.prefab_block_off  = 1U;
+    src_stream[0].header.prefab_block_count = 4U;
+    src_stream[0].header.version           = FLOW_IMAGE64_VERSION;
+    src_stream[1].joint_dq                 = joint_blended;
+    src_stream[2].bvh_node                 = bvh_nodes[0];
+    src_stream[3].sdf_brick                = sdf_brick;
+    src_stream[4].stream_egress            = eg_2020;
+    src_stream[0].header.merkle_mac        = flow_image64_compute_mac(src_stream, 8U);
+
+    uint64_t rx_mask = 0ULL;
+    /* Reject out-of-bounds block index >= 8 */
+    assert(!flow_image64_stream_ingest_block(dst_arena, 8U, 99U, &src_stream[0], &rx_mask));
+    /* Ingest blocks out of order (7, 6, ..., 0) */
+    for (int b = 7; b >= 0; --b) {
+        assert(flow_image64_stream_ingest_block(dst_arena, 8U, (uint32_t)b, &src_stream[b], &rx_mask));
+    }
+    assert(rx_mask == 0xFFULL);
+    assert(flow_image64_verify(dst_arena, sizeof(dst_arena)));
+    printf("  ✓ Verified D65 Gamut Matrix (Rec.709/P3/Rec.2020), BT.709 YUV420p (Y=%u,U=%u,V=%u) & 8-Block .flow Stream!\n",
+           y_w, u_w, v_w);
+
     printf("====================================================================\n");
-    printf("✓ ALL 15 PROCEDURAL, LEAN-ABI & EXTERNAL ASSET TESTS PASSED (100%% SOUND)\n");
+    printf("✓ ALL 16 PROCEDURAL, LEAN-ABI, ASSET & STREAM TESTS PASSED (100%% SOUND)\n");
     printf("====================================================================\n");
     return 0;
 }

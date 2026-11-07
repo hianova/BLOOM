@@ -21,9 +21,10 @@ BLOOM 採用 **「算子與參數分離」** 的設計模式：將底層物理�
     - 以純整數 `Q16.16` 實作體積守恆之對偶四元數（Dual-Quaternion $\hat{q} = q_r + \epsilon q_d$）剛體變換、最短弧混合（`flow_joint_dq64_blend`）與多關節平滑肌肉包絡（`flow_skeleton_eval_sdf_q16`），徹底消除傳統線性矩陣蒙皮（LBS）之關節扭轉體積塌縮與浮點誤差。
     - 支援 60-bit 3D Morton Z-Order 空間編碼（`flow_bvh_morton3d_q16`）、無指標線性陣列 BVH 建構（`flow_bvh_build_from_csg64`）與 $O(\log N)$ AABB 下界剪枝查詢（`flow_bvh_eval_csg_q16`）。
     - 將 $4 \times 4 \times 4 = 64$ 個 4-bit 量化符號距離體素（Bias `8` 對應零等值面）連同 3D 座標原點、體素步長與 MAC 完整封裝進單一 64-byte 快取線（`flow_sdf_brick64_pack`），支援純整數三線性插值取樣（`flow_sdf_brick64_sample_trilinear_q16`）。
-- **統一 64-Byte 記憶體映射 `.flow` 容器格式 (`include/flow_image64.h`)**：
-  - 將分散的設定檔（TOML）、結構化資料（JSON/CSV）與視覺/3D 預製件（PDF/SVG/GLB）統一收斂為單一 2 的冪次方 64-Byte 快取線區塊陣列（`FlowImageHeader64` + `FlowImageBlock64`，Magic `"FLOWIMG4"`）。
-  - 支援 `flow_image64_mmap_readonly` 零解析（Zero-Parse / Zero-Malloc）直接記憶體映射，並透過 `flow_image64_get_block_masked`（$\mathbb{Z}/2^k\mathbb{Z}$ 位元遮罩）保證損毀偏移量下 `0` 越界 Segfault，且相容 `-ffreestanding` 裸機環境。
+- **統一 64-Byte 記憶體映射 `.flow` 容器與雙軌串流色域輸出介面 (`include/flow_image64.h` / `FlowStreamEgress64`)**：
+  - 將分散的設定檔（TOML）、結構化資料（JSON/CSV）與視覺/3D 預製件（PDF/SVG/GLB/骨骼/BVH/SDF 磚）統一收斂為單一 2 的冪次方 64-Byte 快取線區塊陣列（`FlowImageHeader64` + `FlowImageBlock64`，Magic `"FLOWIMG4"`）。
+  - 支援 `flow_image64_mmap_readonly` 零解析（Zero-Parse / Zero-Malloc）直接記憶體映射、`flow_image64_get_block_masked`（$\mathbb{Z}/2^k\mathbb{Z}$ 位元遮罩）與網路分片邊下邊播組裝（`flow_image64_stream_ingest_block`），保證亂序或損毀偏移量下 `0` 越界 Segfault，且相容 `-ffreestanding` 裸機環境。
+  - **64-Byte 串流與色域輸出閘門 (`FlowStreamEgress64`)**：引擎內部統一以物理色溫（Kelvin）與感知正交空間 **OKLab (`Q16.16`)** 運算，輸出邊界透過 `flow_stream_egress64_map_oklab_to_rgb_q16`（支援 `ITU-R BT.709 / sRGB`、`Display P3`、`ITU-R BT.2020 PQ`、`ACEScg`，D65 白點嚴格守恆）與 `flow_stream_egress64_rgb_to_yuv420_bt709`（Studio-Swing `YCbCr`）轉譯至外部直播或影視管線。
 - **64-Byte Cache-Line Univalence 與 $O(1)$ 狀態回滾**：引擎狀態、Prefab 資產（`FlowPrefabDesc64`）、色票配置（`FlowMoodboardPrefab64`）、攝影機分鏡（`FlowCinemaShot64`）與 GPU ABI 均對齊 64-byte Cache Line，支援透過 64B Shadow 雙緩衝進行常數時間狀態回滾（Atomic Rollback）。
 - **統一 64-Byte Engine Bus (`FlowEngineBus1K`)**：CPU 主機端與 GPU 管線透過 16 個 64B 槽位（共 `1024 Bytes`）直接映射至 Metal / Vulkan `buffer(3)`。
 - **程序化 CSG/SDF 舞台與參考圖色票萃取 (`FlowMoodboardPrefab64`)**：

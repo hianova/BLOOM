@@ -140,4 +140,29 @@ theorem sdf_brick_zero_isosurface_exact :
   unfold decodeSdfNibble sdfNibbleBias
   rfl
 
+/-- 9. 64-Byte Color-Gamut Egress D65 White-Point Preservation & BT.709 YUV Bounds. -/
+def evalGamutRowSum (m0 m1 m2 : Int) : Int :=
+  m0 + m1 + m2
+
+def clampBt709Luma (rawY : Int) : Int :=
+  if rawY < 16 then 16
+  else if rawY > 235 then 235
+  else rawY
+
+theorem gamut_matrices_preserve_d65_white :
+    evalGamutRowSum 267181 (-216740) 15095 = 65536 ∧
+    evalGamutRowSum (-83129) 170914 (-22249) = 65536 ∧
+    evalGamutRowSum (-275) (-46099) 111910 = 65536 ∧
+    evalGamutRowSum 204976 (-150580) 11140 = 65536 ∧
+    evalGamutRowSum 159646 (-104202) 10092 = 65536 := by
+  unfold evalGamutRowSum
+  decide
+
+theorem stream_bt709_luma_bounded (rawY : Int) :
+    16 <= clampBt709Luma rawY ∧ clampBt709Luma rawY <= 235 := by
+  unfold clampBt709Luma
+  split
+  · omega
+  · split <;> omega
+
 end Bloom.AssetPipeline

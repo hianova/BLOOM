@@ -74,6 +74,10 @@ typedef union __attribute__((aligned(64))) {
     FlowImageHeader64 header;
     FlowLeanClause64 clause;
     FlowGpuCsgOp64 csg_op;
+    FlowGpuJointDq64 joint_dq;
+    FlowGpuBvhNode64 bvh_node;
+    FlowGpuSdfBrick64 sdf_brick;
+    FlowStreamEgress64 stream_egress;
     FlowSvgUiNode64 svg_node;
     FlowImageUnitCellView16 cells[4];
     uint64_t raw_u64[8];
@@ -133,6 +137,32 @@ static inline const FlowImageBlock64 *flow_image64_get_block_masked(
         *out_inbounds = (oob == 0ULL);
     }
     return &blocks[midx];
+}
+
+/*
+ * Progressive 64-Byte Network Block Streaming Ingestion:
+ * Writes an incoming 64B .flow block into `arena_blocks` using Z / 2^k Z mask
+ * (0 OOB writes on untrusted network indices) and updates the 64-bit reception bitmap.
+ */
+static inline bool flow_image64_stream_ingest_block(FlowImageBlock64 *arena_blocks,
+                                                    size_t arena_block_count,
+                                                    uint32_t incoming_block_idx,
+                                                    const FlowImageBlock64 *incoming_block,
+                                                    uint64_t *inout_received_mask64) {
+    if (!arena_blocks || !incoming_block || arena_block_count == 0U ||
+        (arena_block_count & (arena_block_count - 1U)) != 0U) {
+        return false;
+    }
+    uint64_t cap_mask = (uint64_t)(arena_block_count - 1U);
+    if (((uint64_t)incoming_block_idx & ~cap_mask) != 0ULL) {
+        return false;
+    }
+    uint64_t slot = (uint64_t)incoming_block_idx & cap_mask;
+    arena_blocks[slot] = *incoming_block;
+    if (inout_received_mask64 && slot < 64ULL) {
+        *inout_received_mask64 |= (1ULL << slot);
+    }
+    return true;
 }
 
 #if FLOW_IMAGE64_HAS_POSIX_MMAP
