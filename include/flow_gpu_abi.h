@@ -199,6 +199,7 @@ typedef struct __attribute__((aligned(64))) {
 #define FLOW_STREAM_FMT_YUV420P_PIPE  1U /* BT.709 YUV420p POSIX pipe for FFmpeg / RTMP / SRT */
 #define FLOW_STREAM_FMT_RGB24_PIPE    2U /* Lossless RGB24 POSIX pipe for cinema mastering */
 #define FLOW_STREAM_FMT_IOSURFACE_SHM 3U /* Zero-copy macOS IOSurface + OBS Studio SHM ring */
+#define FLOW_STREAM_FMT_KITTY_TTY     4U /* Kitty Graphics Protocol APC (\x1b_Ga=T,f=24...) for Ghostty/Rex/Agent TUI */
 
 typedef struct __attribute__((aligned(64))) {
     uint32_t stream_id;          /*  4B: Stream channel ID */
@@ -211,6 +212,59 @@ typedef struct __attribute__((aligned(64))) {
     int32_t  peak_nits;          /*  4B: Peak display luminance in nits (100, 500, 1000, 10000) */
     uint64_t egress_mac;         /*  8B: 64-bit integrity MAC */
 } FlowStreamEgress64;
+
+/*
+ * Shared 64-Byte Constitutive Physical Matter State Descriptor
+ * Eliminates semantic "Material Classes" (Glass / Water / Jade / Metal) by deriving
+ * visual appearance from continuous continuum mechanics & electrodynamics via one
+ * branchless optical operator:
+ *   - Gladstone-Dale & Snell Paraxial Refraction (\eta = 1 + k_GD \rho)
+ *   - Complex Fresnel (\eta + i\kappa) unifying Dielectrics (\kappa=0) and Metals (\kappa>0)
+ *   - 2-Jet Surface Field (h, \nabla h, \nabla^2 h) + Analytic Jacobian Caustics
+ *   - Homogenized 12-Tap Golden-Angle Vogel Scattering (\sigma_r + \mu_s)
+ *   - Beer-Lambert Spectral Absorption + Embedded Lattice Parallax Shadow + Planck Emission
+ */
+typedef struct __attribute__((aligned(64))) {
+    uint32_t matter_id;            /*  4B: [0..3]   Constitutive physical state ID */
+    int32_t  ior_eta_q16;          /*  4B: [4..7]   Real refractive index \eta in Q16.16 (1.0 = 65536) */
+    int32_t  extinction_kappa_q16; /*  4B: [8..11]  Imaginary extinction \kappa / free-electron density in Q16 */
+    int32_t  viscosity_quench_q16; /*  4B: [12..15] Solidification quench \mu_visc in Q16 [0=wave..65536=solid] */
+    int32_t  surface_relief_q16;   /*  4B: [16..19] Mesoscopic 2-Jet relief amplitude ||\nabla h, \nabla^2 h|| in Q16 */
+    int32_t  micro_roughness_q16;  /*  4B: [20..23] Micro-facet surface roughness \sigma_r in Q16 */
+    int32_t  mie_scatter_q16;      /*  4B: [24..27] Volumetric Mie scattering coefficient \mu_s in Q16 */
+    int32_t  absorb_rgb_q16[3];    /* 12B: [28..39] Beer-Lambert spectral absorption (\mu_{a,R},\mu_{a,G},\mu_{a,B}) Q16 */
+    int32_t  lattice_wire_q16;     /*  4B: [40..43] Embedded internal wire / crystal lattice density \Lambda in Q16 */
+    int32_t  thickness_mm_q16;     /*  4B: [44..47] Optical medium thickness d in Q16 (mm) */
+    uint32_t thermal_kelvin;       /*  4B: [48..51] Thermodynamic temperature T in Kelvin (Planck radiation) */
+    uint32_t density_kg_m3;        /*  4B: [52..55] Continuum mass density \rho in kg/m^3 */
+    uint64_t matter_mac;           /*  8B: [56..63] 64-bit integrity MAC */
+} FlowMatterState64;
+
+/*
+ * Shared 64-Byte Cloud Room Multi-View Atlas Descriptor (Room Isolate)
+ * Multiplexes N player camera viewports (FlowGpuSlice1Camera64[N]) over 1 shared
+ * room world manifold (s0_core + FlowEngineBus1K) in a single GPU Tile-Atlas pass.
+ * External Docker isolates the physical GPU node; FlowCloudRoomDesc64 isolates
+ * rooms and routes per-player tile viewports with < 8.33ms SLA circuit-breaker.
+ */
+#define FLOW_CLOUD_MAX_ROOM_VIEWS 16U /* Up to 4x4 = 16 concurrent player viewports per room pass */
+
+typedef struct __attribute__((aligned(64))) {
+    uint32_t room_id;              /*  4B: [0..3]   Unique Cloud Room Isolate ID */
+    uint32_t map_block_mask;       /*  4B: [4..7]   \mathbb{Z}/2^k\mathbb{Z} .flow mmap capacity mask (2^k - 1) */
+    uint32_t active_view_count;    /*  4B: [8..11]  Active player viewports in room [1..16] */
+    uint32_t grid_cols;            /*  4B: [12..15] Tile-Atlas column count (1, 2, 4) */
+    uint32_t grid_rows;            /*  4B: [16..19] Tile-Atlas row count (1, 2, 4) */
+    uint32_t tile_width_px;        /*  4B: [20..23] Per-player viewport width in pixels */
+    uint32_t tile_height_px;       /*  4B: [24..27] Per-player viewport height in pixels */
+    uint32_t sla_budget_us;        /*  4B: [28..31] Per-room GPU frame SLA budget in us (default 8333 us) */
+    uint32_t measured_frame_us;    /*  4B: [32..35] Last measured room pass duration in us */
+    uint32_t lod_degrade_level;    /*  4B: [36..39] Automatic noisy-neighbor LOD step [0=Full..3=Minimal] */
+    uint32_t active_seat_mask;     /*  4B: [40..43] Bitmask of occupied player seats (bits 0..15) */
+    uint32_t egress_stream_fmt;    /*  4B: [44..47] Target FLOW_STREAM_FMT_* for room egress */
+    uint64_t shared_world_hash;    /*  8B: [48..55] Deterministic 64-bit hash of shared s0_core + Bus1K */
+    uint64_t room_mac;             /*  8B: [56..63] 64-bit integrity MAC */
+} FlowCloudRoomDesc64;
 
 /*
  * Shared 64-Byte Declarative SVG-UI Frontend Node Descriptor (CPU Compiler <-> Metal Shader)
@@ -319,24 +373,28 @@ typedef struct __attribute__((aligned(64))) {
 
 #ifdef __METAL_VERSION__
 typedef union __attribute__((aligned(64))) {
-    FlowSvgUiNode64   svg_node;
-    FlowGpuJointDq64  joint_dq;
-    FlowGpuBvhNode64  bvh_node;
-    FlowGpuSdfBrick64 sdf_brick;
-    uint4             u32_quads[4];
-    ulong             u64_octets[8];
-    float4            f32_quads[4];
+    FlowSvgUiNode64     svg_node;
+    FlowGpuJointDq64    joint_dq;
+    FlowGpuBvhNode64    bvh_node;
+    FlowGpuSdfBrick64   sdf_brick;
+    FlowMatterState64   matter_state;
+    FlowCloudRoomDesc64 cloud_room;
+    uint4               u32_quads[4];
+    ulong               u64_octets[8];
+    float4              f32_quads[4];
 } FlowEngineBus64;
 #else
 typedef union __attribute__((aligned(64))) {
-    uint8_t           raw_bytes[64];
-    uint32_t          raw_u32[16];
-    uint64_t          raw_u64[8];
-    RicardianStateV4  ricardian;
-    FlowSvgUiNode64   svg_node;
-    FlowGpuJointDq64  joint_dq;
-    FlowGpuBvhNode64  bvh_node;
-    FlowGpuSdfBrick64 sdf_brick;
+    uint8_t             raw_bytes[64];
+    uint32_t            raw_u32[16];
+    uint64_t            raw_u64[8];
+    RicardianStateV4    ricardian;
+    FlowSvgUiNode64     svg_node;
+    FlowGpuJointDq64    joint_dq;
+    FlowGpuBvhNode64    bvh_node;
+    FlowGpuSdfBrick64   sdf_brick;
+    FlowMatterState64   matter_state;
+    FlowCloudRoomDesc64 cloud_room;
 } FlowEngineBus64;
 #endif
 
@@ -355,6 +413,8 @@ FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuJointDq64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuBvhNode64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowGpuSdfBrick64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowStreamEgress64, RicardianStateV4);
+FLOW_STATIC_ASSERT_UNIVALENT(FlowMatterState64, RicardianStateV4);
+FLOW_STATIC_ASSERT_UNIVALENT(FlowCloudRoomDesc64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowSvgUiNode64, RicardianStateV4);
 FLOW_STATIC_ASSERT_UNIVALENT(FlowEngineBus64, RicardianStateV4);
 _Static_assert(sizeof(FlowGpuSlice0Core64) == 64U, "Slice 0 must be 64B");
@@ -367,6 +427,8 @@ _Static_assert(sizeof(FlowGpuJointDq64) == 64U, "FlowGpuJointDq64 must be 64B");
 _Static_assert(sizeof(FlowGpuBvhNode64) == 64U, "FlowGpuBvhNode64 must be 64B");
 _Static_assert(sizeof(FlowGpuSdfBrick64) == 64U, "FlowGpuSdfBrick64 must be 64B");
 _Static_assert(sizeof(FlowStreamEgress64) == 64U, "FlowStreamEgress64 must be 64B");
+_Static_assert(sizeof(FlowMatterState64) == 64U, "FlowMatterState64 must be 64B");
+_Static_assert(sizeof(FlowCloudRoomDesc64) == 64U, "FlowCloudRoomDesc64 must be 64B");
 _Static_assert(sizeof(FlowSvgUiNode64) == 64U, "FlowSvgUiNode64 must be 64B");
 _Static_assert(sizeof(FlowEngineBus64) == 64U, "FlowEngineBus64 must be 64B");
 _Static_assert(_Alignof(FlowEngineBus64) == 64U, "FlowEngineBus64 must be 64B aligned");

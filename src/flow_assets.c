@@ -1422,3 +1422,482 @@ void flow_stream_egress64_rgb_to_yuv420_bt709(const int32_t rgb_q16[3],
     if (out_u) *out_u = (uint8_t)flow_lean_abi_eval_clamp(u, 16LL, 240LL);
     if (out_v) *out_v = (uint8_t)flow_lean_abi_eval_clamp(v, 16LL, 240LL);
 }
+
+static size_t append_u32_dec(char *dst, size_t pos, size_t cap, uint32_t val) {
+    char tmp[10];
+    size_t n = 0U;
+    if (val == 0U) {
+        tmp[n++] = '0';
+    } else {
+        while (val > 0U && n < sizeof(tmp)) {
+            tmp[n++] = (char)('0' + (val % 10U));
+            val /= 10U;
+        }
+    }
+    while (n > 0U && pos < cap) {
+        dst[pos++] = tmp[--n];
+    }
+    return pos;
+}
+
+size_t flow_stream_egress64_encode_kitty_rgb24(const uint8_t *rgb24_pixels,
+                                               uint32_t width,
+                                               uint32_t height,
+                                               char *out_buf,
+                                               size_t max_buf_len) {
+    static const char b64_lut[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (!rgb24_pixels || !out_buf || width == 0U || height == 0U || max_buf_len < 32U) {
+        return 0U;
+    }
+    size_t raw_bytes = (size_t)width * (size_t)height * 3U;
+    size_t b64_len = ((raw_bytes + 2U) / 3U) * 4U;
+    /* Header: "\x1b_Ga=T,f=24,s=<w>,v=<h>,q=2;" (max ~36B) + b64_len + "\x1b\\" (2B) + NUL */
+    if (b64_len + 40U > max_buf_len) {
+        return 0U;
+    }
+
+    size_t pos = 0U;
+    const char *prefix = "\x1b_Ga=T,f=24,s=";
+    for (size_t i = 0U; prefix[i] != '\0'; ++i) {
+        out_buf[pos++] = prefix[i];
+    }
+    pos = append_u32_dec(out_buf, pos, max_buf_len, width);
+    out_buf[pos++] = ',';
+    out_buf[pos++] = 'v';
+    out_buf[pos++] = '=';
+    pos = append_u32_dec(out_buf, pos, max_buf_len, height);
+    const char *mid = ",q=2;";
+    for (size_t i = 0U; mid[i] != '\0'; ++i) {
+        out_buf[pos++] = mid[i];
+    }
+
+    size_t i = 0U;
+    while (i + 3U <= raw_bytes) {
+        uint32_t triple = ((uint32_t)rgb24_pixels[i] << 16U) |
+                          ((uint32_t)rgb24_pixels[i + 1U] << 8U) |
+                          (uint32_t)rgb24_pixels[i + 2U];
+        out_buf[pos++] = b64_lut[(triple >> 18U) & 0x3FU];
+        out_buf[pos++] = b64_lut[(triple >> 12U) & 0x3FU];
+        out_buf[pos++] = b64_lut[(triple >> 6U) & 0x3FU];
+        out_buf[pos++] = b64_lut[triple & 0x3FU];
+        i += 3U;
+    }
+    size_t rem = raw_bytes - i;
+    if (rem == 1U) {
+        uint32_t triple = (uint32_t)rgb24_pixels[i] << 16U;
+        out_buf[pos++] = b64_lut[(triple >> 18U) & 0x3FU];
+        out_buf[pos++] = b64_lut[(triple >> 12U) & 0x3FU];
+        out_buf[pos++] = '=';
+        out_buf[pos++] = '=';
+    } else if (rem == 2U) {
+        uint32_t triple = ((uint32_t)rgb24_pixels[i] << 16U) |
+                          ((uint32_t)rgb24_pixels[i + 1U] << 8U);
+        out_buf[pos++] = b64_lut[(triple >> 18U) & 0x3FU];
+        out_buf[pos++] = b64_lut[(triple >> 12U) & 0x3FU];
+        out_buf[pos++] = b64_lut[(triple >> 6U) & 0x3FU];
+        out_buf[pos++] = '=';
+    }
+    out_buf[pos++] = '\x1b';
+    out_buf[pos++] = '\\';
+    out_buf[pos] = '\0';
+    return pos;
+}
+
+/* ============================================================================
+ * 10. 64-Byte Constitutive Physical Matter State & Branchless Optical Operator
+ * ============================================================================ */
+
+void flow_matter_state64_init(FlowMatterState64 *out_matter,
+                              uint32_t matter_id,
+                              int32_t ior_eta_q16,
+                              int32_t extinction_kappa_q16,
+                              int32_t viscosity_quench_q16,
+                              int32_t surface_relief_q16,
+                              int32_t micro_roughness_q16,
+                              int32_t mie_scatter_q16,
+                              const int32_t absorb_rgb_q16[3],
+                              int32_t lattice_wire_q16,
+                              int32_t thickness_mm_q16,
+                              uint32_t thermal_kelvin,
+                              uint32_t density_kg_m3) {
+    if (!out_matter) {
+        return;
+    }
+    memset(out_matter, 0, sizeof(*out_matter));
+    out_matter->matter_id      = matter_id;
+    out_matter->density_kg_m3  = (density_kg_m3 > 0U) ? density_kg_m3 : 1000U;
+    out_matter->thermal_kelvin = (thermal_kelvin > 0U) ? thermal_kelvin : 295U;
+
+    /* Gladstone-Dale law (\eta = 1 + k_GD * \rho) if ior_eta_q16 <= 0 */
+    int64_t eta = (int64_t)ior_eta_q16;
+    if (eta <= 0LL) {
+        eta = 65536LL + (int64_t)out_matter->density_kg_m3 * 14LL;
+    }
+    out_matter->ior_eta_q16          = (int32_t)flow_lean_abi_eval_clamp(eta, 65536LL, 262144LL);
+    out_matter->extinction_kappa_q16 = (int32_t)flow_lean_abi_eval_clamp((int64_t)extinction_kappa_q16, 0LL, 524288LL);
+    out_matter->viscosity_quench_q16 = (int32_t)flow_lean_abi_eval_clamp((int64_t)viscosity_quench_q16, 0LL, 65536LL);
+    out_matter->surface_relief_q16   = (int32_t)flow_lean_abi_eval_clamp((int64_t)surface_relief_q16, 0LL, 131072LL);
+    out_matter->micro_roughness_q16  = (int32_t)flow_lean_abi_eval_clamp((int64_t)micro_roughness_q16, 0LL, 65536LL);
+    out_matter->mie_scatter_q16      = (int32_t)flow_lean_abi_eval_clamp((int64_t)mie_scatter_q16, 0LL, 65536LL);
+
+    for (size_t c = 0U; c < 3U; ++c) {
+        int64_t a = absorb_rgb_q16 ? (int64_t)absorb_rgb_q16[c] : 0LL;
+        out_matter->absorb_rgb_q16[c] = (int32_t)flow_lean_abi_eval_clamp(a, 0LL, 262144LL);
+    }
+
+    out_matter->lattice_wire_q16 = (int32_t)flow_lean_abi_eval_clamp((int64_t)lattice_wire_q16, 0LL, 65536LL);
+    out_matter->thickness_mm_q16 = (int32_t)flow_lean_abi_eval_clamp(
+        (thickness_mm_q16 > 0) ? (int64_t)thickness_mm_q16 : 65536LL, 1024LL, 1638400LL
+    );
+    out_matter->matter_mac = flow_capsule64_calc_mac(out_matter, 0x4D41545445523634ULL);
+}
+
+static int hex_nibble_val(char c) {
+    if (c >= '0' && c <= '9') return (int)(c - '0');
+    if (c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
+    if (c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
+    return -1;
+}
+
+void flow_matter_state64_format_hex128(const FlowMatterState64 *matter,
+                                       char out_hex[129]) {
+    static const char hex_lut[] = "0123456789abcdef";
+    if (!out_hex) {
+        return;
+    }
+    if (!matter) {
+        memset(out_hex, '0', 128U);
+        out_hex[128] = '\0';
+        return;
+    }
+    const uint8_t *raw = (const uint8_t *)matter;
+    for (size_t i = 0U; i < 64U; ++i) {
+        out_hex[i * 2U]      = hex_lut[(raw[i] >> 4U) & 0x0FU];
+        out_hex[i * 2U + 1U] = hex_lut[raw[i] & 0x0FU];
+    }
+    out_hex[128] = '\0';
+}
+
+bool flow_matter_state64_parse_hex128(const char *hex128,
+                                      FlowMatterState64 *out_matter) {
+    if (!hex128 || !out_matter) {
+        return false;
+    }
+    FlowMatterState64 candidate;
+    uint8_t *raw = (uint8_t *)&candidate;
+    for (size_t i = 0U; i < 64U; ++i) {
+        int hi = hex_nibble_val(hex128[i * 2U]);
+        int lo = hex_nibble_val(hex128[i * 2U + 1U]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        raw[i] = (uint8_t)((hi << 4) | lo);
+    }
+    uint64_t expected_mac = flow_capsule64_calc_mac(&candidate, 0x4D41545445523634ULL);
+    if (candidate.matter_mac != expected_mac || expected_mac == 0ULL) {
+        return false;
+    }
+    *out_matter = candidate;
+    return true;
+}
+
+int32_t flow_matter_eval_fresnel_q16(const FlowMatterState64 *matter,
+                                     int32_t cos_theta_q16) {
+    if (!matter) {
+        return 0;
+    }
+    int64_t eta   = flow_lean_abi_eval_clamp((int64_t)matter->ior_eta_q16, 65536LL, 262144LL);
+    int64_t kappa = flow_lean_abi_eval_clamp((int64_t)matter->extinction_kappa_q16, 0LL, 524288LL);
+
+    int64_t dm = eta - 65536LL;
+    int64_t dp = eta + 65536LL;
+    int64_t k2 = (kappa * kappa) / 65536LL;
+    int64_t num = (dm * dm) / 65536LL + k2;
+    int64_t den = (dp * dp) / 65536LL + k2;
+    if (den <= 0LL) {
+        den = 65536LL;
+    }
+    int64_t f0 = flow_lean_abi_eval_clamp((num * 65536LL) / den, 0LL, 65536LL);
+
+    int64_t cos_t = flow_lean_abi_eval_clamp((int64_t)cos_theta_q16, 0LL, 65536LL);
+    int64_t m1 = 65536LL - cos_t;
+    int64_t m2 = (m1 * m1) / 65536LL;
+    int64_t m4 = (m2 * m2) / 65536LL;
+    int64_t m5 = (m4 * m1) / 65536LL;
+
+    int64_t f_theta = f0 + ((65536LL - f0) * m5) / 65536LL;
+    return (int32_t)flow_lean_abi_eval_clamp(f_theta, 0LL, 65536LL);
+}
+
+int32_t flow_matter_eval_vogel_radius_q16(const FlowMatterState64 *matter) {
+    if (!matter) {
+        return 0;
+    }
+    int64_t eta     = flow_lean_abi_eval_clamp((int64_t)matter->ior_eta_q16, 65536LL, 262144LL);
+    int64_t sigma_r = flow_lean_abi_eval_clamp((int64_t)matter->micro_roughness_q16, 0LL, 65536LL);
+    int64_t mu_s    = flow_lean_abi_eval_clamp((int64_t)matter->mie_scatter_q16, 0LL, 65536LL);
+    int64_t d_mm    = flow_lean_abi_eval_clamp((int64_t)matter->thickness_mm_q16, 1024LL, 1638400LL);
+
+    /* Snell paraxial factor (1 - 1/\eta) in Q16.16 */
+    int64_t snell_q16 = ((eta - 65536LL) * 65536LL) / eta;
+    /* Normalized thickness factor d / 8mm in Q16.16 */
+    int64_t d_norm = flow_lean_abi_eval_clamp(d_mm / 8LL, 4096LL, 131072LL);
+
+    int64_t surf_cone = (snell_q16 * sigma_r) / 65536LL;
+    int64_t total_scatter = surf_cone + (mu_s * 3LL) / 4LL;
+    int64_t r_vogel = (d_norm * total_scatter) / 65536LL;
+    return (int32_t)flow_lean_abi_eval_clamp(r_vogel, 0LL, 65536LL);
+}
+
+int32_t flow_matter_eval_caustic_gain_q16(const FlowMatterState64 *matter,
+                                          int32_t laplacian_h_q16) {
+    if (!matter) {
+        return 65536;
+    }
+    int64_t eta    = flow_lean_abi_eval_clamp((int64_t)matter->ior_eta_q16, 65536LL, 262144LL);
+    int64_t relief = flow_lean_abi_eval_clamp((int64_t)matter->surface_relief_q16, 0LL, 131072LL);
+    int64_t snell_q16 = ((eta - 65536LL) * 65536LL) / eta;
+
+    /* Focal convergence term: z_focus * (1 - 1/\eta) * \nabla^2 h */
+    int64_t focus_scale = (snell_q16 * relief) / 65536LL;
+    int64_t defocus_term = (focus_scale * (int64_t)laplacian_h_q16) / 65536LL;
+    int64_t jacobian_det = 65536LL - defocus_term;
+    if (jacobian_det < 0LL) {
+        jacobian_det = -jacobian_det;
+    }
+    if (jacobian_det < 16384LL) {
+        jacobian_det = 16384LL; /* Cap maximum caustic focus at 4.0x (262144 Q16) */
+    }
+    int64_t raw_gain = (65536LL * 65536LL) / jacobian_det;
+
+    /* Scattering (\sigma_r + \mu_s) smoothly diffuses sharp caustics toward 1.0x */
+    int64_t scatter_damp = flow_lean_abi_eval_clamp(
+        ((int64_t)matter->micro_roughness_q16 + (int64_t)matter->mie_scatter_q16) / 2LL,
+        0LL, 65536LL
+    );
+    int64_t gain = ((raw_gain * (65536LL - scatter_damp)) + 65536LL * scatter_damp) / 65536LL;
+    return (int32_t)flow_lean_abi_eval_clamp(gain, 16384LL, 262144LL);
+}
+
+static int64_t eval_pade_exp_neg_q16(int64_t x_q16) {
+    if (x_q16 <= 0LL) {
+        return 65536LL;
+    }
+    int64_t x2_half = (x_q16 * x_q16) / 131072LL;
+    int64_t den = 65536LL + x_q16 + x2_half;
+    return flow_lean_abi_eval_clamp((65536LL * 65536LL) / den, 0LL, 65536LL);
+}
+
+void flow_matter_eval_radiance_rgb_q16(const FlowMatterState64 *matter,
+                                       const int32_t grad_h_q16[2],
+                                       int32_t laplacian_h_q16,
+                                       const int32_t bg_rgb_q16[3],
+                                       const int32_t light_delta_q16[2],
+                                       int32_t out_rgb_q16[3]) {
+    if (!out_rgb_q16) {
+        return;
+    }
+    int64_t bg[3] = {
+        bg_rgb_q16 ? (int64_t)bg_rgb_q16[0] : 32768LL,
+        bg_rgb_q16 ? (int64_t)bg_rgb_q16[1] : 32768LL,
+        bg_rgb_q16 ? (int64_t)bg_rgb_q16[2] : 32768LL
+    };
+    if (!matter) {
+        out_rgb_q16[0] = (int32_t)bg[0];
+        out_rgb_q16[1] = (int32_t)bg[1];
+        out_rgb_q16[2] = (int32_t)bg[2];
+        return;
+    }
+
+    int64_t gx = grad_h_q16 ? (int64_t)grad_h_q16[0] : 0LL;
+    int64_t gy = grad_h_q16 ? (int64_t)grad_h_q16[1] : 0LL;
+    int64_t relief = flow_lean_abi_eval_clamp((int64_t)matter->surface_relief_q16, 0LL, 131072LL);
+    gx = (gx * relief) / 65536LL;
+    gy = (gy * relief) / 65536LL;
+
+    /* 1. Surface Normal N = normalize(-gx, -gy, 1.0) -> cos_theta = N.z in Q16.16 */
+    int64_t g2 = (gx * gx + gy * gy) / 65536LL;
+    int64_t cos_theta = (65536LL * 65536LL) / (65536LL + g2 / 2LL);
+    int64_t f_theta = (int64_t)flow_matter_eval_fresnel_q16(matter, (int32_t)cos_theta);
+
+    /* 2. Complex refractive index skin-depth attenuation (continuous dielectric -> metal) */
+    int64_t kappa = flow_lean_abi_eval_clamp((int64_t)matter->extinction_kappa_q16, 0LL, 524288LL);
+    int64_t skin_trans = eval_pade_exp_neg_q16(kappa * 2LL);
+    int64_t transmit_weight = ((65536LL - f_theta) * skin_trans) / 65536LL;
+
+    /* 3. Beer-Lambert spectral volume transmittance + Mie subsurface back-scatter */
+    int64_t d_norm = flow_lean_abi_eval_clamp((int64_t)matter->thickness_mm_q16 / 8LL, 4096LL, 196608LL);
+    int64_t mu_s   = flow_lean_abi_eval_clamp((int64_t)matter->mie_scatter_q16, 0LL, 65536LL);
+    int64_t opt_path = (d_norm * (65536LL + mu_s / 2LL)) / 65536LL;
+
+    int64_t beer_rgb[3];
+    for (size_t c = 0U; c < 3U; ++c) {
+        int64_t mu_a = flow_lean_abi_eval_clamp((int64_t)matter->absorb_rgb_q16[c], 0LL, 262144LL);
+        beer_rgb[c] = eval_pade_exp_neg_q16((mu_a * opt_path) / 65536LL);
+    }
+
+    /* 4. 2-Jet Analytic Jacobian Caustics & Embedded Lattice Wire Occlusion */
+    int64_t caustic_gain = (int64_t)flow_matter_eval_caustic_gain_q16(matter, laplacian_h_q16);
+    int64_t wire_occ = flow_lean_abi_eval_clamp(
+        65536LL - ((int64_t)matter->lattice_wire_q16 * 45875LL) / 65536LL,
+        16384LL, 65536LL
+    );
+
+    /* 5. Micro-Pebble Softbox Light Vector Bending: u_bent = light_delta + 0.35 * grad_h */
+    int64_t lx = (light_delta_q16 ? (int64_t)light_delta_q16[0] : 0LL) + (gx * 22938LL) / 65536LL;
+    int64_t ly = (light_delta_q16 ? (int64_t)light_delta_q16[1] : 0LL) + (gy * 22938LL) / 65536LL;
+    int64_t l_dist2 = (lx * lx + ly * ly) / 65536LL;
+    int64_t softbox_spec = eval_pade_exp_neg_q16(l_dist2 * 3LL);
+
+    /* 6. Planck Blackbody Thermal Emission for T > 650K (molten silicate / lava) */
+    int64_t t_kelvin = (int64_t)matter->thermal_kelvin;
+    int64_t emit_r = 0LL, emit_g = 0LL, emit_b = 0LL;
+    if (t_kelvin > 650LL) {
+        int64_t excess = flow_lean_abi_eval_clamp(t_kelvin - 650LL, 0LL, 2000LL);
+        emit_r = (excess * 65536LL) / 700LL;
+        emit_g = (excess * excess * 65536LL) / (950LL * 950LL);
+        emit_b = (excess > 450LL) ? (((excess - 450LL) * 65536LL) / 1100LL) : 0LL;
+    }
+
+    for (size_t c = 0U; c < 3U; ++c) {
+        /* Transmitted & caustics-focused background + Mie turbid subsurface scatter */
+        int64_t trans_c = (bg[c] * beer_rgb[c]) / 65536LL;
+        trans_c = (trans_c * caustic_gain) / 65536LL;
+        int64_t sss_c = (beer_rgb[c] * mu_s * 24576LL) / (65536LL * 65536LL);
+        int64_t body_c = ((trans_c + sss_c) * wire_occ) / 65536LL;
+
+        /* Dielectric + Metallic complex Fresnel reflection */
+        int64_t refl_c = ((49152LL + softbox_spec) * f_theta) / 65536LL;
+        int64_t emit_c = (c == 0U) ? emit_r : ((c == 1U) ? emit_g : emit_b);
+
+        int64_t total_c = (body_c * transmit_weight) / 65536LL + refl_c + emit_c;
+        out_rgb_q16[c] = (int32_t)flow_lean_abi_eval_clamp(total_c, 0LL, 262144LL);
+    }
+}
+
+void flow_gpu_bus1k_update_slot64(FlowEngineBus1K *inout_bus,
+                                  uint32_t slot_id,
+                                  const void *block64) {
+    if (!inout_bus || !block64 || slot_id >= FLOW_ENGINE_BUS_SLOTS) {
+        return;
+    }
+    memcpy(&inout_bus->slots[slot_id], block64, sizeof(FlowEngineBus64));
+}
+
+void flow_gpu_bus1k_sync_svg_nodes(FlowEngineBus1K *inout_bus,
+                                   const FlowSvgUiNode64 *svg_nodes,
+                                   size_t node_count) {
+    if (!inout_bus || !svg_nodes) {
+        return;
+    }
+    size_t count = (node_count <= 8U) ? node_count : 8U;
+    for (size_t i = 0U; i < count; ++i) {
+        memcpy(&inout_bus->slots[FLOW_BUS_SLOT_SVG_UI_0 + i], &svg_nodes[i], sizeof(FlowSvgUiNode64));
+    }
+}
+
+void flow_cloud_room64_init(FlowCloudRoomDesc64 *out_room,
+                            uint32_t room_id,
+                            uint32_t map_block_count,
+                            uint32_t active_views,
+                            uint32_t tile_width_px,
+                            uint32_t tile_height_px,
+                            uint32_t sla_budget_us,
+                            uint64_t shared_world_hash) {
+    if (!out_room) {
+        return;
+    }
+    memset(out_room, 0, sizeof(*out_room));
+    out_room->room_id = room_id;
+
+    /* Round or clamp map_block_count to power-of-2 mask (2^k - 1) */
+    uint32_t pow2_blocks = 1U;
+    while (pow2_blocks < map_block_count && pow2_blocks < (1U << 30U)) {
+        pow2_blocks <<= 1U;
+    }
+    out_room->map_block_mask = pow2_blocks - 1U;
+
+    uint32_t views = (uint32_t)flow_lean_abi_eval_clamp((int64_t)active_views, 1LL, 16LL);
+    out_room->active_view_count = views;
+
+    /* Select minimal power-of-2 Tile-Atlas grid (cols x rows >= views) */
+    if (views == 1U) {
+        out_room->grid_cols = 1U;
+        out_room->grid_rows = 1U;
+    } else if (views == 2U) {
+        out_room->grid_cols = 2U;
+        out_room->grid_rows = 1U;
+    } else if (views <= 4U) {
+        out_room->grid_cols = 2U;
+        out_room->grid_rows = 2U;
+    } else if (views <= 8U) {
+        out_room->grid_cols = 4U;
+        out_room->grid_rows = 2U;
+    } else {
+        out_room->grid_cols = 4U;
+        out_room->grid_rows = 4U;
+    }
+
+    out_room->tile_width_px     = (tile_width_px > 0U) ? tile_width_px : 960U;
+    out_room->tile_height_px    = (tile_height_px > 0U) ? tile_height_px : 540U;
+    out_room->sla_budget_us     = (sla_budget_us > 0U) ? sla_budget_us : 8333U;
+    out_room->measured_frame_us = 0U;
+    out_room->lod_degrade_level = 0U;
+    out_room->active_seat_mask  = (views >= 16U) ? 0xFFFFU : ((1U << views) - 1U);
+    out_room->egress_stream_fmt = FLOW_STREAM_FMT_YUV420P_PIPE;
+    out_room->shared_world_hash = shared_world_hash;
+    out_room->room_mac = flow_capsule64_calc_mac(out_room, 0x434C4F5544524D36ULL);
+}
+
+uint32_t flow_cloud_room64_route_pixel_to_seat(const FlowCloudRoomDesc64 *room,
+                                               uint32_t atlas_x_px,
+                                               uint32_t atlas_y_px,
+                                               int32_t *out_local_ndc_x_q16,
+                                               int32_t *out_local_ndc_y_q16) {
+    if (out_local_ndc_x_q16) *out_local_ndc_x_q16 = 0;
+    if (out_local_ndc_y_q16) *out_local_ndc_y_q16 = 0;
+    if (!room || room->tile_width_px == 0U || room->tile_height_px == 0U ||
+        room->grid_cols == 0U || room->grid_rows == 0U) {
+        return 0xFFFFFFFFU;
+    }
+    uint32_t col_idx = atlas_x_px / room->tile_width_px;
+    uint32_t row_idx = atlas_y_px / room->tile_height_px;
+    if (col_idx >= room->grid_cols || row_idx >= room->grid_rows) {
+        return 0xFFFFFFFFU;
+    }
+    uint32_t seat_idx = row_idx * room->grid_cols + col_idx;
+    if (seat_idx >= 16U || ((room->active_seat_mask >> seat_idx) & 1U) == 0U) {
+        return 0xFFFFFFFFU;
+    }
+
+    uint32_t local_x = atlas_x_px % room->tile_width_px;
+    uint32_t local_y = atlas_y_px % room->tile_height_px;
+    int64_t ndc_x = (((int64_t)local_x * 131072LL) / (int64_t)room->tile_width_px) - 65536LL;
+    int64_t ndc_y = (((int64_t)local_y * 131072LL) / (int64_t)room->tile_height_px) - 65536LL;
+    if (out_local_ndc_x_q16) {
+        *out_local_ndc_x_q16 = (int32_t)flow_lean_abi_eval_clamp(ndc_x, -65536LL, 65536LL);
+    }
+    if (out_local_ndc_y_q16) {
+        *out_local_ndc_y_q16 = (int32_t)flow_lean_abi_eval_clamp(ndc_y, -65536LL, 65536LL);
+    }
+    return seat_idx;
+}
+
+uint32_t flow_cloud_room64_step_sla_governor(FlowCloudRoomDesc64 *inout_room,
+                                             uint32_t measured_frame_us) {
+    if (!inout_room) {
+        return 0U;
+    }
+    inout_room->measured_frame_us = measured_frame_us;
+    uint32_t budget = (inout_room->sla_budget_us > 0U) ? inout_room->sla_budget_us : 8333U;
+    int64_t lod = (int64_t)inout_room->lod_degrade_level;
+    if (measured_frame_us > budget) {
+        lod = flow_lean_abi_eval_clamp(lod + 1LL, 0LL, 3LL);
+    } else if (measured_frame_us < (budget * 3U) / 4U && lod > 0LL) {
+        lod = flow_lean_abi_eval_clamp(lod - 1LL, 0LL, 3LL);
+    }
+    inout_room->lod_degrade_level = (uint32_t)lod;
+    inout_room->room_mac = flow_capsule64_calc_mac(inout_room, 0x434C4F5544524D36ULL);
+    return inout_room->lod_degrade_level;
+}

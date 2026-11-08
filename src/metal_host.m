@@ -126,6 +126,18 @@ static NSString *load_metal_shader_with_ssot_abi(NSError **error) {
     NSString *abiSrc = [NSString stringWithContentsOfFile:@"include/flow_gpu_abi.h"
                                                  encoding:NSUTF8StringEncoding
                                                     error:error];
+    NSString *sdfSrc = [NSString stringWithContentsOfFile:@"include/gpu/flow_sdf_ops.h"
+                                                 encoding:NSUTF8StringEncoding
+                                                    error:error];
+    NSString *matSrc = [NSString stringWithContentsOfFile:@"include/gpu/flow_matter_optics.h"
+                                                 encoding:NSUTF8StringEncoding
+                                                    error:error];
+    NSString *moodSrc = [NSString stringWithContentsOfFile:@"include/gpu/flow_mood_stages.h"
+                                                  encoding:NSUTF8StringEncoding
+                                                     error:error];
+    NSString *uiSrc = [NSString stringWithContentsOfFile:@"include/gpu/flow_svg_ui_pass.h"
+                                                encoding:NSUTF8StringEncoding
+                                                   error:error];
     NSString *shaderSrc = [NSString stringWithContentsOfFile:@"src/shaders.metal"
                                                     encoding:NSUTF8StringEncoding
                                                        error:error];
@@ -135,9 +147,41 @@ static NSString *load_metal_shader_with_ssot_abi(NSError **error) {
         abiSrc = [abiSrc stringByReplacingOccurrencesOfString:@"#include \"flow_shader_portability.h\""
                                                    withString:portSrc];
     }
+    if (sdfSrc) {
+        sdfSrc = [sdfSrc stringByReplacingOccurrencesOfString:@"#include \"flow_gpu_abi.h\""
+                                                   withString:@""];
+    }
+    if (matSrc) {
+        matSrc = [matSrc stringByReplacingOccurrencesOfString:@"#include \"gpu/flow_sdf_ops.h\""
+                                                   withString:@""];
+    }
+    if (moodSrc) {
+        moodSrc = [moodSrc stringByReplacingOccurrencesOfString:@"#include \"gpu/flow_sdf_ops.h\""
+                                                     withString:@""];
+    }
+    if (uiSrc) {
+        uiSrc = [uiSrc stringByReplacingOccurrencesOfString:@"#include \"gpu/flow_sdf_ops.h\""
+                                                 withString:@""];
+    }
     if (abiSrc) {
-        return [shaderSrc stringByReplacingOccurrencesOfString:@"#include \"flow_gpu_abi.h\""
-                                                    withString:abiSrc];
+        shaderSrc = [shaderSrc stringByReplacingOccurrencesOfString:@"#include \"flow_gpu_abi.h\""
+                                                         withString:abiSrc];
+    }
+    if (sdfSrc) {
+        shaderSrc = [shaderSrc stringByReplacingOccurrencesOfString:@"#include \"gpu/flow_sdf_ops.h\""
+                                                         withString:sdfSrc];
+    }
+    if (matSrc) {
+        shaderSrc = [shaderSrc stringByReplacingOccurrencesOfString:@"#include \"gpu/flow_matter_optics.h\""
+                                                         withString:matSrc];
+    }
+    if (moodSrc) {
+        shaderSrc = [shaderSrc stringByReplacingOccurrencesOfString:@"#include \"gpu/flow_mood_stages.h\""
+                                                         withString:moodSrc];
+    }
+    if (uiSrc) {
+        shaderSrc = [shaderSrc stringByReplacingOccurrencesOfString:@"#include \"gpu/flow_svg_ui_pass.h\""
+                                                         withString:uiSrc];
     }
     return shaderSrc;
 }

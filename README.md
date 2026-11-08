@@ -1,14 +1,20 @@
 # BLOOM — 64-Byte 定點物理光學、程序化資產與影視預演引擎
 
-**BLOOM**（原專案代號 `flow_game`）是一套以 100% 純 C17（`-std=c17 -Wall -Wextra -Werror -O2`）與 Apple Metal 建構的**定點物理模擬、程序化 SDF/CSG 幾何渲染、64-Byte UI 排版與影視預演（Previz）管線基礎庫**，底層建構於 [`FLOW`](../FLOW)（`libflow_rt.a`）與 `Ricardian`（[`include/ricardian.h`](include/ricardian.h)）。
+**BLOOM**（原專案代號 `flow_game`）是 [`FLOW`](../FLOW) 在 GPU 與空間流形上的對偶（Dual）——一套以 100% 純 C17（`-std=c17 -Wall -Wextra -Werror -O2`）與跨平台 Single-Source GPU 算子（[`include/gpu/`](include/gpu) + Apple Metal / Vulkan / WebGPU）建構的 **64-Byte 空間場論、本構物理光學（Constitutive Matter Optics）、程序化 SDF/CSG 幾何、64-Byte 向量 UI 與影視預演（Previz）協處理器基礎庫（`libbloom.a`）**，底層建構於 [`FLOW`](../FLOW)（`libflow_rt.a`）與 `Ricardian`（[`include/ricardian.h`](include/ricardian.h)）。
 
 ---
 
 ## 專案架構與設計核心
 
-BLOOM 採用 **「算子與參數分離」** 的設計模式：將底層物理運動、光學折射與微分幾何固定為預編譯的 C17 / Metal 算子，並將場景資產、材質風格、攝影機鏡位與介面節點統一表達為 **`64-Byte (128-Hex)` Cache-Line 對齊描述子（Descriptors）**，在執行期直接路由而無須重新編譯或載入大型外部貼圖資產：
+BLOOM 採用 **「算子與參數分離（Operator-Parameter Separation）」** 與 **「從物性推導視覺（Physics-to-Vision）」** 的設計模式：既不是綁定 2D 盒模型與系統 Widget 狀態樹的傳統 GUI 框架，也不是依賴數十 GB 多邊形貼圖資產的巨石型遊戲引擎，而是將連續介質力學、光學折射與微分幾何固定為可形式化證明的 C17 / GPU 算子，並將所有場景資產、物質本構狀態、攝影機鏡位與介面節點統一收斂為 **`64-Byte (128-Hex)` Cache-Line 對齊描述子（Descriptors）**：
 
 - **100% Pure C17 / Zero Float Drift / Zero Heap**：核心模擬邏輯皆為純 C17（`FloatOps: 0 | HeapCalls: 0`），採用 Q16.16 / Q48.16 定點數與 2-Jet 自動微分（`FlowJet2`），確保跨平台、跨執行緒與網路同步具備 **Bit-for-Bit 確定性**，並編譯為靜態函式庫 `build/libbloom.a` 供下游專案直接連結。
+- **64-Byte 物質本構光學算子 (`FlowMatterState64` / `include/gpu/flow_matter_optics.h`)**：
+  - 廢除傳統繪圖引擎硬編碼的「材質分類（Glass / Water / Jade / Metal）」物件概念，將真空、流體、玻璃、玉石、液態金屬與高溫熔岩統一表達為單一 64-Byte 連續物性狀態向量（`FlowMatterState64`：質量密度 $\rho$、複折射率 $\eta + i\kappa$、黏滯淬火度 $\mu_{\text{visc}}$、2-Jet 表面曲率起伏 $\|\nabla h, \nabla^2 h\|$、微表面粗糙度 $\sigma_r$、體積米氏散射 $\mu_s$、Beer-Lambert 光譜吸收係數 $\mu_a$、內部晶格/夾絲密度 $\Lambda$、厚度 $d$ 與熱力學溫度 $T$）。
+  - 透過單一無分支（Branchless）物理光學算子（CPU 端 `flow_matter_eval_radiance_rgb_q16` 與 GPU 端 `eval_constitutive_matter_optics64`），直接由 Gladstone-Dale 密度折射定律、複數 Fresnel 反射、2-Jet 雅可比行列式解析焦散（Analytic Jacobian Caustics）、12-Tap 黃金角 Vogel 均質散射與 Planck 黑體輻射推導出視覺表現，並支援 `128-Hex` 帶 MAC 驗證之跨行程 Wire Protocol 序列化（`flow_matter_state64_format_hex128` / `flow_matter_state64_parse_hex128`）。
+- **跨平台 Single-Source GPU 算子模組化 (`include/flow_shader_portability.h` / `include/gpu/*.h`)**：
+  - 透過跨 GPU 位址空間巨集（`FLOW_CONST_REF`、`FLOW_THREAD_CREF`、`FLOW_OUT_F32`）與無須 64-bit 整數硬體支援之雙 32-bit Wave64 子群組遮罩算子（`flow_wave64_mask_test_u32x2`），將核心 GPU 數學算子拆解為 4 個平台無關的 Single-Source 標頭檔：[`include/gpu/flow_sdf_ops.h`](include/gpu/flow_sdf_ops.h)（SDF/CSG/BVH/對偶四元數骨骼）、[`include/gpu/flow_matter_optics.h`](include/gpu/flow_matter_optics.h)（64B 物性光學與 Chladni 駐波場）、[`include/gpu/flow_mood_stages.h`](include/gpu/flow_mood_stages.h)（程序化物理光學舞台）與 [`include/gpu/flow_svg_ui_pass.h`](include/gpu/flow_svg_ui_pass.h)（64B 向量 UI 與 LaTeX SDF 合成）。
+  - 平台綁定層 [`src/shaders.metal`](src/shaders.metal) 僅保留 137 行薄封裝（Thin Host Entry Wrapper），且 `FlowEngineBus1K` 槽位打包完全收斂至純 C17（`flow_gpu_bus1k_update_slot64`、`flow_gpu_bus1k_sync_svg_nodes`），可無縫映射至 Metal、Vulkan、DirectX 12 與 WebGPU。
 - **零編譯期 `.lean` $\leftrightarrow$ `FLOW` 64-Byte ABI 直接路由 (`include/flow_lean_abi.h`)**：
   - 執行期直接解析 `research/*.lean` 形式化規格檔（`flow_lean_abi_load_file`），提取常數與狀態轉移條件並綁定為 64-byte `FlowLeanClause64` 算子描述子。
   - 直接驅動底層 `FLOW` 核心算子（`FlowAbiPoly1D_eval_hysteresis` + `flow_cubical_step_neighbor` Kan 同倫驗證、`flow_jet2_ema_step` 二階阻尼、守恆比例拆分、區間鉗制與配額閘門），無須在 C 端重複手寫 `if/else` 膠水碼。
@@ -24,7 +30,10 @@ BLOOM 採用 **「算子與參數分離」** 的設計模式：將底層物理�
 - **統一 64-Byte 記憶體映射 `.flow` 容器與雙軌串流色域輸出介面 (`include/flow_image64.h` / `FlowStreamEgress64`)**：
   - 將分散的設定檔（TOML）、結構化資料（JSON/CSV）與視覺/3D 預製件（PDF/SVG/GLB/骨骼/BVH/SDF 磚）統一收斂為單一 2 的冪次方 64-Byte 快取線區塊陣列（`FlowImageHeader64` + `FlowImageBlock64`）。
   - 支援 `flow_image64_mmap_readonly` 零解析（Zero-Parse / Zero-Malloc）直接記憶體映射、`flow_image64_get_block_masked`（$\mathbb{Z}/2^k\mathbb{Z}$ 位元遮罩）與網路分片邊下邊播組裝（`flow_image64_stream_ingest_block`），保證亂序或損毀偏移量下 `0` 越界 Segfault，且相容 `-ffreestanding` 裸機環境。
-  - **64-Byte 串流與色域輸出閘門 (`FlowStreamEgress64`)**：引擎內部統一以物理色溫（Kelvin）與感知正交空間 **OKLab (`Q16.16`)** 運算，輸出邊界透過 `flow_stream_egress64_map_oklab_to_rgb_q16`（支援 `ITU-R BT.709 / sRGB`、`Display P3`、`ITU-R BT.2020 PQ`、`ACEScg`，D65 白點嚴格守恆）與 `flow_stream_egress64_rgb_to_yuv420_bt709`（Studio-Swing `YCbCr`）轉譯至外部直播或影視管線。
+  - **64-Byte 串流與色域輸出閘門 (`FlowStreamEgress64`)**：引擎內部統一以物理色溫（Kelvin）與感知正交空間 **OKLab (`Q16.16`)** 運算，輸出邊界透過 `flow_stream_egress64_map_oklab_to_rgb_q16`（支援 `ITU-R BT.709 / sRGB`、`Display P3`、`ITU-R BT.2020 PQ`、`ACEScg`，D65 白點嚴格守恆）、`flow_stream_egress64_rgb_to_yuv420_bt709`（Studio-Swing `YCbCr`）與 `flow_stream_egress64_encode_kitty_rgb24`（Kitty Graphics Protocol APC 終端機畫面串流，相容 Ghostty / `rex` / Kitty 內嵌渲染）轉譯至外部直播、影視或 Agent 終端管線。
+- **64-Byte 雲端同房多視角共算微容器 (`FlowCloudRoomDesc64` / Multi-View Tile-Atlas Isolate)**：
+  - 採用「外層標準 Docker 隔離實體 GPU 節點、內層 `BLOOM` 隔離遊戲房間（Room Isolate）」的雙層容器架構：單一房間共享唯一一份 `s0_core` 世界流形、[`FlowEngineBus1K`](include/flow_gpu_abi.h)（`1 KB` 地圖 CSG/BVH/物性）與 `.flow` `MAP_SHARED` 唯讀地圖（$\mathbb{Z}/2^k\mathbb{Z}$ 遮罩防越界）。
+  - 透過 `FlowCloudRoomDesc64`（`flow_cloud_room64_init`、`flow_cloud_room64_route_pixel_to_seat` 與 GPU 端 `eval_cloud_room_tile_seat_and_uv`）將同房最多 16 名玩家的獨立視角（`FlowGpuSlice1Camera64`）路由至單趟 GPU Tile-Atlas 網格共算，並內建 `< 8.33ms` 鄰居噪音自動 LOD 降級熔斷器（`flow_cloud_room64_step_sla_governor`）。
 - **64-Byte Cache-Line Univalence 與 $O(1)$ 狀態回滾**：引擎狀態、Prefab 資產（`FlowPrefabDesc64`）、色票配置（`FlowMoodboardPrefab64`）、攝影機分鏡（`FlowCinemaShot64`）與 GPU ABI 均對齊 64-byte Cache Line，支援透過 64B Shadow 雙緩衝進行常數時間狀態回滾（Atomic Rollback）。
 - **統一 64-Byte Engine Bus (`FlowEngineBus1K`)**：CPU 主機端與 GPU 管線透過 16 個 64B 槽位（共 `1024 Bytes`）直接映射至 Metal / Vulkan `buffer(3)`。
 - **程序化 CSG/SDF 舞台與參考圖色票萃取 (`FlowMoodboardPrefab64`)**：
@@ -48,7 +57,7 @@ BLOOM 採用 **「算子與參數分離」** 的設計模式：將底層物理�
 #### 快速建置指令
 
 ```bash
-# 編譯所有模組並執行 8 道驗證閘門（Gate 0 FLOWY 跨層稽核 + Gate 1..6 共 55 項單元測試 + Gate 7 4K Metal 基準測試）
+# 編譯所有模組並執行 8 道驗證閘門（Gate 0 FLOWY 跨層稽核 + Gate 1..6 共 64 項單元測試 + Gate 7 4K Metal 基準測試）
 make test
 
 # 僅編譯核心二進位執行檔（build/bloom）
@@ -116,7 +125,7 @@ make clean
 ```bash
 ./build/test-bloom              # Gate 1：連續碰撞防穿隧、相對論度規、UDP 快照、QSBR 與調速器 (10 項測試)
 ./build/test-prefab-ssot        # Gate 2：64B CSG/SDF 預製件、材質參數與參考圖轉 Prefab (9 項測試)
-./build/test-procedural-assets  # Gate 3：程序化幾何、對偶四元數骨骼蒙皮、BVH、SDF 體素磚、雙軌色域串流、SVG HUD (9 項測試)
+./build/test-procedural-assets  # Gate 3：程序化幾何、對偶四元數骨骼、BVH、SDF 磚、本構物性光學、128-Hex、Kitty Egress 與雲端同房共算 (18 項測試)
 ./build/test-cine-camera        # Gate 4：FlowCineRig64 攝影機、薄透鏡景深、24fps EDL 與 48kHz 鎖幀 (7 項測試)
 ./build/test-wallpaper-engine   # Gate 5：動態桌布雙門檻遲滯休眠、低電量調速與 Web 匯出 (5 項測試)
 ./build/test-svg-ui             # Gate 6：宣告式 64B SVG-UI、Flexbox 排版、通用暫存器、文字輸入、LaTeX SDF 與過場控制 (15 項測試)
@@ -185,4 +194,15 @@ flow_director_trigger_scene_transition64(&director, 3U, FLOW_STAGE_LAYER_1_RELAT
 
 /* (F) 固定步長物理與渲染解耦步進：在不同目標顯示幀率下維持物理狀態 Bit-Identical */
 uint32_t substeps = flow_game_step_fixed_accumulator(&engine, measured_frame_us, &accum_us, &alpha_q16);
+
+/* (G) [物性推導視覺 & 128-Hex 協議] 初始化 64B 物質本構狀態、推導輻射亮度並序列化為 128-Hex 封包 */
+flow_matter_state64_init(&matter, 1U, 0, 0, 65536, 42598, 22938, 19660, absorb_rgb, 32768, 524288, 295U, 2500U);
+flow_matter_eval_radiance_rgb_q16(&matter, grad_h, laplacian_h, bg_rgb, light_delta, out_rgb_q16);
+flow_matter_state64_format_hex128(&matter, matter_hex128);
+flow_gpu_bus1k_update_slot64(&bus1k, FLOW_BUS_SLOT_MATTER_STATE, &matter);
+
+/* (H) [雲端同房多視角共算] 初始化 64B 房間隔離描述子、Tile-Atlas 視角路由與 SLA 降級調速器 */
+flow_cloud_room64_init(&room, 0xCAFEBABEU, 0x0FFFE000ULL, 0x0FFU, 4U, 960U, 540U);
+uint32_t seat_idx = flow_cloud_room64_route_pixel_to_seat(&room, px, py, &local_x, &local_y);
+flow_cloud_room64_step_sla_governor(&room, seat_idx, measured_gpu_us);
 ```

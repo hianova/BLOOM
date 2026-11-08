@@ -1371,9 +1371,9 @@ static void test_fps120_hysteresis_governor(void) {
 
 int main(void) {
     assert(BLOOM_VERSION_MAJOR == 1U);
-    assert(BLOOM_VERSION_MINOR == 1U);
+    assert(BLOOM_VERSION_MINOR == 3U);
     assert(BLOOM_VERSION_PATCH == 0U);
-    assert(strcmp(BLOOM_VERSION_STRING, "1.1.0") == 0);
+    assert(strcmp(BLOOM_VERSION_STRING, "1.3.0") == 0);
 
     printf("================================================================================\n");
     printf("  BLOOM v%s: Deterministic C17 Verification Suite (Zero Float/Double)\n", BLOOM_VERSION_STRING);

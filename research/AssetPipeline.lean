@@ -165,4 +165,85 @@ theorem stream_bt709_luma_bounded (rawY : Int) :
   · omega
   · split <;> omega
 
+/-- 10. 64-Byte Constitutive Physical Matter State (`FlowMatterState64`):
+        Gladstone-Dale IOR Lower Bound & Complex Fresnel Energy Conservation (`F0 <= 1`). -/
+def evalGladstoneDaleEta (densityKgM3 : Nat) : Nat :=
+  q16One + 14 * densityKgM3
+
+def evalComplexFresnelNum (dmSq kSq : Nat) : Nat :=
+  dmSq + kSq
+
+def evalComplexFresnelDen (dmSq fourEta kSq : Nat) : Nat :=
+  dmSq + fourEta + kSq
+
+theorem gladstone_dale_eta_ge_vacuum (densityKgM3 : Nat) :
+    q16One <= evalGladstoneDaleEta densityKgM3 := by
+  unfold evalGladstoneDaleEta q16One
+  omega
+
+theorem gladstone_dale_vacuum_identity :
+    evalGladstoneDaleEta 0 = q16One := by
+  unfold evalGladstoneDaleEta q16One
+  rfl
+
+theorem complex_fresnel_energy_conserving (dmSq fourEta kSq : Nat) :
+    evalComplexFresnelNum dmSq kSq <= evalComplexFresnelDen dmSq fourEta kSq := by
+  unfold evalComplexFresnelNum evalComplexFresnelDen
+  omega
+
+theorem complex_fresnel_vacuum_zero :
+    evalComplexFresnelNum 0 0 = 0 := by
+  unfold evalComplexFresnelNum
+  rfl
+
+/-- 11. 64-Byte Cloud Room Isolate & Multi-View Tile-Atlas (`FlowCloudRoomDesc64`):
+        Tile-Atlas Capacity Sufficiency & <8.33ms SLA LOD Circuit-Breaker Bounds. -/
+def cloudRoomClampViews (activeViews : Nat) : Nat :=
+  if activeViews <= 1 then 1
+  else if activeViews >= 16 then 16
+  else activeViews
+
+def cloudRoomAtlasCapacity (clampedViews : Nat) : Nat :=
+  if clampedViews <= 1 then 1
+  else if clampedViews <= 2 then 2
+  else if clampedViews <= 4 then 4
+  else if clampedViews <= 8 then 8
+  else 16
+
+def cloudRoomStepLod (curLod measuredUs budgetUs : Nat) : Nat :=
+  if measuredUs > budgetUs then
+    if curLod + 1 >= 3 then 3 else curLod + 1
+  else if measuredUs * 4 < budgetUs * 3 ∧ curLod > 0 then
+    if curLod - 1 >= 3 then 3 else curLod - 1
+  else
+    if curLod >= 3 then 3 else curLod
+
+theorem cloud_room_clamp_views_bounded (activeViews : Nat) :
+    1 <= cloudRoomClampViews activeViews ∧ cloudRoomClampViews activeViews <= 16 := by
+  unfold cloudRoomClampViews
+  split
+  · omega
+  · split <;> omega
+
+theorem cloud_room_atlas_capacity_sufficient (clampedViews : Nat) (h : clampedViews <= 16) :
+    clampedViews <= cloudRoomAtlasCapacity clampedViews ∧
+    cloudRoomAtlasCapacity clampedViews <= 16 := by
+  unfold cloudRoomAtlasCapacity
+  split
+  · omega
+  · split
+    · omega
+    · split
+      · omega
+      · split <;> omega
+
+theorem cloud_room_lod_governor_bounded (curLod measuredUs budgetUs : Nat) :
+    cloudRoomStepLod curLod measuredUs budgetUs <= 3 := by
+  unfold cloudRoomStepLod
+  split
+  · split <;> omega
+  · split
+    · split <;> omega
+    · split <;> omega
+
 end Bloom.AssetPipeline

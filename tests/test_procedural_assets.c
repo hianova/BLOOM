@@ -910,8 +910,125 @@ int main(void) {
     printf("  ✓ Verified D65 Gamut Matrix (Rec.709/P3/Rec.2020), BT.709 YUV420p (Y=%u,U=%u,V=%u) & 8-Block .flow Stream!\n",
            y_w, u_w, v_w);
 
+    /* 17. 64B Constitutive Physical Matter State (FlowMatterState64) & Branchless Physics-to-Vision Optics */
+    printf("[Test 17/17] 64B Constitutive Physical Matter State & Branchless Optical Operator...\n");
+    assert(sizeof(FlowMatterState64) == 64U && _Alignof(FlowMatterState64) == 64U);
+
+    FlowMatterState64 m_air, m_glass, m_jade, m_mercury, m_magma;
+    int32_t zero_abs[3]  = { 0, 0, 0 };
+    int32_t glass_abs[3] = { 9175, 2621, 5242 };    /* Low-iron green silicate absorption */
+    int32_t jade_abs[3]  = { 98304, 7864, 72089 };  /* Emerald jadeite Cr3+ absorption */
+    int32_t magma_abs[3] = { 131072, 163840, 196608 };
+
+    /* 17a. Gladstone-Dale auto-IOR derivation (ior_eta_q16 = 0 -> derived from density_kg_m3) */
+    flow_matter_state64_init(&m_air,     1U, 65536,  0,      0,     16384, 0,     0,     zero_abs,  0,     65536,  295U,  1U);
+    flow_matter_state64_init(&m_glass,   2U, 0,      0,      65536, 49152, 29491, 5242,  glass_abs, 58982, 524288, 295U,  2500U);
+    flow_matter_state64_init(&m_jade,    3U, 108789, 0,      65536, 26214, 19660, 49152, jade_abs,  0,     917504, 295U,  3340U);
+    flow_matter_state64_init(&m_mercury, 4U, 106168, 314572, 13107, 52428, 3276,  0,     zero_abs,  0,     655360, 295U,  13534U);
+    flow_matter_state64_init(&m_magma,   5U, 104857, 19660,  39321, 58982, 32768, 26214, magma_abs, 16384, 786432, 1450U, 2700U);
+
+    assert(m_glass.ior_eta_q16 == 65536 + 2500 * 14); /* Gladstone-Dale: 100536 (~1.534) */
+    assert(m_glass.matter_mac != 0ULL && m_mercury.matter_mac != 0ULL);
+
+    /* 17b. Complex Fresnel (\eta + i\kappa) continuous transition: Air -> Glass -> Mercury */
+    int32_t f0_air     = flow_matter_eval_fresnel_q16(&m_air,     65536);
+    int32_t f90_air    = flow_matter_eval_fresnel_q16(&m_air,     0);
+    int32_t f0_glass   = flow_matter_eval_fresnel_q16(&m_glass,   65536);
+    int32_t f0_mercury = flow_matter_eval_fresnel_q16(&m_mercury, 65536);
+    assert(f0_air == 0 && f90_air == 65536);
+    assert(f0_glass > 2500 && f0_glass < 3500);     /* ~4.4% normal reflectance for silicate glass */
+    assert(f0_mercury > 45000 && f0_mercury <= 65536); /* >68% metallic reflectance from \kappa! */
+
+    /* 17c. Homogenized Vogel scattering radius & 2-Jet Jacobian caustic amplification */
+    int32_t r_air   = flow_matter_eval_vogel_radius_q16(&m_air);
+    int32_t r_glass = flow_matter_eval_vogel_radius_q16(&m_glass);
+    int32_t r_jade  = flow_matter_eval_vogel_radius_q16(&m_jade);
+    assert(r_air == 0 && r_glass > 0 && r_jade > r_glass);
+
+    int32_t c_flat  = flow_matter_eval_caustic_gain_q16(&m_glass, 0);
+    int32_t c_crest = flow_matter_eval_caustic_gain_q16(&m_glass, 49152); /* Convex wave/pebble crest */
+    assert(c_flat == 65536 && c_crest > 65536);
+
+    /* 17d. Branchless Constitutive Radiance Evaluator across all phases */
+    int32_t grad_h[2] = { 8192, -6144 };
+    int32_t bg_rgb[3] = { 49152, 52428, 45875 };
+    int32_t l_del[2]  = { 4096, 4096 };
+    int32_t rad_glass[3], rad_jade[3], rad_mercury[3], rad_magma[3];
+
+    flow_matter_eval_radiance_rgb_q16(&m_glass,   grad_h, 32768, bg_rgb, l_del, rad_glass);
+    flow_matter_eval_radiance_rgb_q16(&m_jade,    grad_h, 32768, bg_rgb, l_del, rad_jade);
+    flow_matter_eval_radiance_rgb_q16(&m_mercury, grad_h, 32768, bg_rgb, l_del, rad_mercury);
+    flow_matter_eval_radiance_rgb_q16(&m_magma,   grad_h, 32768, bg_rgb, l_del, rad_magma);
+
+    /* Jadeite Cr3+ Beer-Lambert + Mie SSS preserves green channel (G > R, G > B) */
+    assert(rad_jade[1] > rad_jade[0] && rad_jade[1] > rad_jade[2]);
+    /* 1450K Molten Magma Planck blackbody emission produces incandescent R > G > B */
+    assert(rad_magma[0] > rad_magma[1] && rad_magma[1] > rad_magma[2] && rad_magma[0] > 65536);
+    /* Liquid Mercury specular reflection is high-intensity across all channels */
+    assert(rad_mercury[0] > 50000 && rad_mercury[1] > 50000 && rad_mercury[2] > 50000);
+
+    /* 17e. 128-Hex Wire Protocol round-trip & MAC tamper rejection for FlowMatterState64 */
+    char hex128[129];
+    FlowMatterState64 m_decoded;
+    flow_matter_state64_format_hex128(&m_jade, hex128);
+    assert(strlen(hex128) == 128U);
+    assert(flow_matter_state64_parse_hex128(hex128, &m_decoded));
+    assert(memcmp(&m_jade, &m_decoded, sizeof(FlowMatterState64)) == 0);
+    /* Flip 1 nibble in payload -> MAC check must reject tampered 128-Hex */
+    hex128[10] = (hex128[10] == 'a') ? 'b' : 'a';
+    assert(!flow_matter_state64_parse_hex128(hex128, &m_decoded));
+
+    /* 17f. Kitty Graphics Protocol APC terminal egress encoder (Ghostty / Rex / Agent TUI) */
+    uint8_t mini_rgb[2 * 2 * 3] = {
+        255, 0, 0,   0, 255, 0,
+        0, 0, 255,   255, 255, 255
+    };
+    char kitty_apc[128];
+    size_t kitty_len = flow_stream_egress64_encode_kitty_rgb24(mini_rgb, 2U, 2U, kitty_apc, sizeof(kitty_apc));
+    assert(kitty_len > 20U);
+    assert(strncmp(kitty_apc, "\x1b_Ga=T,f=24,s=2,v=2,q=2;", 24U) == 0);
+    assert(kitty_apc[kitty_len - 2U] == '\x1b' && kitty_apc[kitty_len - 1U] == '\\');
+
+    printf("  ✓ Verified Gladstone-Dale IOR, Complex Fresnel (Air=%d, Glass=%d, Mercury=%d Q16), 2-Jet Caustics, 128-Hex MAC & Kitty TUI Egress!\n",
+           f0_air, f0_glass, f0_mercury);
+
+    /* ====================================================================
+     * Test 18: 64B Cloud Room Isolate & Multi-View Tile-Atlas Router
+     * ==================================================================== */
+    printf("[Test 18/18] 64B Cloud Room Isolate & Multi-View Tile-Atlas Router (FlowCloudRoomDesc64)...\n");
+    assert(sizeof(FlowCloudRoomDesc64) == 64U);
+    assert(_Alignof(FlowCloudRoomDesc64) == 64U);
+
+    FlowCloudRoomDesc64 room10;
+    /* 10-player match (e.g. CS / LoL 5v5 room): 64 map blocks, 960x540 per player tile, 8333us SLA */
+    flow_cloud_room64_init(&room10, 42U, 64U, 10U, 960U, 540U, 8333U, 0xCAFEBABE12345678ULL);
+    assert(room10.map_block_mask == 63U);
+    assert(room10.active_view_count == 10U);
+    assert(room10.grid_cols == 4U && room10.grid_rows == 4U);
+    assert(room10.active_seat_mask == 0x03FFU); /* Seats 0..9 occupied, 10..15 empty */
+    assert(room10.room_mac != 0ULL);
+
+    /* Seat 0 center pixel (480, 270) -> seat 0, NDC (0, 0) */
+    int32_t ndc_x = 0, ndc_y = 0;
+    uint32_t s0 = flow_cloud_room64_route_pixel_to_seat(&room10, 480U, 270U, &ndc_x, &ndc_y);
+    assert(s0 == 0U && ndc_x == 0 && ndc_y == 0);
+
+    /* Seat 9 (row 2, col 1 -> x in [960..1919], y in [1080..1619]) */
+    uint32_t s9 = flow_cloud_room64_route_pixel_to_seat(&room10, 960U + 480U, 1080U + 270U, &ndc_x, &ndc_y);
+    assert(s9 == 9U && ndc_x == 0 && ndc_y == 0);
+
+    /* Unoccupied Seat 10 (row 2, col 2) -> returns 0xFFFFFFFFU */
+    uint32_t s10 = flow_cloud_room64_route_pixel_to_seat(&room10, 1920U + 100U, 1080U + 100U, &ndc_x, &ndc_y);
+    assert(s10 == 0xFFFFFFFFU);
+
+    /* Noisy-neighbor < 8.33ms SLA circuit-breaker LOD stepping & recovery */
+    assert(flow_cloud_room64_step_sla_governor(&room10, 9500U) == 1U);
+    assert(flow_cloud_room64_step_sla_governor(&room10, 11000U) == 2U);
+    assert(flow_cloud_room64_step_sla_governor(&room10, 5000U) == 1U); /* < 75% budget -> recovers 1 step */
+    printf("  ✓ Verified 10-Player Shared-Room 4x4 Tile-Atlas Routing, Z/2^kZ Map Mask & <8.33ms SLA Circuit-Breaker!\n");
+
     printf("====================================================================\n");
-    printf("✓ ALL 16 PROCEDURAL, LEAN-ABI, ASSET & STREAM TESTS PASSED (100%% SOUND)\n");
+    printf("✓ ALL 18 PROCEDURAL, LEAN-ABI, ASSET, MATTER & CLOUD ROOM TESTS PASSED\n");
     printf("====================================================================\n");
     return 0;
 }

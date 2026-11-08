@@ -247,4 +247,86 @@ void flow_stream_egress64_rgb_to_yuv420_bt709(const int32_t rgb_q16[3],
                                               uint8_t *out_u,
                                               uint8_t *out_v);
 
+size_t flow_stream_egress64_encode_kitty_rgb24(const uint8_t *rgb24_pixels,
+                                               uint32_t width,
+                                               uint32_t height,
+                                               char *out_buf,
+                                               size_t max_buf_len);
+
+/*
+ * 9. 64-Byte Constitutive Physical Matter State & Branchless Optical Operator API
+ * Derives visual appearance directly from continuum mechanics & electrodynamics
+ * without semantic "Material Classes" (Glass / Water / Jade / Metal / Lava).
+ */
+void flow_matter_state64_init(FlowMatterState64 *out_matter,
+                              uint32_t matter_id,
+                              int32_t ior_eta_q16,
+                              int32_t extinction_kappa_q16,
+                              int32_t viscosity_quench_q16,
+                              int32_t surface_relief_q16,
+                              int32_t micro_roughness_q16,
+                              int32_t mie_scatter_q16,
+                              const int32_t absorb_rgb_q16[3],
+                              int32_t lattice_wire_q16,
+                              int32_t thickness_mm_q16,
+                              uint32_t thermal_kelvin,
+                              uint32_t density_kg_m3);
+
+void flow_matter_state64_format_hex128(const FlowMatterState64 *matter,
+                                       char out_hex[129]);
+
+bool flow_matter_state64_parse_hex128(const char *hex128,
+                                      FlowMatterState64 *out_matter);
+
+int32_t flow_matter_eval_fresnel_q16(const FlowMatterState64 *matter,
+                                     int32_t cos_theta_q16);
+
+int32_t flow_matter_eval_vogel_radius_q16(const FlowMatterState64 *matter);
+
+int32_t flow_matter_eval_caustic_gain_q16(const FlowMatterState64 *matter,
+                                          int32_t laplacian_h_q16);
+
+void flow_matter_eval_radiance_rgb_q16(const FlowMatterState64 *matter,
+                                       const int32_t grad_h_q16[2],
+                                       int32_t laplacian_h_q16,
+                                       const int32_t bg_rgb_q16[3],
+                                       const int32_t light_delta_q16[2],
+                                       int32_t out_rgb_q16[3]);
+
+/*
+ * 10. Cross-Platform 64-Byte GPU Bus1K Packer API (Metal / Vulkan / DX12 / WebGPU)
+ * Decouples 16 x 64B GPU Bus slot assembly from platform-specific window hosts.
+ */
+void flow_gpu_bus1k_update_slot64(FlowEngineBus1K *inout_bus,
+                                  uint32_t slot_id,
+                                  const void *block64);
+
+void flow_gpu_bus1k_sync_svg_nodes(FlowEngineBus1K *inout_bus,
+                                   const FlowSvgUiNode64 *svg_nodes,
+                                   size_t node_count);
+
+/*
+ * 11. 64-Byte Cloud Room Isolate & Multi-View Tile-Atlas Router API
+ * Multiplexes up to 16 concurrent player viewports (FlowGpuSlice1Camera64) over
+ * a single shared room world manifold (s0_core + FlowEngineBus1K) with < 8.33ms
+ * SLA noisy-neighbor LOD circuit-breaker.
+ */
+void flow_cloud_room64_init(FlowCloudRoomDesc64 *out_room,
+                            uint32_t room_id,
+                            uint32_t map_block_count,
+                            uint32_t active_views,
+                            uint32_t tile_width_px,
+                            uint32_t tile_height_px,
+                            uint32_t sla_budget_us,
+                            uint64_t shared_world_hash);
+
+uint32_t flow_cloud_room64_route_pixel_to_seat(const FlowCloudRoomDesc64 *room,
+                                               uint32_t atlas_x_px,
+                                               uint32_t atlas_y_px,
+                                               int32_t *out_local_ndc_x_q16,
+                                               int32_t *out_local_ndc_y_q16);
+
+uint32_t flow_cloud_room64_step_sla_governor(FlowCloudRoomDesc64 *inout_room,
+                                             uint32_t measured_frame_us);
+
 #endif /* FLOW_ASSETS_H */

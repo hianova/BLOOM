@@ -78,6 +78,7 @@ typedef union __attribute__((aligned(64))) {
     FlowGpuBvhNode64 bvh_node;
     FlowGpuSdfBrick64 sdf_brick;
     FlowStreamEgress64 stream_egress;
+    FlowMatterState64 matter_state;
     FlowSvgUiNode64 svg_node;
     FlowImageUnitCellView16 cells[4];
     uint64_t raw_u64[8];
