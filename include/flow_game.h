@@ -40,19 +40,6 @@
 #include "flow_cine_camera.h"
 #include "flow_prefab_ssot.h"
 
-#ifndef BLOOM_VERSION_MAJOR
-#define BLOOM_VERSION_MAJOR 1U
-#endif
-#ifndef BLOOM_VERSION_MINOR
-#define BLOOM_VERSION_MINOR 3U
-#endif
-#ifndef BLOOM_VERSION_PATCH
-#define BLOOM_VERSION_PATCH 0U
-#endif
-#ifndef BLOOM_VERSION_STRING
-#define BLOOM_VERSION_STRING "1.3.0"
-#endif
-
 /* Viewport Tile Partitioning for 4K (3840x2160) */
 #define FLOW_GAME_VIEWPORT_W       3840U
 #define FLOW_GAME_VIEWPORT_H       2160U

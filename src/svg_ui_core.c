@@ -29,15 +29,6 @@ static uint64_t compute_dom_mac64(const FlowSvgUiDomState64 *dom) {
     return h ^ (h >> 31U);
 }
 
-static uint64_t compute_bridge_mac64(const FlowBroadcastObsBridge64 *b) {
-    uint64_t h = 0x9E3779B97F4A7C15ULL ^ b->state_trajectory_hash;
-    h ^= ((uint64_t)b->iosurface_id_ring[0] << 32U) | (uint64_t)b->iosurface_id_ring[1];
-    h ^= ((uint64_t)b->iosurface_id_ring[2] << 32U) | (uint64_t)b->published_frame_seq;
-    h ^= ((uint64_t)b->broadcast_mode << 16U) | (uint64_t)b->read_ring_slot;
-    h *= 0xBF58476D1CE4E5B9ULL;
-    return h ^ (h >> 32U);
-}
-
 static int32_t parse_svg_attr_i32(const char *line, const char *attr_key, int32_t default_val) {
     const char *p = strstr(line, attr_key);
     if (!p) return default_val;
@@ -334,63 +325,6 @@ void flow_svg_ui_resolve_anchor_q16(const FlowSvgUiNode64 *node,
     *out_center_y_q16 = cy;
 }
 
-void flow_svg_ui_bind_telemetry_q16(FlowSvgUiNode64 *nodes,
-                                    size_t node_count,
-                                    uint32_t thermal_kelvin,
-                                    int32_t craft_speed_q16,
-                                    uint32_t active_vcam_id,
-                                    uint32_t dopamine_phase,
-                                    uint32_t broadcast_mode) {
-    if (!nodes) return;
-
-    for (size_t i = 0U; i < node_count; ++i) {
-        FlowSvgUiNode64 *n = &nodes[i];
-        int32_t val_q16 = 0;
-
-        switch (n->bind_source) {
-            case FLOW_SVG_BIND_THERMAL_KELVIN: {
-                if (n->prim_type == FLOW_SVG_PRIM_NUM_READOUT) {
-                    /* Pass integer Kelvin directly in bound_value_q16 for 7-segment display */
-                    val_q16 = (int32_t)clamp_i32_ui((int32_t)thermal_kelvin, 0, 9999);
-                } else {
-                    int32_t delta = (thermal_kelvin > 700U) ? (int32_t)(thermal_kelvin - 700U) : 0;
-                    val_q16 = clamp_i32_ui((delta * 65536) / 150, 0, 65536);
-                }
-                break;
-            }
-            case FLOW_SVG_BIND_CRAFT_SPEED: {
-                int32_t spd = craft_speed_q16 >> 16;
-                val_q16 = clamp_i32_ui((spd * 65536) / 1200, 0, 65536);
-                break;
-            }
-            case FLOW_SVG_BIND_VCAM_ID: {
-                uint32_t target_vcam = (n->action_opcode >= FLOW_SVG_ACTION_VCAM_0 &&
-                                        n->action_opcode <= FLOW_SVG_ACTION_VCAM_3)
-                    ? (n->action_opcode - FLOW_SVG_ACTION_VCAM_0)
-                    : 0U;
-                val_q16 = (active_vcam_id == target_vcam) ? 65536 : 16384;
-                break;
-            }
-            case FLOW_SVG_BIND_DOPAMINE_PHASE:
-                val_q16 = (dopamine_phase > 0U) ? 65536 : 24576;
-                break;
-            case FLOW_SVG_BIND_BROADCAST_REC:
-                val_q16 = (broadcast_mode != FLOW_BROADCAST_MODE_IDLE) ? 65536 : 16384;
-                break;
-            case FLOW_SVG_BIND_XRAY_RADIUS:
-            case FLOW_SVG_BIND_PIPELINE_SLA:
-                /* Preserve interactive scrubbed value in [0..65536] */
-                val_q16 = clamp_i32_ui(n->bound_value_q16, 0, 65536);
-                break;
-            case FLOW_SVG_BIND_NONE:
-            default:
-                val_q16 = 32768;
-                break;
-        }
-        n->bound_value_q16 = val_q16;
-    }
-}
-
 uint32_t flow_svg_ui_extract_fill_rgb24(const FlowSvgUiNode64 *node) {
     if (!node) return 0U;
     return (node->style_and_state >> 8U) & 0x00FFFFFFU;
@@ -515,75 +449,6 @@ uint32_t flow_svg_ui_step_interaction(FlowSvgUiNode64 *nodes,
                                           0,
                                           mouse_pressed,
                                           mouse_just_clicked);
-}
-
-void flow_broadcast_obs_init64(FlowBroadcastObsBridge64 *bridge,
-                               uint32_t surface_id_0,
-                               uint32_t surface_id_1,
-                               uint32_t surface_id_2) {
-    if (!bridge) return;
-    memset(bridge, 0, sizeof(*bridge));
-    bridge->state_trajectory_hash = 0xCBF29CE484222325ULL;
-    bridge->iosurface_id_ring[0]  = (surface_id_0 != 0U) ? surface_id_0 : 0x1001U;
-    bridge->iosurface_id_ring[1]  = (surface_id_1 != 0U) ? surface_id_1 : 0x1002U;
-    bridge->iosurface_id_ring[2]  = (surface_id_2 != 0U) ? surface_id_2 : 0x1003U;
-    bridge->write_ring_slot       = 1U;
-    bridge->read_ring_slot        = 0U;
-    bridge->broadcast_mode        = FLOW_BROADCAST_MODE_LIVE_OBS_SHM;
-    bridge->active_vcam_mask      = 0x1U;
-    bridge->obs_audio_sample_rate = 48000U;
-    bridge->bridge_seal_mac       = compute_bridge_mac64(bridge);
-}
-
-void flow_broadcast_obs_publish_frame64(FlowBroadcastObsBridge64 *bridge,
-                                        uint32_t frame_seq,
-                                        uint32_t active_vcam_id,
-                                        uint32_t dopamine_phase,
-                                        uint64_t frame_state_hash) {
-    if (!bridge) return;
-
-    /* Advance Triple-Buffered Zero-Copy Ring (Theorem 4: write_ring_slot != read_ring_slot) */
-    uint32_t published_slot = bridge->write_ring_slot % 3U;
-    bridge->read_ring_slot  = published_slot;
-    bridge->write_ring_slot = (published_slot + 1U) % 3U;
-
-    bridge->published_frame_seq = frame_seq;
-    bridge->state_trajectory_hash ^= frame_state_hash + 0x9E3779B97F4A7C15ULL
-                                   + (bridge->state_trajectory_hash << 6U)
-                                   + (bridge->state_trajectory_hash >> 2U);
-
-    if (bridge->replay_frames_buffered < 3600U) {
-        bridge->replay_frames_buffered++;
-    }
-    /* Each 4K RGBA8 zero-copy IOSurface frame saves 33 MB of CPU readback */
-    bridge->zero_copy_bytes_saved += 33U;
-
-    /* When Dopamine Jackpot Catharsis Boom triggers, unlock 4-VCam Post-Play Replay mask */
-    if (dopamine_phase >= 3U) {
-        bridge->highlight_jackpot_tick = frame_seq;
-        bridge->active_vcam_mask       = 0xFU; /* All 4 VCams (135mm, 24mm, 35mm, 18mm) */
-        bridge->broadcast_mode         = FLOW_BROADCAST_MODE_REPLAY_4VCAM;
-    } else {
-        bridge->active_vcam_mask = (1U << (active_vcam_id & 3U));
-    }
-
-    bridge->bridge_seal_mac = compute_bridge_mac64(bridge);
-}
-
-int flow_broadcast_obs_export_shm_packet(const FlowBroadcastObsBridge64 *bridge,
-                                         const FlowSvgUiDomState64 *dom,
-                                         const char *shm_file_path) {
-    if (!bridge || !dom || !shm_file_path) {
-        return -1;
-    }
-    FILE *f = fopen(shm_file_path, "wb");
-    if (!f) {
-        return -2;
-    }
-    size_t w1 = fwrite(bridge, sizeof(FlowBroadcastObsBridge64), 1U, f);
-    size_t w2 = fwrite(dom, sizeof(FlowSvgUiDomState64), 1U, f);
-    fclose(f);
-    return (w1 == 1U && w2 == 1U) ? 0 : -3;
 }
 
 void flow_debug_log_append64(FlowDebugLogEntry64 *ring,
@@ -1170,200 +1035,7 @@ int32_t flow_latex_eval_box_sdf_q16(const FlowLatexBoxNode64 *box,
 
 /*
  * ============================================================================
- * 10. 64-Byte Scripted Story Finisher ("劇情殺") & Scene Transition ("過渡動畫")
- * ============================================================================
- */
-static uint64_t compute_director_mac64(const FlowNarrativeDirector64 *d) {
-    uint64_t h = 0xCBF29CE484222325ULL;
-    h ^= ((uint64_t)d->script_id << 32U) | ((uint64_t)d->director_phase << 16U) |
-         (uint64_t)d->transition_style;
-    h ^= ((uint64_t)d->input_lock_mask << 32U) | (uint64_t)d->target_prefab_id;
-    h ^= ((uint64_t)d->target_vcam_id << 32U) | (uint64_t)d->next_ticket_preset_id;
-    h ^= ((uint64_t)(uint32_t)d->wipe_progress_q16 << 32U) |
-         (uint64_t)(uint32_t)d->time_dilation_q16;
-    h ^= ((uint64_t)(uint32_t)d->scripted_hp_floor_q16 << 32U) |
-         (uint64_t)d->atomic_swap_completed;
-    h *= 0x9E3779B97F4A7C15ULL;
-    return h ^ (h >> 31U);
-}
-
-void flow_director_init64(FlowNarrativeDirector64 *dir) {
-    if (!dir) return;
-    memset(dir, 0, sizeof(*dir));
-    dir->director_phase    = FLOW_DIRECTOR_IDLE;
-    dir->transition_style  = FLOW_TRANS_LIQUID_GLASS_WAVE;
-    dir->input_lock_mask   = FLOW_INPUT_LOCK_NONE;
-    dir->time_dilation_q16 = 65536; /* 1.0x realtime */
-    dir->director_mac      = compute_director_mac64(dir);
-}
-
-void flow_director_trigger_story_finisher64(FlowNarrativeDirector64 *dir,
-                                            uint32_t script_id,
-                                            uint32_t target_prefab_id,
-                                            uint32_t vcam_id,
-                                            uint16_t transition_style,
-                                            int32_t hp_floor_q16) {
-    if (!dir) return;
-    memset(dir, 0, sizeof(*dir));
-    dir->script_id             = (script_id != 0U) ? script_id : 0x777U;
-    dir->director_phase        = FLOW_DIRECTOR_ANTICIPATION_LOCK;
-    dir->transition_style      = (uint16_t)(transition_style & 3U);
-    dir->input_lock_mask       = FLOW_INPUT_LOCK_FULL_CUTSCENE;
-    dir->target_prefab_id      = target_prefab_id;
-    dir->target_vcam_id        = (uint16_t)(vcam_id & 3U);
-    dir->next_ticket_preset_id = (uint8_t)((vcam_id + 1U) & 3U);
-    dir->next_stage_layer      = 1U;
-    dir->phase_elapsed_ms      = 0U;
-    dir->phase_duration_ms     = 320U;
-    dir->wipe_progress_q16     = 0;
-    dir->letterbox_aspect_q16  = 65536; /* 2.39:1 CinemaScope framing */
-    dir->time_dilation_q16     = 16384; /* 0.25x slow-motion anticipation */
-    dir->scripted_hp_floor_q16 = (hp_floor_q16 > 1) ? hp_floor_q16 : 1;
-    dir->xray_cutaway_q16      = 16384; /* Pre-strike X-Ray core lock scan */
-    dir->atomic_swap_completed = 0U;
-    dir->world_facts_delta     = 1ULL << (dir->script_id & 63U);
-    dir->director_mac          = compute_director_mac64(dir);
-}
-
-void flow_director_trigger_scene_transition64(FlowNarrativeDirector64 *dir,
-                                              uint32_t next_ticket_preset_id,
-                                              uint32_t next_stage_layer,
-                                              uint16_t transition_style,
-                                              uint32_t duration_ms) {
-    if (!dir) return;
-    uint32_t half_dur = (duration_ms >= 64U) ? (duration_ms >> 1U) : 160U;
-    memset(dir, 0, sizeof(*dir));
-    dir->script_id             = 0xCF01U + (next_ticket_preset_id & 3U);
-    dir->director_phase        = FLOW_DIRECTOR_CLIMAX_EXECUTION;
-    dir->transition_style      = (uint16_t)(transition_style & 3U);
-    dir->input_lock_mask       = FLOW_INPUT_LOCK_MOVEMENT;
-    dir->target_prefab_id      = 0U;
-    dir->target_vcam_id        = (uint16_t)(next_ticket_preset_id & 3U);
-    dir->next_ticket_preset_id = (uint8_t)(next_ticket_preset_id & 3U);
-    dir->next_stage_layer      = (uint8_t)(next_stage_layer & 1U);
-    dir->phase_elapsed_ms      = 0U;
-    dir->phase_duration_ms     = half_dur;
-    dir->wipe_progress_q16     = 0;
-    dir->letterbox_aspect_q16  = 49152;
-    dir->time_dilation_q16     = 32768; /* 0.50x transition glide */
-    dir->scripted_hp_floor_q16 = 0;
-    dir->xray_cutaway_q16      = 0;
-    dir->atomic_swap_completed = 0U;
-    dir->world_facts_delta     = 1ULL << (next_ticket_preset_id & 3U);
-    dir->director_mac          = compute_director_mac64(dir);
-}
-
-int32_t flow_director_eval_hp_gate_q16(const FlowNarrativeDirector64 *dir,
-                                       int32_t raw_hp_q16) {
-    if (!dir) {
-        return raw_hp_q16;
-    }
-    /* Theorem 15: Plot-Armor HP floor holds strictly during ANTICIPATION_LOCK */
-    if (dir->director_phase == FLOW_DIRECTOR_ANTICIPATION_LOCK &&
-        raw_hp_q16 < dir->scripted_hp_floor_q16) {
-        return dir->scripted_hp_floor_q16;
-    }
-    return raw_hp_q16;
-}
-
-bool flow_director_step_choreography64(FlowNarrativeDirector64 *dir,
-                                       uint32_t dt_ms,
-                                       uint32_t *out_active_vcam_id,
-                                       int32_t *out_trauma_boost_q16,
-                                       uint32_t *inout_ticket_preset_id,
-                                       uint32_t *inout_stage_layer) {
-    if (out_trauma_boost_q16) *out_trauma_boost_q16 = 0;
-    if (!dir || dir->director_phase == FLOW_DIRECTOR_IDLE) {
-        return false;
-    }
-
-    bool swapped_now = false;
-    dir->phase_elapsed_ms += dt_ms;
-    uint32_t dur = (dir->phase_duration_ms > 0U) ? dir->phase_duration_ms : 1U;
-    int32_t prog_q16 = (int32_t)((((int64_t)dir->phase_elapsed_ms) * 65536LL) / (int64_t)dur);
-    prog_q16 = clamp_i32_ui(prog_q16, 0, 65536);
-
-    if (out_active_vcam_id) {
-        *out_active_vcam_id = dir->target_vcam_id;
-    }
-
-    if (dir->director_phase == FLOW_DIRECTOR_ANTICIPATION_LOCK) {
-        dir->wipe_progress_q16    = 0;
-        dir->letterbox_aspect_q16 = 65536;
-        dir->time_dilation_q16    = 16384;
-        if (dir->phase_elapsed_ms >= dir->phase_duration_ms) {
-            /* Transition to CLIMAX_EXECUTION: release HP floor & trigger X-Ray shatter! */
-            dir->director_phase        = FLOW_DIRECTOR_CLIMAX_EXECUTION;
-            dir->phase_elapsed_ms      = 0U;
-            dir->phase_duration_ms     = 240U;
-            dir->scripted_hp_floor_q16 = 0;     /* Plot armor released for fatal strike */
-            dir->time_dilation_q16     = 4096;  /* 0.0625x relativistic hitstop */
-            dir->xray_cutaway_q16      = 52428; /* 0.80 SDF X-Ray internal core shatter */
-            if (out_trauma_boost_q16) {
-                *out_trauma_boost_q16 = 49152;  /* 0.75 6D camera trauma impulse */
-            }
-        }
-    } else if (dir->director_phase == FLOW_DIRECTOR_CLIMAX_EXECUTION) {
-        /* Closing wipe envelope [0 -> 65536] (Theorem 16) */
-        dir->wipe_progress_q16 = prog_q16;
-        if (dir->phase_elapsed_ms >= dir->phase_duration_ms) {
-            dir->director_phase    = FLOW_DIRECTOR_SCENE_TRANSITION;
-            dir->phase_elapsed_ms  = 0U;
-            dir->phase_duration_ms = 64U;
-            dir->wipe_progress_q16 = 65536; /* Exact 100% occlusion midpoint */
-            if (dir->atomic_swap_completed == 0U) {
-                if (inout_ticket_preset_id) {
-                    *inout_ticket_preset_id = dir->next_ticket_preset_id;
-                }
-                if (inout_stage_layer) {
-                    *inout_stage_layer = dir->next_stage_layer;
-                }
-                dir->atomic_swap_completed = 1U;
-                swapped_now = true;
-            }
-        }
-    } else if (dir->director_phase == FLOW_DIRECTOR_SCENE_TRANSITION) {
-        /* Full 100% occlusion held across atomic swap frame (Theorem 16: == 65536) */
-        dir->wipe_progress_q16 = 65536;
-        if (dir->atomic_swap_completed == 0U) {
-            if (inout_ticket_preset_id) {
-                *inout_ticket_preset_id = dir->next_ticket_preset_id;
-            }
-            if (inout_stage_layer) {
-                *inout_stage_layer = dir->next_stage_layer;
-            }
-            dir->atomic_swap_completed = 1U;
-            swapped_now = true;
-        }
-        if (dir->phase_elapsed_ms >= dir->phase_duration_ms) {
-            dir->director_phase    = FLOW_DIRECTOR_RECOVERY_SETTLE;
-            dir->phase_elapsed_ms  = 0U;
-            dir->phase_duration_ms = 240U;
-            dir->time_dilation_q16 = 49152; /* 0.75x smooth settle */
-            dir->xray_cutaway_q16  = 0;
-        }
-    } else if (dir->director_phase == FLOW_DIRECTOR_RECOVERY_SETTLE) {
-        /* Opening wipe envelope [65536 -> 0] (Theorem 16) */
-        dir->wipe_progress_q16    = 65536 - prog_q16;
-        dir->letterbox_aspect_q16 = 65536 - prog_q16;
-        if (dir->phase_elapsed_ms >= dir->phase_duration_ms) {
-            dir->director_phase       = FLOW_DIRECTOR_IDLE;
-            dir->input_lock_mask      = FLOW_INPUT_LOCK_NONE;
-            dir->phase_elapsed_ms     = 0U;
-            dir->wipe_progress_q16    = 0;
-            dir->letterbox_aspect_q16 = 0;
-            dir->time_dilation_q16    = 65536; /* Restore 1.0x realtime */
-            dir->xray_cutaway_q16     = 0;
-        }
-    }
-
-    dir->director_mac = compute_director_mac64(dir);
-    return swapped_now;
-}
-
-/*
- * ============================================================================
- * 11. 64-Byte Flexbox / Stack Auto-Layout Container, Generic Register Bank &
+ * 10. 64-Byte Flexbox / Stack Auto-Layout Container, Generic Register Bank &
  *     Interactive Text Input Widget State (General-Purpose Native App UI)
  * ============================================================================
  */
@@ -1798,5 +1470,188 @@ bool flow_native_dialog_prepare64(FlowNativeDialogDesc64 *dlg,
     }
     dlg->dialog_mac = calc_ui_block_mac64(dlg, 0x4E4154444C473634ULL);
     return true;
+}
+
+/* ============================================================================
+ * 11. Constraint-Projected 64B Semantic UI & Auto-Bento Synthesizer (Zero-XML)
+ * ============================================================================ */
+
+uint16_t flow_ui_eval_constraint_optical_state(int32_t val_q16,
+                                               int32_t b_exit_q16,
+                                               int32_t b_enter_q16,
+                                               uint32_t *out_rgb24) {
+    uint16_t state = FLOW_UI_OPTICAL_SAFE;
+    uint32_t rgb   = 0x0020D8FFU; /* Safe: Cyan-Ice Physical Liquid Glass */
+    if (val_q16 >= b_enter_q16) {
+        state = FLOW_UI_OPTICAL_TRIP_ALERT;
+        rgb   = 0x00FF2848U; /* Tripped: Crimson-Laser Alert Glass */
+    } else if (val_q16 > b_exit_q16) {
+        state = FLOW_UI_OPTICAL_HYST_WARN;
+        rgb   = 0x00FFB020U; /* Hysteresis Deadband: Amber-Gold Warning Glass */
+    }
+    if (out_rgb24) {
+        *out_rgb24 = rgb;
+    }
+    return state;
+}
+
+void flow_ui_intent_init64(FlowUiIntentSpec64 *intent,
+                           uint16_t semantic_role,
+                           const char *label_utf8,
+                           uint16_t bind_channel,
+                           int32_t b_exit_q16,
+                           int32_t b_enter_q16,
+                           uint32_t action_id,
+                           uint16_t grid_span_cols) {
+    if (!intent) return;
+    memset(intent, 0, sizeof(*intent));
+    intent->semantic_role  = (semantic_role >= 1U && semantic_role <= 6U)
+        ? semantic_role
+        : FLOW_UI_ROLE_METRIC_GAUGE;
+    intent->bind_channel   = (bind_channel < FLOW_UI_REGISTER_CHANNELS) ? bind_channel : 0U;
+    intent->grid_span_cols = (grid_span_cols >= 1U && grid_span_cols <= 4U) ? grid_span_cols : 1U;
+    intent->b_exit_q16     = b_exit_q16;
+    intent->b_enter_q16    = (b_enter_q16 > b_exit_q16) ? b_enter_q16 : (b_exit_q16 + 4096);
+    intent->action_id      = action_id;
+    intent->optical_state  = flow_ui_eval_constraint_optical_state(
+        0, intent->b_exit_q16, intent->b_enter_q16, &intent->derived_rgb24);
+    if (label_utf8) {
+        size_t i = 0U;
+        while (label_utf8[i] != '\0' && i < 23U) {
+            intent->label_utf8[i] = label_utf8[i];
+            i++;
+        }
+        intent->label_utf8[i] = '\0';
+    }
+    intent->intent_mac = calc_ui_block_mac64(intent, 0x5549494E54454E54ULL);
+}
+
+size_t flow_ui_synthesize_bento64(FlowUiIntentSpec64 *intents,
+                                  size_t intent_count,
+                                  const FlowUiRegisterBank64 *bank,
+                                  uint32_t grid_cols,
+                                  uint32_t viewport_w_px,
+                                  uint32_t viewport_h_px,
+                                  FlowSvgUiNode64 *out_nodes,
+                                  size_t max_nodes,
+                                  FlowSvgUiDomState64 *out_dom) {
+    if (!intents || !out_nodes || intent_count == 0U || max_nodes == 0U) {
+        return 0U;
+    }
+    size_t count = (intent_count <= max_nodes) ? intent_count : max_nodes;
+    if (count > FLOW_SVG_UI_MAX_NODES) {
+        count = FLOW_SVG_UI_MAX_NODES;
+    }
+
+    uint32_t cols = (grid_cols >= 1U && grid_cols <= 8U) ? grid_cols : 2U;
+    int32_t margin_q16 = 2048;
+    int32_t gap_q16    = 1024;
+    int32_t span_q16   = 65536; /* Normalized [-32768, +32768] screen-space span */
+    int32_t overhead   = 2 * margin_q16 + (int32_t)(cols - 1U) * gap_q16;
+    int32_t cell_half_w_q16 = (span_q16 > overhead)
+        ? ((span_q16 - overhead) / (int32_t)(2U * cols))
+        : 4096;
+    int32_t cell_half_h_q16 = 4096;
+
+    uint32_t cur_col = 0U;
+    uint32_t cur_row = 0U;
+    uint64_t combined_wave64 = 0ULL;
+
+    for (size_t i = 0U; i < count; ++i) {
+        FlowUiIntentSpec64 *in = &intents[i];
+        uint32_t cspan = (in->grid_span_cols >= 1U && in->grid_span_cols <= cols)
+            ? (uint32_t)in->grid_span_cols
+            : 1U;
+        if (cur_col + cspan > cols) {
+            cur_col = 0U;
+            cur_row++;
+        }
+
+        int32_t val_q16 = bank ? flow_ui_register_bank_get_q16(bank, in->bind_channel) : in->current_val_q16;
+        in->current_val_q16 = val_q16;
+        in->optical_state   = flow_ui_eval_constraint_optical_state(
+            val_q16, in->b_exit_q16, in->b_enter_q16, &in->derived_rgb24);
+        in->node_id         = (uint32_t)(900U + i);
+        in->intent_mac      = calc_ui_block_mac64(in, 0x5549494E54454E54ULL);
+
+        int32_t w_half = (int32_t)cspan * cell_half_w_q16 + (int32_t)(cspan - 1U) * (gap_q16 / 2);
+        int32_t left_x = -32768 + margin_q16 + (int32_t)cur_col * (2 * cell_half_w_q16 + gap_q16);
+        int32_t cx_q16 = clamp_i32_ui(left_x + w_half, -32768, 32768);
+        int32_t cy_q16 = clamp_i32_ui(-16384 + (int32_t)cur_row * (2 * cell_half_h_q16 + gap_q16), -24576, 24576);
+
+        FlowSvgUiNode64 *node = &out_nodes[i];
+        memset(node, 0, sizeof(*node));
+        node->node_id           = in->node_id;
+        node->bind_source       = in->bind_channel;
+        node->action_opcode     = in->action_id;
+        node->anchor_mode       = FLOW_SVG_ANCHOR_CENTER;
+        node->offset_x_q16      = cx_q16;
+        node->offset_y_q16      = cy_q16;
+        node->half_w_q16        = w_half;
+        node->half_h_q16        = cell_half_h_q16;
+        node->corner_radius_q16 = 1024;
+        node->scale_jet_v_q16   = 65536;
+        node->scale_jet_d1_q16  = 0;
+        node->bound_value_q16   = clamp_i32_ui(val_q16, 0, 65536);
+        node->style_and_state   = (in->derived_rgb24 << 8U) |
+                                  FLOW_SVG_GLASS_BEER_LAMBERT |
+                                  FLOW_SVG_STATE_GLASS_BIT;
+
+        if (in->semantic_role == FLOW_UI_ROLE_METRIC_GAUGE) {
+            node->prim_type = FLOW_SVG_PRIM_CIRCLE_RING;
+        } else if (in->semantic_role == FLOW_UI_ROLE_STATUS_BADGE) {
+            node->prim_type = FLOW_SVG_PRIM_NUM_READOUT;
+        } else {
+            node->prim_type = FLOW_SVG_PRIM_RECT_GLASS;
+        }
+
+        node->tile_mask_wave64 = compute_node_wave64_mask(cx_q16, cy_q16, w_half, cell_half_h_q16);
+        combined_wave64 |= node->tile_mask_wave64;
+        cur_col += cspan;
+    }
+
+    if (out_dom) {
+        memset(out_dom, 0, sizeof(*out_dom));
+        out_dom->compiled_node_count    = (uint32_t)count;
+        out_dom->viewport_width_px      = (viewport_w_px > 0U) ? viewport_w_px : 1920U;
+        out_dom->viewport_height_px     = (viewport_h_px > 0U) ? viewport_h_px : 1080U;
+        out_dom->hot_reload_epoch       = 1U;
+        out_dom->active_dom_mask_wave64 = combined_wave64;
+        out_dom->dom_state_mac          = compute_dom_mac64(out_dom);
+    }
+    return count;
+}
+
+size_t flow_ui_project_from_abi64(const FlowLeanClause64 *clause,
+                                  const FlowUiRegisterBank64 *bank,
+                                  uint32_t viewport_w_px,
+                                  uint32_t viewport_h_px,
+                                  FlowUiIntentSpec64 *out_intents,
+                                  FlowSvgUiNode64 *out_nodes,
+                                  size_t max_nodes,
+                                  FlowSvgUiDomState64 *out_dom) {
+    if (!clause || !out_intents || !out_nodes || max_nodes < 4U) {
+        return 0U;
+    }
+    int32_t pa = (int32_t)clause->param_a;
+    int32_t pb = (int32_t)clause->param_b;
+    int32_t b_exit  = (pa <= pb) ? pa : pb;
+    int32_t b_enter = (pa >= pb) ? pa : pb;
+    if (b_enter <= b_exit) {
+        b_enter = b_exit + 4096;
+    }
+
+    flow_ui_intent_init64(&out_intents[0], FLOW_UI_ROLE_METRIC_GAUGE,
+                          "HYST_GOVERNOR", 0U, b_exit, b_enter, 101U, 1U);
+    flow_ui_intent_init64(&out_intents[1], FLOW_UI_ROLE_STATUS_BADGE,
+                          "SIEVE_CAP_MASK", 1U, b_exit, b_enter, 102U, 1U);
+    flow_ui_intent_init64(&out_intents[2], FLOW_UI_ROLE_SCRUB_SLIDER,
+                          "WEIGHT_GAIN_Q16", 2U, b_exit, b_enter, 103U, 1U);
+    flow_ui_intent_init64(&out_intents[3], FLOW_UI_ROLE_ACTION_BUTTON,
+                          "HOTSWAP_COMMIT", 3U, b_exit, b_enter, 104U, 1U);
+
+    return flow_ui_synthesize_bento64(out_intents, 4U, bank, 2U,
+                                      viewport_w_px, viewport_h_px,
+                                      out_nodes, max_nodes, out_dom);
 }
 

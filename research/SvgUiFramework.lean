@@ -66,22 +66,7 @@ theorem svg_ui_wave64_hittest_conservative
   unfold wave64HitTest
   simp
 
-/-- 4. Triple-Buffered Zero-Copy Broadcast Ring Slot Step (`(idx + 1) % 3`). -/
-def nextBroadcastSlot (writeIdx : Nat) : Nat :=
-  (writeIdx + 1) % 3
-
-/-- Theorem 4: In the 3-slot Zero-Copy IOSurface / OBS SHM ring buffer,
-    the next write slot `nextBroadcastSlot w` is always strictly in `[0, 2]` and
-    never aliases the current published reader slot `w % 3`. -/
-theorem broadcast_triple_ring_no_aliasing
-    (w : Nat) :
-    nextBroadcastSlot w < 3 ∧ nextBroadcastSlot w ≠ (w % 3) := by
-  unfold nextBroadcastSlot
-  constructor
-  · exact Nat.mod_lt (w + 1) (by decide)
-  · omega
-
-/-- 5. Beer-Lambert Physical Glass Optical Transmittance in Q16:
+/-- 4. Beer-Lambert Physical Glass Optical Transmittance in Q16:
     Given optical absorption loss `opticalLossQ16`, clamps transmittance strictly
     between the crystal floor `4096` (6.25% minimum clarity, never iOS 7 dead-dark)
     and `65536` (100% pure crystal transmission). -/
@@ -255,54 +240,7 @@ theorem svg_viewbox_q16_normalization_bounded
     · simp [h0, h1]
     · by_cases h2 : (coordPx * 65536) / viewExtentPx > 65536 <;> simp [h0, h1, h2] <;> omega
 
-/-- 15. Scripted Story Finisher ("劇情殺") Plot-Armor HP Floor Gate:
-    While `inAnticipationLock = true`, entity HP is clamped to at least `hpFloor` (`>= 1`)
-    so the boss/player cannot die prematurely before the scripted execution climax lands. -/
-def evalStoryHpGate (inAnticipationLock : Bool) (hpFloor : Nat) (rawHp : Nat) : Nat :=
-  if inAnticipationLock then
-    if rawHp < hpFloor then hpFloor else rawHp
-  else
-    rawHp
-
-/-- Theorem 15: During the Scripted Story Finisher anticipation lock, resolved HP
-    is strictly bounded below by `hpFloor`, guaranteeing zero premature death or
-    sequence break before the climax execution blow. -/
-theorem story_execution_hp_floor_invariant
-    (hpFloor rawHp : Nat) :
-    evalStoryHpGate true hpFloor rawHp >= hpFloor := by
-  unfold evalStoryHpGate
-  by_cases h : rawHp < hpFloor <;> simp [h] <;> omega
-
-/-- 16. Scene Transition Choreography ("過渡動畫") Wipe Envelope & Midpoint Occlusion:
-    Maps director phase `(0=Idle, 1=Anticipation, 2=Climax, 3=WipeMidpoint, 4=Settle)`
-    and normalized timer progress `[0..65536]` to screen wipe occlusion `[0..65536]`. -/
-def evalTransitionWipeEnvelopeQ16 (phase : Nat) (progressQ16 : Nat) : Nat :=
-  let clampedProg := if progressQ16 > 65536 then 65536 else progressQ16
-  if phase == 3 then 65536
-  else if phase == 2 then clampedProg
-  else if phase == 4 then 65536 - clampedProg
-  else 0
-
-/-- Theorem 16: Scene transition wipe occlusion is strictly bounded within `[0, 65536]`
-    across all choreography phases and reaches full 100% occlusion (`65536`) at the
-    atomic scene-swap phase (`phase = 3`), guaranteeing zero visual pop-in. -/
-theorem scene_transition_wipe_atomic_swap_bounded
-    (phase progressQ16 : Nat) :
-    evalTransitionWipeEnvelopeQ16 phase progressQ16 <= 65536 ∧
-    evalTransitionWipeEnvelopeQ16 3 progressQ16 = 65536 := by
-  constructor
-  · unfold evalTransitionWipeEnvelopeQ16
-    by_cases h3 : (phase == 3) = true
-    · simp [h3]
-    · by_cases h2 : (phase == 2) = true
-      · by_cases hp : progressQ16 > 65536 <;> simp [h3, h2, hp] <;> omega
-      · by_cases h4 : (phase == 4) = true
-        · by_cases hp : progressQ16 > 65536 <;> simp [h3, h2, h4, hp] <;> omega
-        · simp [h3, h2, h4]
-  · unfold evalTransitionWipeEnvelopeQ16
-    simp
-
-/-- 17. 64-Byte Inline Text Input Widget (`FlowUiTextInput64`) Cursor & Capacity Bounds:
+/-- 15. 64-Byte Inline Text Input Widget (`FlowUiTextInput64`) Cursor & Capacity Bounds:
     Models a character insertion into the 39-byte inline UTF-8/ASCII buffer (`cap = 39`),
     computing the new byte length `stepUiTextLen` and new caret position `stepUiTextCursor`. -/
 def stepUiTextLen (byteLen : Nat) : Nat :=
@@ -376,6 +314,65 @@ theorem dpi_scale_monotonic
   unfold evalDpiPhysicalPx
   have hMul : logicalPx * s1 <= logicalPx * s2 := Nat.mul_le_mul_left logicalPx h_scale
   exact Nat.div_le_div_right hMul
+
+/-- 21. Constraint-Projected Optical State (`FlowUiIntentSpec64`):
+    Directly maps a bound Q16 telemetry value `valQ16` and formal hysteresis deadband
+    `[bExitQ16, bEnterQ16]` into optical state `{0 = Safe, 1 = HysteresisWarn, 2 = TripAlert}`
+    without manual CSS/SVG hex color authoring. -/
+def evalConstraintOpticalState (valQ16 : Int) (bExitQ16 : Int) (bEnterQ16 : Int) : Nat :=
+  if valQ16 >= bEnterQ16 then 2
+  else if valQ16 <= bExitQ16 then 0
+  else 1
+
+/-- Theorem 21: For any valid hysteresis deadband `bExitQ16 < bEnterQ16`, the constraint-projected
+    optical state is strictly bounded in `{0, 1, 2}` and deterministically separates the safe
+    region (`valQ16 <= bExitQ16 -> 0`) from the tripped region (`valQ16 >= bEnterQ16 -> 2`). -/
+theorem constraint_optical_state_partition_sound
+    (valQ16 bExitQ16 bEnterQ16 : Int)
+    (h_band : bExitQ16 < bEnterQ16) :
+    evalConstraintOpticalState valQ16 bExitQ16 bEnterQ16 <= 2 ∧
+    evalConstraintOpticalState bExitQ16 bExitQ16 bEnterQ16 = 0 ∧
+    evalConstraintOpticalState bEnterQ16 bExitQ16 bEnterQ16 = 2 := by
+  refine ⟨?_, ?_, ?_⟩
+  · unfold evalConstraintOpticalState
+    by_cases h1 : valQ16 >= bEnterQ16
+    · simp [h1]
+    · by_cases h2 : valQ16 <= bExitQ16 <;> simp [h1, h2]
+  · unfold evalConstraintOpticalState
+    have h_not_ge : ¬ (bExitQ16 >= bEnterQ16) := by omega
+    simp [h_not_ge]
+  · unfold evalConstraintOpticalState
+    simp
+
+/-- 22. Auto-Bento Grid Cell Half-Extent Synthesizer (`flow_ui_synthesize_bento64`):
+    Computes the per-column cell half-extent in Q16 from `viewportSpanQ16`, outer `marginQ16`,
+    inter-cell `gapQ16`, and column count `cols >= 1` with zero manual coordinate authoring. -/
+def evalAutoBentoCellHalfQ16
+    (viewportSpanQ16 : Nat)
+    (marginQ16 : Nat)
+    (gapQ16 : Nat)
+    (cols : Nat) : Nat :=
+  let c := if cols = 0 then 1 else cols
+  let overhead := 2 * marginQ16 + (c - 1) * gapQ16
+  if viewportSpanQ16 <= overhead then 0
+  else (viewportSpanQ16 - overhead) / (2 * c)
+
+/-- Theorem 22: Auto-Bento synthesized cells never overflow the viewport span
+    (`2 * cols * cellHalf <= viewportSpanQ16`) for any positive column count `cols >= 1`. -/
+theorem auto_bento_cell_partition_fits_viewport
+    (viewportSpanQ16 marginQ16 gapQ16 cols : Nat)
+    (h_cols : cols >= 1) :
+    2 * cols * evalAutoBentoCellHalfQ16 viewportSpanQ16 marginQ16 gapQ16 cols <= viewportSpanQ16 := by
+  unfold evalAutoBentoCellHalfQ16
+  have h_nz : cols ≠ 0 := by omega
+  simp [h_nz]
+  by_cases h_ovh : viewportSpanQ16 <= 2 * marginQ16 + (cols - 1) * gapQ16
+  · simp [h_ovh]
+  · simp [h_ovh]
+    have h_div : 2 * cols * ((viewportSpanQ16 - (2 * marginQ16 + (cols - 1) * gapQ16)) / (2 * cols)) <=
+        viewportSpanQ16 - (2 * marginQ16 + (cols - 1) * gapQ16) :=
+      Nat.mul_div_le (viewportSpanQ16 - (2 * marginQ16 + (cols - 1) * gapQ16)) (2 * cols)
+    omega
 
 end FlowSvgUiFramework
 

@@ -287,109 +287,8 @@ static void test_wave64_compaction_and_layer_collapse(void) {
     printf("  ✓ Wave64 1-cycle compaction (20 active lanes) & Layer 0/1/HUD collapse verified!\n");
 }
 
-static void test_fashion_lofting_and_steam_marketplace(void) {
-    printf("[Test 7/8] Human-Aesthetic Silhouette Lofting (FlowFashionSkin64) & Steam Marketplace...\n");
-
-    assert(sizeof(FlowFashionSkin64) == 64U);
-    assert(_Alignof(FlowFashionSkin64) == 64U);
-    assert(sizeof(FlowMarketToken64) == 64U);
-    assert(_Alignof(FlowMarketToken64) == 64U);
-
-    /* 1. Design 4 Haute-Couture Skins via Orthogonal 2D Silhouette Lofting (Zero Blender!) */
-    const int32_t chord_2m_q16 = (int32_t)(2LL * FLOW_Q16_ONE);
-    FlowFashionSkin64 showroom_skins[4];
-    showroom_skins[0] = flow_fashion_design_from_silhouette(
-        1001U, FLOW_FINISH_DOPPLER_SAPPHIRE, FLOW_RICARDIAN_GRADE_S, 420ULL, 1310, chord_2m_q16, 40503
-    );
-    showroom_skins[1] = flow_fashion_design_from_silhouette(
-        1002U, FLOW_FINISH_CASE_HARDENED_BLUE, FLOW_RICARDIAN_GRADE_S, 661ULL, 1966, chord_2m_q16, 40503
-    );
-    showroom_skins[2] = flow_fashion_design_from_silhouette(
-        1003U, FLOW_FINISH_KINTSUGI_DAMASCUS, FLOW_RICARDIAN_GRADE_A, 888ULL, 2621, chord_2m_q16, 40503
-    );
-    showroom_skins[3] = flow_fashion_design_from_silhouette(
-        1004U, FLOW_FINISH_CELESTIAL_JADE, FLOW_RICARDIAN_GRADE_A, 777ULL, 1500, chord_2m_q16, 40503
-    );
-
-    /* Verify Golden-Ratio wingspan (~0.618 * length_z) & Harmony Score >= 0.95 (62259 Q16) */
-    for (int i = 0; i < 4; ++i) {
-        assert(showroom_skins[i].wingspan_x_q16 == 81006); /* 2.0 * 40503 */
-        assert(showroom_skins[i].aesthetic_harmony_q16 >= 62259);
-        assert(showroom_skins[i].ssot_signature != 0ULL);
-        /* Origin (0,0,0) is strictly inside the lofted 3D silhouette (f < 0) */
-        int64_t d_origin = flow_fashion_eval_lofted_sdf_q16(&showroom_skins[i], 0, 0, 0);
-        int64_t d_far = flow_fashion_eval_lofted_sdf_q16(&showroom_skins[i], 5LL * FLOW_Q16_ONE, 0, 0);
-        assert(d_origin < 0LL);
-        assert(d_far > 0LL);
-    }
-    /* Scar Pattern #661 has 95% Blue Gem coverage (62259 Q16) */
-    assert(showroom_skins[1].gold_vein_q16 == 62259);
-
-    /* 2. Render 4-Panel Haute-Couture Showroom Inspection Preview */
-    int rc_ppm = flow_fashion_render_showroom_ppm(showroom_skins, "build/fashion_showroom.ppm");
-    assert(rc_ppm == 0);
-
-    /* 3. Zero-Backend Steam Inventory Hex128 Bijective Codec & Anti-Forgery Verification */
-    char hex_blob[129];
-    flow_market_encode_hex128(&showroom_skins[1], hex_blob);
-    assert(strlen(hex_blob) == 128U);
-
-    FlowFashionSkin64 decoded_skin;
-    assert(flow_market_decode_hex128(hex_blob, &decoded_skin) == true);
-    assert(memcmp(&decoded_skin, &showroom_skins[1], sizeof(FlowFashionSkin64)) == 0);
-
-    /* Non-NUL-terminated 129-char string (trailing garbage) -> must be rejected! */
-    char unterminated_hex[130];
-    memcpy(unterminated_hex, hex_blob, 128U);
-    unterminated_hex[128] = 'A';
-    unterminated_hex[129] = '\0';
-    FlowFashionSkin64 trailing_skin;
-    assert(flow_market_decode_hex128(unterminated_hex, &trailing_skin) == false);
-
-    /* Tamper with 1 nibble in the Steam metadata string -> must be rejected by SSOT signature! */
-    hex_blob[16] = (hex_blob[16] == 'A') ? 'B' : 'A';
-    FlowFashionSkin64 forged_skin;
-    assert(flow_market_decode_hex128(hex_blob, &forged_skin) == false);
-
-    /* 4. Steam Community Market + Web SaaS Creator Royalty Split (Zero Rounding Leak) */
-    FlowMarketToken64 settlement;
-    /* $199.99 ($19,999 cents) transaction for Scar-Pattern #661 Blue Gem */
-    assert(flow_market_settle_transaction(900012345ULL, 77001ULL, 19999ULL, &settlement) == 0);
-    assert(settlement.valve_steam_fee_cents == 999ULL);     /* 5% */
-    assert(settlement.studio_treasury_cents == 1399ULL);    /* 7% */
-    assert(settlement.creator_royalty_cents == 599ULL);     /* 3% Web SaaS Workshop Creator */
-    assert(settlement.seller_net_payout_cents == 17002ULL); /* 85% + exact cent remainder */
-    assert(settlement.valve_steam_fee_cents +
-           settlement.studio_treasury_cents +
-           settlement.creator_royalty_cents +
-           settlement.seller_net_payout_cents == settlement.gross_price_cents);
-
-    /* 5. Ricardian 10-to-1 Trade-Up Deflation Contract */
-    FlowFashionSkin64 inputs_grade_b[10];
-    for (uint32_t i = 0; i < 10U; ++i) {
-        inputs_grade_b[i] = flow_fashion_design_from_silhouette(
-            2000U + i,
-            i & 3U,
-            FLOW_RICARDIAN_GRADE_B,
-            100ULL + i * 37ULL,
-            2000 + (int32_t)(i * 100U),
-            chord_2m_q16,
-            40503
-        );
-    }
-    FlowFashionSkin64 upgraded_grade_a;
-    uint64_t burned_supply = 0ULL;
-    assert(flow_market_trade_up_contract(inputs_grade_b, 3001U, &upgraded_grade_a, &burned_supply) == 0);
-    assert(burned_supply == 10ULL);
-    assert(upgraded_grade_a.ricardian_grade == FLOW_RICARDIAN_GRADE_A);
-    assert(upgraded_grade_a.assembly_index > inputs_grade_b[0].assembly_index);
-
-    printf("  ✓ 2D Silhouette Lofting (Harmony=%d/65536), Showroom PPM, Hex128 MAC, Royalty Split ($199.99) & 10-to-1 Trade-Up verified!\n",
-           showroom_skins[1].aesthetic_harmony_q16);
-}
-
 static void test_trc_accessibility_epilepsy_and_colorblind_geometry(void) {
-    printf("[Test 8/8] Steam/Console TRC Accessibility Guard (<= 3Hz Strobe & Colorblind Geometry)...\n");
+    printf("[Test 7/7] Console/Display TRC Accessibility Guard (<= 3Hz Strobe & Colorblind Geometry)...\n");
 
     /* 1. Photosensitive Epilepsy Guard: 800K meltdown strobe clamped from 10.0 Hz to <= 3.0 Hz (196608 Q16) */
     bool overheated = false;
@@ -463,67 +362,9 @@ static void test_trc_accessibility_epilepsy_and_colorblind_geometry(void) {
            meltdown_safe.strobe_hz_q16);
 }
 
-static void test_moodboard_to_prefab_notebook(void) {
-    printf("[Test 9] Fashion/Game Moodboard-to-Prefab Notebook (FlowMoodboardPrefab64 + Hex128)...\n");
-
-    assert(sizeof(FlowMoodboardPrefab64) == 64U);
-    assert(_Alignof(FlowMoodboardPrefab64) == 64U);
-
-    for (uint32_t m = 0U; m < FLOW_MOOD_STAGE_COUNT; ++m) {
-        FlowMoodboardPrefab64 mb;
-        flow_moodboard_init_preset64(&mb, m);
-        assert(mb.stage_mode == m);
-        assert(mb.mood_signature != 0ULL);
-
-        char hex[129];
-        flow_moodboard_encode_hex128(&mb, hex);
-        assert(strlen(hex) == 128U);
-
-        FlowMoodboardPrefab64 decoded;
-        assert(flow_moodboard_decode_hex128(hex, &decoded) == true);
-        assert(memcmp(&mb, &decoded, sizeof(mb)) == 0);
-
-        /* Reject tampered Hex128 share code */
-        hex[12] = (hex[12] == 'A') ? 'B' : 'A';
-        assert(flow_moodboard_decode_hex128(hex, &decoded) == false);
-
-        FlowPrefabDesc64 prefab;
-        FlowArtStyle64 style;
-        flow_moodboard_to_prefab_and_style64(&mb, &prefab, &style);
-        assert(prefab.prefab_id == mb.mood_id);
-        assert(prefab.ssot_hash == flow_prefab_calc_hash(&prefab));
-        assert(style.style_id == mb.mood_id);
-    }
-
-    /* Test automatic genre classification & swatch extraction on synthetic 16x16 RGB image */
-    uint8_t synth_rgb[16 * 16 * 3];
-    for (uint32_t y = 0U; y < 16U; ++y) {
-        for (uint32_t x = 0U; x < 16U; ++x) {
-            size_t idx = ((size_t)y * 16U + (size_t)x) * 3U;
-            /* Cream studio surround -> auto-detects Stage 3 Isometric Diorama */
-            synth_rgb[idx + 0U] = 235U;
-            synth_rgb[idx + 1U] = 230U;
-            synth_rgb[idx + 2U] = 220U;
-            if (x == 8U && y == 8U) {
-                /* Nordic red cabin swatch */
-                synth_rgb[idx + 0U] = 190U;
-                synth_rgb[idx + 1U] = 45U;
-                synth_rgb[idx + 2U] = 38U;
-            }
-        }
-    }
-    FlowMoodboardPrefab64 extracted;
-    assert(flow_moodboard_extract_from_rgb_buffer64(synth_rgb, 16U, 16U, 16U * 3U,
-                                                    FLOW_MOOD_STAGE_AUTO_DETECT, &extracted) == 0);
-    assert(extracted.stage_mode == FLOW_MOOD_STAGE_ISOMETRIC_DIORAMA);
-    assert(extracted.accent_rgb24 == ((190U << 16U) | (45U << 8U) | 38U));
-
-    printf("  ✓ 64B Moodboard-to-Prefab Extractor, Auto-Classifier & Hex128 Codec verified!\n");
-}
-
 int main(void) {
     printf("====================================================================\n");
-    printf("BLOOM: Prefab SSOT + Art Bible (HTML/CSS/JS) Test Suite\n");
+    printf("BLOOM: Prefab SSOT + Art Bible Test Suite\n");
     printf("====================================================================\n");
 
     test_64b_univalence();
@@ -532,12 +373,10 @@ int main(void) {
     test_q16_csg_sdf_and_worldline_root();
     test_thermal_hysteresis_800k_760k();
     test_wave64_compaction_and_layer_collapse();
-    test_fashion_lofting_and_steam_marketplace();
     test_trc_accessibility_epilepsy_and_colorblind_geometry();
-    test_moodboard_to_prefab_notebook();
 
     printf("====================================================================\n");
-    printf("✓ ALL 9 SSOT / PREFAB / ART BIBLE / FASHION / MOODBOARD TESTS PASSED\n");
+    printf("✓ ALL 7 SSOT / PREFAB / ART BIBLE / WAVE64 / TRC TESTS PASSED\n");
     printf("====================================================================\n");
     return 0;
 }

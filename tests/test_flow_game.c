@@ -1370,13 +1370,8 @@ static void test_fps120_hysteresis_governor(void) {
 }
 
 int main(void) {
-    assert(BLOOM_VERSION_MAJOR == 1U);
-    assert(BLOOM_VERSION_MINOR == 3U);
-    assert(BLOOM_VERSION_PATCH == 0U);
-    assert(strcmp(BLOOM_VERSION_STRING, "1.3.0") == 0);
-
     printf("================================================================================\n");
-    printf("  BLOOM v%s: Deterministic C17 Verification Suite (Zero Float/Double)\n", BLOOM_VERSION_STRING);
+    printf("  BLOOM: Deterministic C17 Verification Suite (Zero Float/Double)\n");
     printf("================================================================================\n");
 
     test_worldline_anti_tunneling();
@@ -1394,7 +1389,7 @@ int main(void) {
     test_fps120_hysteresis_governor();
 
     printf("================================================================================\n");
-    printf("  ✓ ALL 13 BLOOM v%s DETERMINISTIC C17 VERIFICATION GATES PASSED!\n", BLOOM_VERSION_STRING);
+    printf("  ✓ ALL 13 BLOOM DETERMINISTIC C17 VERIFICATION GATES PASSED!\n");
     printf("================================================================================\n");
     return 0;
 }

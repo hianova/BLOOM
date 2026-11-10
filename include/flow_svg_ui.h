@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "flow_gpu_abi.h"
+#include "flow_lean_abi.h"
 #include "ricardian.h"
 
 /*
@@ -46,32 +47,6 @@ FLOW_STATIC_ASSERT_UNIVALENT(FlowSvgUiDomState64, RicardianStateV4);
 _Static_assert(sizeof(FlowSvgUiDomState64) == 64U, "FlowSvgUiDomState64 must be 64 bytes");
 _Static_assert(_Alignof(FlowSvgUiDomState64) == 64U, "FlowSvgUiDomState64 must be 64-byte aligned");
 
-/*
- * 64-Byte Zero-Copy Broadcast & OBS Studio Telemetry Bridge Descriptor
- */
-#define FLOW_BROADCAST_MODE_IDLE         0U
-#define FLOW_BROADCAST_MODE_LIVE_OBS_SHM 1U
-#define FLOW_BROADCAST_MODE_REPLAY_4VCAM 2U
-
-typedef struct __attribute__((aligned(64))) {
-    uint64_t state_trajectory_hash;  /*  8B: Rolling deterministic hash of 64B state stream */
-    uint32_t iosurface_id_ring[3];   /* 12B: Triple-buffered macOS IOSurfaceID zero-copy handles */
-    uint32_t write_ring_slot;        /*  4B: Next write slot in [0..2] (never aliases read slot) */
-    uint32_t read_ring_slot;         /*  4B: Latest published slot for OBS Studio / Encoder [0..2] */
-    uint32_t broadcast_mode;         /*  4B: FLOW_BROADCAST_MODE_* (Idle / Live OBS / 4-VCam Replay) */
-    uint32_t published_frame_seq;    /*  4B: Monotonic published frame sequence number */
-    uint32_t active_vcam_mask;       /*  4B: Bitmask of active VCams (0xF = Post-Play 4-VCam Director) */
-    uint32_t highlight_jackpot_tick; /*  4B: Frame tick of latest Dopamine Jackpot highlight */
-    uint32_t replay_frames_buffered; /*  4B: Deterministic 64B state frames stored in replay ring */
-    uint32_t zero_copy_bytes_saved;  /*  4B: Cumulative MB of CPU readback avoided via IOSurface */
-    uint32_t obs_audio_sample_rate;  /*  4B: 48000 Hz binaural stereo feed rate */
-    uint64_t bridge_seal_mac;        /*  8B: Cryptographic OBS SHM packet integrity seal */
-} FlowBroadcastObsBridge64;
-
-FLOW_STATIC_ASSERT_UNIVALENT(FlowBroadcastObsBridge64, RicardianStateV4);
-_Static_assert(sizeof(FlowBroadcastObsBridge64) == 64U, "FlowBroadcastObsBridge64 must be 64 bytes");
-_Static_assert(_Alignof(FlowBroadcastObsBridge64) == 64U, "FlowBroadcastObsBridge64 must be 64-byte aligned");
-
 /* API: 1. Compile Declarative .svg Component Tree into 64B FlowSvgUiNode64 Array */
 size_t flow_svg_ui_compile_file(const char *svg_path,
                                 FlowSvgUiNode64 *out_nodes,
@@ -85,16 +60,7 @@ void flow_svg_ui_resolve_anchor_q16(const FlowSvgUiNode64 *node,
                                     int32_t *out_center_x_q16,
                                     int32_t *out_center_y_q16);
 
-/* API: 3. Reactive O(1) Telemetry Register Data Binding (Zero Virtual DOM Diff) */
-void flow_svg_ui_bind_telemetry_q16(FlowSvgUiNode64 *nodes,
-                                    size_t node_count,
-                                    uint32_t thermal_kelvin,
-                                    int32_t craft_speed_q16,
-                                    uint32_t active_vcam_id,
-                                    uint32_t dopamine_phase,
-                                    uint32_t broadcast_mode);
-
-/* API: 4. Wave64 O(1) Spatial Hit-Testing, 2-Jet Spring Micro-Interaction & Action Dispatch */
+/* API: 3. Wave64 O(1) Spatial Hit-Testing, 2-Jet Spring Micro-Interaction & Action Dispatch */
 uint32_t flow_svg_ui_step_interaction(FlowSvgUiNode64 *nodes,
                                       size_t node_count,
                                       FlowSvgUiDomState64 *dom,
@@ -102,22 +68,6 @@ uint32_t flow_svg_ui_step_interaction(FlowSvgUiNode64 *nodes,
                                       int32_t cursor_norm_y_q16,
                                       bool mouse_pressed,
                                       bool mouse_just_clicked);
-
-/* API: 5. Zero-Copy Broadcast & OBS Studio Shared-Memory Bridge */
-void flow_broadcast_obs_init64(FlowBroadcastObsBridge64 *bridge,
-                               uint32_t surface_id_0,
-                               uint32_t surface_id_1,
-                               uint32_t surface_id_2);
-
-void flow_broadcast_obs_publish_frame64(FlowBroadcastObsBridge64 *bridge,
-                                        uint32_t frame_seq,
-                                        uint32_t active_vcam_id,
-                                        uint32_t dopamine_phase,
-                                        uint64_t frame_state_hash);
-
-int flow_broadcast_obs_export_shm_packet(const FlowBroadcastObsBridge64 *bridge,
-                                         const FlowSvgUiDomState64 *dom,
-                                         const char *shm_file_path);
 
 /*
  * ============================================================================
@@ -315,91 +265,7 @@ int32_t flow_latex_eval_box_sdf_q16(const FlowLatexBoxNode64 *box,
 
 /*
  * ============================================================================
- * 10. 64-Byte Scripted Story Finisher ("劇情殺") & Scene Transition ("過渡動畫")
- *     One-Call Game Authoring Interface
- * ============================================================================
- * Enforces Lean 4 Formal Invariants (Theorems 15 & 16):
- *   - Plot-Armor HP Floor Gate (`story_execution_hp_floor_invariant`):
- *     Target/player HP is clamped >= `scripted_hp_floor_q16` during Anticipation
- *     so entities cannot die prematurely before the climax execution blow lands.
- *   - Zero-Pop-In Scene Wipe (`scene_transition_wipe_atomic_swap_bounded`):
- *     Wipe progress is strictly bounded in `[0, 65536]` and performs the atomic
- *     ticket/stage/seed swap at exact 100% occlusion (`FLOW_DIRECTOR_SCENE_TRANSITION`).
- * ============================================================================
- */
-#define FLOW_DIRECTOR_IDLE              0U /* Normal gameplay (1.0x time, 0 wipe, unlocked input) */
-#define FLOW_DIRECTOR_ANTICIPATION_LOCK 1U /* "劇情殺" Pre-strike lock: 2.39:1 letterbox, VCam blend, HP floor active */
-#define FLOW_DIRECTOR_CLIMAX_EXECUTION  2U /* "劇情殺" Climax strike: hitstop, SDF X-Ray shatter, HP floor released */
-#define FLOW_DIRECTOR_SCENE_TRANSITION  3U /* "過渡動畫" 100% Wipe Midpoint: atomic 0-pop-in stage/ticket swap */
-#define FLOW_DIRECTOR_RECOVERY_SETTLE   4U /* "過渡動畫" Wipe opening: retract letterbox & restore 1.0x gameplay */
-
-#define FLOW_TRANS_CINEMA_CUT           0U /* Instant frame-accurate smash cut + anamorphic flash */
-#define FLOW_TRANS_LIQUID_GLASS_WAVE    1U /* Beer-Lambert refractive liquid-glass wave sweep */
-#define FLOW_TRANS_IRIS_APERTURE        2U /* Circular SDF iris aperture close -> swap -> open */
-#define FLOW_TRANS_RELATIVISTIC_WARP    3U /* Lorentz star-streak radial tunnel warp transition */
-
-#define FLOW_INPUT_LOCK_NONE            0U /* All player controls active */
-#define FLOW_INPUT_LOCK_MOVEMENT        1U /* Lock steering/throttle, allow camera/UI */
-#define FLOW_INPUT_LOCK_FULL_CUTSCENE   3U /* Full cinematic lock during scripted finisher */
-#define FLOW_INPUT_LOCK_QTE_WINDOW      4U /* Only finisher trigger chord / QTE active */
-
-typedef struct __attribute__((aligned(64))) {
-    uint32_t script_id;             /*  4B: Active story finisher or transition choreography ID */
-    uint16_t director_phase;        /*  2B: FLOW_DIRECTOR_* state machine phase (0..4) */
-    uint16_t transition_style;      /*  2B: FLOW_TRANS_* procedural GPU wipe style (0..3) */
-    uint16_t input_lock_mask;       /*  2B: FLOW_INPUT_LOCK_* player input filter mask */
-    uint16_t atomic_swap_completed; /*  2B: 1 once midpoint 0-pop-in scene swap has executed */
-    uint32_t target_prefab_id;      /*  4B: Target boss/entity Prefab ID for scripted execution */
-    uint16_t target_vcam_id;        /*  2B: Locked VCam ID during finisher (0..3) */
-    uint8_t  next_ticket_preset_id; /*  1B: Next FlowObjectTicket64 preset swapped at midpoint */
-    uint8_t  next_stage_layer;      /*  1B: Next FlowStageLayer swapped atomically at midpoint */
-    uint32_t phase_elapsed_ms;      /*  4B: Elapsed milliseconds in current director phase */
-    uint32_t phase_duration_ms;     /*  4B: Target duration of current phase in milliseconds */
-    int32_t  wipe_progress_q16;     /*  4B: Procedural transition wipe occlusion [0..65536] */
-    int32_t  letterbox_aspect_q16;  /*  4B: 2.39:1 CinemaScope letterbox bar envelope [0..65536] */
-    int32_t  time_dilation_q16;     /*  4B: Relativistic hitstop / slow-mo scale (65536 = 1.0x) */
-    int32_t  scripted_hp_floor_q16; /*  4B: Plot-armor HP floor (>= 1 in lock, 0 at climax blow) */
-    int32_t  xray_cutaway_q16;      /*  4B: Automatic SDF X-Ray internal core shatter radius */
-    uint64_t world_facts_delta;     /*  8B: Narrative world-fact bitmask unlocked on completion */
-    uint64_t director_mac;          /*  8B: 64-bit deterministic choreography integrity MAC */
-} FlowNarrativeDirector64;
-
-FLOW_STATIC_ASSERT_UNIVALENT(FlowNarrativeDirector64, RicardianStateV4);
-_Static_assert(sizeof(FlowNarrativeDirector64) == 64U, "FlowNarrativeDirector64 must be 64 bytes");
-_Static_assert(_Alignof(FlowNarrativeDirector64) == 64U, "FlowNarrativeDirector64 must be 64-byte aligned");
-
-void flow_director_init64(FlowNarrativeDirector64 *dir);
-
-/* One-Call Authoring API: Trigger Scripted Story Finisher ("劇情殺") */
-void flow_director_trigger_story_finisher64(FlowNarrativeDirector64 *dir,
-                                            uint32_t script_id,
-                                            uint32_t target_prefab_id,
-                                            uint32_t vcam_id,
-                                            uint16_t transition_style,
-                                            int32_t hp_floor_q16);
-
-/* One-Call Authoring API: Trigger Standalone Scene Transition ("過渡動畫") */
-void flow_director_trigger_scene_transition64(FlowNarrativeDirector64 *dir,
-                                              uint32_t next_ticket_preset_id,
-                                              uint32_t next_stage_layer,
-                                              uint16_t transition_style,
-                                              uint32_t duration_ms);
-
-/* Plot-Armor / Scripted Finisher HP Floor Gate (Enforces Theorem 15) */
-int32_t flow_director_eval_hp_gate_q16(const FlowNarrativeDirector64 *dir,
-                                       int32_t raw_hp_q16);
-
-/* Deterministic Choreography Stepper (Enforces Theorem 16 & returns true on atomic swap frame) */
-bool flow_director_step_choreography64(FlowNarrativeDirector64 *dir,
-                                       uint32_t dt_ms,
-                                       uint32_t *out_active_vcam_id,
-                                       int32_t *out_trauma_boost_q16,
-                                       uint32_t *inout_ticket_preset_id,
-                                       uint32_t *inout_stage_layer);
-
-/*
- * ============================================================================
- * 11. 64-Byte Flexbox / Stack Auto-Layout Container, Generic Register Bank &
+ * 10. 64-Byte Flexbox / Stack Auto-Layout Container, Generic Register Bank &
  *     Interactive Text Input Widget State (General-Purpose Native App UI)
  * ============================================================================
  * Enforces Lean 4 Formal Invariants (Theorems 13, 14, 17, 18):
@@ -626,6 +492,78 @@ bool flow_native_dialog_prepare64(FlowNativeDialogDesc64 *dlg,
                                   uint32_t dialog_kind,
                                   uint32_t filter_mask,
                                   const char *payload_utf8);
+
+/*
+ * ============================================================================
+ * 11. Constraint-Projected 64B Semantic UI & Auto-Bento Synthesizer (Zero-XML)
+ * ============================================================================
+ * Replaces manual HTML/SVG coordinate & hex-color authoring:
+ *   - Theorem 21: Optical color & phase derived directly from hysteresis [b_exit, b_enter]
+ *   - Theorem 22: Auto-Bento grid layout synthesized with 0 manual (x, y, w, h) coordinates
+ *   - One-Call ABI Projection: Synthesizes complete interactive UI directly from FlowLeanAbiClause64
+ */
+#define FLOW_UI_ROLE_METRIC_GAUGE   1U
+#define FLOW_UI_ROLE_TOGGLE_SWITCH  2U
+#define FLOW_UI_ROLE_SCRUB_SLIDER   3U
+#define FLOW_UI_ROLE_STATUS_BADGE   4U
+#define FLOW_UI_ROLE_TEXT_FIELD     5U
+#define FLOW_UI_ROLE_ACTION_BUTTON  6U
+
+#define FLOW_UI_OPTICAL_SAFE        0U
+#define FLOW_UI_OPTICAL_HYST_WARN   1U
+#define FLOW_UI_OPTICAL_TRIP_ALERT  2U
+
+typedef struct __attribute__((aligned(64))) {
+    uint16_t semantic_role;     /*  2B: FLOW_UI_ROLE_* (Gauge, Toggle, Slider, Badge, Text, Button) */
+    uint16_t bind_channel;      /*  2B: Target FlowUiRegisterBank64 channel [0..11] */
+    uint16_t grid_span_cols;    /*  2B: Auto-Bento column span [1..4] (0 = auto 1 col) */
+    uint16_t optical_state;     /*  2B: Derived FLOW_UI_OPTICAL_* state (0=Safe, 1=Warn, 2=Alert) */
+    uint32_t action_id;         /*  4B: Dispatched action opcode on click/scrub/submit */
+    int32_t  b_exit_q16;        /*  4B: Constraint release threshold (from .lean / ABI) */
+    int32_t  b_enter_q16;       /*  4B: Constraint trip threshold (from .lean / ABI) */
+    int32_t  current_val_q16;   /*  4B: Live bound value from FlowUiRegisterBank64 */
+    uint32_t derived_rgb24;     /*  4B: Auto-derived optical color (0 manual hex color!) */
+    uint32_t node_id;           /*  4B: Assigned FlowSvgUiNode64 ID */
+    char     label_utf8[24];    /* 24B: Semantic intent label (e.g. "CORE_LOAD", "ZERO_ROOT") */
+    uint64_t intent_mac;        /*  8B: 64-bit semantic intent descriptor MAC */
+} FlowUiIntentSpec64;
+
+FLOW_STATIC_ASSERT_UNIVALENT(FlowUiIntentSpec64, RicardianStateV4);
+_Static_assert(sizeof(FlowUiIntentSpec64) == 64U, "FlowUiIntentSpec64 must be 64 bytes");
+_Static_assert(_Alignof(FlowUiIntentSpec64) == 64U, "FlowUiIntentSpec64 must be 64-byte aligned");
+
+uint16_t flow_ui_eval_constraint_optical_state(int32_t val_q16,
+                                               int32_t b_exit_q16,
+                                               int32_t b_enter_q16,
+                                               uint32_t *out_rgb24);
+
+void flow_ui_intent_init64(FlowUiIntentSpec64 *intent,
+                           uint16_t semantic_role,
+                           const char *label_utf8,
+                           uint16_t bind_channel,
+                           int32_t b_exit_q16,
+                           int32_t b_enter_q16,
+                           uint32_t action_id,
+                           uint16_t grid_span_cols);
+
+size_t flow_ui_synthesize_bento64(FlowUiIntentSpec64 *intents,
+                                  size_t intent_count,
+                                  const FlowUiRegisterBank64 *bank,
+                                  uint32_t grid_cols,
+                                  uint32_t viewport_w_px,
+                                  uint32_t viewport_h_px,
+                                  FlowSvgUiNode64 *out_nodes,
+                                  size_t max_nodes,
+                                  FlowSvgUiDomState64 *out_dom);
+
+size_t flow_ui_project_from_abi64(const FlowLeanClause64 *clause,
+                                  const FlowUiRegisterBank64 *bank,
+                                  uint32_t viewport_w_px,
+                                  uint32_t viewport_h_px,
+                                  FlowUiIntentSpec64 *out_intents,
+                                  FlowSvgUiNode64 *out_nodes,
+                                  size_t max_nodes,
+                                  FlowSvgUiDomState64 *out_dom);
 
 #endif /* FLOW_SVG_UI_H */
 
