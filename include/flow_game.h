@@ -674,5 +674,66 @@ FlowFrameGovernor64 flow_game_step_fps_governor(FlowGameEngineState *engine,
 
 bool flow_fps_governor_verify(const FlowFrameGovernor64 *gov);
 
+/*
+ * ============================================================================
+ * Subsystem 11: Overflow-Safe 64-Bit Widened Q16.16 Physics & Art Helpers
+ * ============================================================================
+ * Eliminates 32-bit intermediate overflow hazards when composing Q16.16 scales,
+ * area-preserving squash/stretch, and thermodynamic range normalization.
+ * ============================================================================
+ */
+static inline int32_t flow_q16_mul_safe(int32_t a_q16, int32_t b_q16) {
+    int64_t prod = ((int64_t)a_q16 * (int64_t)b_q16) >> 16;
+    if (prod > 2147483647LL) {
+        return 2147483647;
+    }
+    if (prod < -2147483648LL) {
+        return (int32_t)(-2147483647LL - 1LL);
+    }
+    return (int32_t)prod;
+}
+
+static inline int32_t flow_q16_lerp_clamped(int32_t a_q16, int32_t b_q16, int32_t t_q16) {
+    int32_t t_clamped = (t_q16 < 0) ? 0 : ((t_q16 > 65536) ? 65536 : t_q16);
+    int64_t delta = (int64_t)b_q16 - (int64_t)a_q16;
+    int64_t interp = (int64_t)a_q16 + ((delta * (int64_t)t_clamped) >> 16);
+    if (interp > 2147483647LL) {
+        return 2147483647;
+    }
+    if (interp < -2147483648LL) {
+        return (int32_t)(-2147483647LL - 1LL);
+    }
+    return (int32_t)interp;
+}
+
+static inline int32_t flow_q16_norm_range_clamped(int32_t val, int32_t lo, int32_t hi) {
+    if (hi <= lo || val <= lo) {
+        return 0;
+    }
+    if (val >= hi) {
+        return 65536;
+    }
+    int64_t num = ((int64_t)(val - lo)) << 16;
+    int64_t den = (int64_t)(hi - lo);
+    return (int32_t)(num / den);
+}
+
+static inline int32_t flow_q16_area_preserve_perp(int32_t parallel_scale_q16) {
+    if (parallel_scale_q16 <= 4096) {
+        return 65536;
+    }
+    uint64_t num = (1ULL << 32U) + ((uint64_t)(uint32_t)parallel_scale_q16 >> 1U);
+    uint64_t perp = num / (uint64_t)(uint32_t)parallel_scale_q16;
+    return (perp > 1048576ULL) ? 1048576 : (int32_t)perp;
+}
+
+static inline int32_t flow_q16_area_preserve_product(int32_t sx_q16, int32_t sy_q16) {
+    if (sx_q16 <= 0 || sy_q16 <= 0) {
+        return 0;
+    }
+    uint64_t prod = ((uint64_t)(uint32_t)sx_q16 * (uint64_t)(uint32_t)sy_q16) >> 16U;
+    return (prod > 2147483647ULL) ? 2147483647 : (int32_t)prod;
+}
+
 #endif /* FLOW_GAME_H */
 

@@ -53,8 +53,17 @@
   #define FLOW_OUT_F32(name)                out float name
   #define mix(a, b, t)                      lerp((a), (b), (t))
   #define fract(x)                          frac(x)
+#elif defined(FLOW_SHADER_TARGET_WEBGPU_WGSL)
+  /* 4. WebGPU (Dawn / wgpu) Portable 32-Bit Pair Compute Bridge */
+  #define FLOW_SHADER_BACKEND_NAME          "WebGPU-WGSL-U32x2"
+  #define FLOW_GPU_INLINE                   static inline
+  #define FLOW_THREAD_ADDR
+  #define FLOW_CONSTANT_ADDR                const
+  #define FLOW_CONST_REF(type)              const type *
+  #define FLOW_THREAD_CREF(type)            const type *
+  #define FLOW_OUT_F32(name)                float *name
 #else
-  /* 4. Pure C17 Host Compiler / FLOWY Static Analyzer */
+  /* 5. Pure C17 Host Compiler / FLOWY Static Analyzer */
   #define FLOW_SHADER_BACKEND_NAME          "C17-Host-JSI-Bridge"
   #define FLOW_GPU_INLINE                   static inline
   #define FLOW_THREAD_ADDR
@@ -69,15 +78,25 @@
 #define FLOW_JSI_BUS1K_SLOT_COUNT           16U
 
 /*
- * Portable 32-Bit Pair Wave64 Tile Bitmask Test:
- * Evaluates a 64-bit Wave64 tile mask split into two 32-bit unsigned words (lo32, hi32),
- * eliminating the need for 64-bit integer shader extensions on WebGPU (WGSL) & mobile Vulkan.
+ * Portable 32-Bit Pair Wave64 Tile Bitmask Test & 64-Bit Carry-Propagating Algebra:
+ * Evaluates 64-bit Wave64 masks and Bus1K fences split into two 32-bit unsigned words (lo32, hi32),
+ * eliminating the need for 64-bit integer shader extensions on WebGPU (WGSL), Vulkan & DX12.
  */
 #if defined(__METAL_VERSION__) || defined(FLOW_SHADER_TARGET_VULKAN_GLSL) || defined(FLOW_SHADER_TARGET_HLSL)
 FLOW_GPU_INLINE bool flow_wave64_mask_test_u32x2(uint lo32, uint hi32, uint bit_idx) {
     uint word = (bit_idx < 32U) ? lo32 : hi32;
     uint shift = bit_idx & 31U;
     return ((word >> shift) & 1U) != 0U;
+}
+
+FLOW_GPU_INLINE uint flow_u32x2_add_lo(uint a_lo, uint b_lo) {
+    return a_lo + b_lo;
+}
+
+FLOW_GPU_INLINE uint flow_u32x2_add_hi(uint a_lo, uint a_hi, uint b_lo, uint b_hi) {
+    uint sum_lo = a_lo + b_lo;
+    uint carry = (sum_lo < a_lo) ? 1U : 0U;
+    return a_hi + b_hi + carry;
 }
 #endif
 
