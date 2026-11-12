@@ -1,156 +1,77 @@
-# ==============================================================================
-# BLOOM: 100% Pure C17 Visual, Optics, Procedural SDF/CSG & Semantic UI Engine
-# ==============================================================================
-CC ?= clang
+export PATH := $(HOME)/.elan/bin:/opt/homebrew/opt/llvm/bin:/opt/homebrew/bin:/usr/local/bin:$(PATH)
 
-CFLAGS = -std=c17 -Wall -Wextra -Werror -O2 -pthread \
-         -Iinclude -I../FLOW/src -I../FLOW/build
+LEAN    ?= lean
+SWIFTC  ?= swiftc
+UNAME_S := $(shell uname -s)
+PREFIX  ?= /usr/local
 
-FLOW_DIR = ../FLOW
-FLOW_LIB = $(FLOW_DIR)/build/libflow_rt.a
-FLOWY_DIR = ../FLOWY
-FLOWY_BIN = $(FLOWY_DIR)/build/flowy
+FLOW_DIR   ?= $(abspath ../FLOW)
+UNIT_DIR   ?= $(abspath ../UNIT)
+FLOW_BUILD := $(FLOW_DIR)/build
+UNIT_BUILD := $(UNIT_DIR)/build
+FLOW_BIN   ?= $(FLOW_BUILD)/flow
 
-TARGET_ABI_OBJ    = build/lean_abi_bridge.o
-TARGET_ASSETS_OBJ = build/flow_assets.o
-TARGET_ENGINE_OBJ = build/engine_core.o
-TARGET_PREFAB_OBJ = build/prefab_ssot.o
-TARGET_CINE_OBJ   = build/cine_camera.o
-TARGET_SVGUI_OBJ  = build/svg_ui_core.o
+BUILD_DIR   := build
+BLOOM_OLEAN := $(BUILD_DIR)/Bloom.olean
+METAL_COSIM := $(BUILD_DIR)/metal_cosim
 
-BLOOM_OBJS = $(TARGET_ABI_OBJ) $(TARGET_ASSETS_OBJ) $(TARGET_ENGINE_OBJ) \
-             $(TARGET_PREFAB_OBJ) $(TARGET_CINE_OBJ) $(TARGET_SVGUI_OBJ)
-BLOOM_LIB  = build/libbloom.a
+SHADERS := shaders/bloom_core.metal shaders/bloom_core.wgsl
 
-TARGET_TEST_CORE   = build/test-bloom
-TARGET_TEST_PREFAB = build/test-prefab-ssot
-TARGET_TEST_ASSETS = build/test-flow-assets
-TARGET_TEST_CINE   = build/test-cine-camera
-TARGET_TEST_SVGUI  = build/test-svg-ui
+.DEFAULT_GOAL := all
+.PHONY: all test clean install uninstall upstream-deps shader-gate
 
-.PHONY: all test clean dirs verify-flowy verify-lean-all
+ifeq ($(UNAME_S),Darwin)
+all: $(BLOOM_OLEAN) $(METAL_COSIM)
+else
+all: $(BLOOM_OLEAN)
+endif
 
-all: $(BLOOM_LIB) $(TARGET_TEST_CORE) $(TARGET_TEST_PREFAB) $(TARGET_TEST_ASSETS) $(TARGET_TEST_CINE) $(TARGET_TEST_SVGUI)
+$(BUILD_DIR):
+	@mkdir -p $(BUILD_DIR)
 
-dirs:
-	@mkdir -p build build/.lean_stamps
+upstream-deps:
+	@test -f "$(FLOW_BUILD)/Flow.olean" && test -x "$(FLOW_BIN)" || $(MAKE) -C "$(FLOW_DIR)" all
+	@test -f "$(UNIT_BUILD)/Unit.olean" || $(MAKE) -C "$(UNIT_DIR)" all
 
-$(FLOW_LIB):
-	@echo "▶ Building FLOW runtime in $(FLOW_DIR)..."
-	$(MAKE) -C $(FLOW_DIR) all
+$(BLOOM_OLEAN): Bloom.lean | $(BUILD_DIR) upstream-deps
+	@echo "=== [Gate 1] BLOOM Pure Lean 4 Formal Proof Check (0 sorryAx, 0 C/C++/Obj-C files) ==="
+	LEAN_PATH="$(FLOW_BUILD):$(UNIT_BUILD)" $(LEAN) -DwarningAsError=true -o $@ Bloom.lean
+	@ax="$$(printf 'import Bloom\n#print axioms Bloom.Geometry.poly_smin_bounded_below_min\n#print axioms Bloom.Geometry.swept_segment_catches_midstep_tunneling\n#print axioms Bloom.Geometry.rigid_isometry_preserves_dist_sq\n#print axioms Bloom.Geometry.bvh_parent_union_encloses_children\n#print axioms Bloom.Optics.gladstone_dale_vacuum_and_monotone\n#print axioms Bloom.Optics.schlick_fresnel_grazing_and_bounds\n#print axioms Bloom.Optics.beer_lambert_energy_conserving\n#print axioms Bloom.Optics.thin_lens_in_focus_zero_coc_and_symmetric\n#print axioms Bloom.Optics.camera_pullback_isolates_collision_shocks\n#print axioms Bloom.Optics.strobe_trc_clamp_isolates_flash_spikes\n#print axioms Bloom.Ui.bento_split_disjoint_and_conserves_area\n#print axioms Bloom.Ui.wave64_u32x2_bijection\n#print axioms Bloom.GpuAbi.gpuPacket64_toBytes_size\n#print axioms Bloom.GpuAbi.q16MulNatSplit_exact\n' | LEAN_PATH="$(FLOW_BUILD):$(UNIT_BUILD):$(BUILD_DIR)" $(LEAN) --stdin)" && \
+		! printf '%s\n' "$$ax" | grep -q 'sorryAx'
+	@test -z "$$(find . -maxdepth 3 \( -name '*.c' -o -name '*.h' -o -name '*.cpp' -o -name '*.cc' -o -name '*.m' -o -name '*.mm' \) -not -path './build/*')"
+	@echo "  [PASS] $(BLOOM_OLEAN) compiled (0 sorryAx, 0 .c/.h/.cpp/.m files)"
 
-$(FLOWY_BIN): $(FLOW_LIB)
-	@echo "▶ Building FLOWY companion CLI in $(FLOWY_DIR)..."
-	$(MAKE) -C $(FLOWY_DIR) all
+$(METAL_COSIM): tests/metal_cosim.swift $(SHADERS) | $(BUILD_DIR)
+	@echo "=== [Gate 2] Apple Metal Unified Memory Runner & MSL Kernel Compilation ==="
+	$(SWIFTC) -O -warnings-as-errors -framework Metal -framework Foundation tests/metal_cosim.swift -o $(METAL_COSIM)
+	./$(METAL_COSIM) --compile-only shaders/bloom_core.metal
 
-LEAN_SRCS = research/LeanFlowAbi.lean \
-            research/AssetPipeline.lean \
-            research/physics/HighSpeedPhysics.lean \
-            research/SvgUiFramework.lean \
-            research/ricardian.lean
+shader-gate: $(SHADERS)
+ifeq ($(UNAME_S),Darwin)
+	@$(MAKE) $(METAL_COSIM)
+endif
+	@if command -v naga >/dev/null 2>&1; then \
+		naga shaders/bloom_core.wgsl && echo "  [PASS] naga validated shaders/bloom_core.wgsl"; \
+	fi
 
-LEAN_ALL_STAMP = build/.lean_stamps/.all_lean.stamp
-
-$(LEAN_ALL_STAMP): $(LEAN_SRCS) $(FLOWY_BIN) | dirs
-	@mkdir -p build/.lean_stamps
-	@echo ""
-	@echo "▶ Step 3: Lean 4 Parallel Batch Verification ($(words $(LEAN_SRCS)) specifications, 0 sorryAx)..."
-	$(FLOWY_BIN) lean --verify-all $(LEAN_SRCS)
-	@touch $@
-
-verify-lean-all: $(FLOWY_BIN)
-	$(FLOWY_BIN) lean --verify-all $(LEAN_SRCS)
-
-verify-flowy: $(FLOWY_BIN) $(LEAN_ALL_STAMP)
-	@echo ""
+test: all shader-gate TestBloom.lean
+	@echo "=== [Gate 3] .flow Runtime + 0-ULP GPU/CPU Co-Verification + PPM/Kitty Egress ==="
+	FLOW_BIN="$(FLOW_BIN)" LEAN_PATH="$(FLOW_BUILD):$(UNIT_BUILD):$(BUILD_DIR)" \
+		$(LEAN) -DwarningAsError=true --run TestBloom.lean
 	@echo "================================================================================"
-	@echo " [Gate 0/5] FLOWY Cross-Layer Audit (64B Matrix, LLVM IR & Lean 4)"
+	@echo "   ALL BLOOM VERIFICATION GATES PASSED (0 .c/.h/.m, 0 sorryAx, 0-ULP GPU==CPU)"
 	@echo "================================================================================"
-	@echo "▶ Step 1: Auditing 64-Byte Univalence Across All 8 Engine, Lean-ABI, Asset & GPU Headers..."
-	$(FLOWY_BIN) slice include/ricardian.h --audit-all
-	$(FLOWY_BIN) slice include/flow_lean_abi.h --audit-all
-	$(FLOWY_BIN) slice include/flow_assets.h --audit-all
-	$(FLOWY_BIN) slice include/flow_game.h --audit-all
-	$(FLOWY_BIN) slice include/flow_prefab_ssot.h --audit-all
-	$(FLOWY_BIN) slice include/flow_cine_camera.h --audit-all
-	$(FLOWY_BIN) slice include/flow_gpu_abi.h --audit-all
-	$(FLOWY_BIN) slice include/flow_svg_ui.h --audit-all
-	@echo "▶ Step 2: LLVM IR Static Audit (100% Pure C17: 0-Float / 0-Heap)..."
-	$(FLOWY_BIN) slice src/lean_abi_bridge.c --llvm-ir
-	$(FLOWY_BIN) slice src/flow_assets.c --llvm-ir
-	$(FLOWY_BIN) slice src/engine_core.c --llvm-ir
-	$(FLOWY_BIN) slice src/prefab_ssot.c --llvm-ir
-	$(FLOWY_BIN) slice src/cine_camera.c --llvm-ir
-	$(FLOWY_BIN) slice src/svg_ui_core.c --llvm-ir
-	@echo "▶ Step 3: Lean 4 SSOT Physics & Invariant Verification (Cached / Parallel: 0 sorryAx verified)"
-	@echo "▶ Step 4: FLOWY Relativistic & Timing Wheel Algebraic Wind Tunnel..."
-	$(FLOWY_BIN) diff --mode relativistic --trials 10000
-	@echo "✓ GATE 0: ALL CROSS-LAYER DETERMINISTIC AUDITS PASSED!"
 
-HEADERS = include/bloom.h include/ricardian.h include/flow_lean_abi.h include/flow_assets.h include/flow_game.h include/flow_prefab_ssot.h include/flow_cine_camera.h include/flow_gpu_abi.h include/flow_svg_ui.h include/flow_shader_portability.h
+install: $(BLOOM_OLEAN)
+	mkdir -p $(DESTDIR)$(PREFIX)/lib/flow $(DESTDIR)$(PREFIX)/share/bloom/shaders
+	install -m 644 Bloom.lean $(DESTDIR)$(PREFIX)/lib/flow/Bloom.lean
+	install -m 644 $(BLOOM_OLEAN) $(DESTDIR)$(PREFIX)/lib/flow/Bloom.olean
+	install -m 644 shaders/bloom_core.metal $(DESTDIR)$(PREFIX)/share/bloom/shaders/bloom_core.metal
+	install -m 644 shaders/bloom_core.wgsl $(DESTDIR)$(PREFIX)/share/bloom/shaders/bloom_core.wgsl
 
-$(TARGET_ABI_OBJ): src/lean_abi_bridge.c include/flow_lean_abi.h $(FLOW_LIB) | dirs
-	$(CC) $(CFLAGS) -c src/lean_abi_bridge.c -o $@
-
-$(TARGET_ASSETS_OBJ): src/flow_assets.c include/flow_assets.h include/flow_lean_abi.h $(FLOW_LIB) | dirs
-	$(CC) $(CFLAGS) -c src/flow_assets.c -o $@
-
-$(TARGET_ENGINE_OBJ): src/engine_core.c include/flow_game.h include/flow_lean_abi.h include/flow_prefab_ssot.h include/flow_cine_camera.h $(FLOW_LIB) | dirs
-	$(CC) $(CFLAGS) -c src/engine_core.c -o $@
-
-$(TARGET_PREFAB_OBJ): src/prefab_ssot.c include/flow_prefab_ssot.h $(FLOW_LIB) | dirs
-	$(CC) $(CFLAGS) -c src/prefab_ssot.c -o $@
-
-$(TARGET_CINE_OBJ): src/cine_camera.c include/flow_cine_camera.h $(FLOW_LIB) | dirs
-	$(CC) $(CFLAGS) -c src/cine_camera.c -o $@
-
-$(TARGET_SVGUI_OBJ): src/svg_ui_core.c include/flow_svg_ui.h include/flow_gpu_abi.h $(FLOW_LIB) | dirs
-	$(CC) $(CFLAGS) -c src/svg_ui_core.c -o $@
-
-$(BLOOM_LIB): $(BLOOM_OBJS) | dirs
-	ar rcs $@ $(BLOOM_OBJS)
-
-$(TARGET_TEST_CORE): tests/test_flow_game.c $(HEADERS) $(BLOOM_LIB) $(FLOW_LIB) | dirs
-	$(CC) $(CFLAGS) tests/test_flow_game.c $(BLOOM_LIB) $(FLOW_LIB) -o $@
-
-$(TARGET_TEST_PREFAB): tests/test_prefab_ssot.c $(HEADERS) $(BLOOM_LIB) $(FLOW_LIB) | dirs
-	$(CC) $(CFLAGS) tests/test_prefab_ssot.c $(BLOOM_LIB) $(FLOW_LIB) -o $@
-
-$(TARGET_TEST_ASSETS): tests/test_flow_assets.c $(HEADERS) $(BLOOM_LIB) $(FLOW_LIB) | dirs
-	$(CC) $(CFLAGS) tests/test_flow_assets.c $(BLOOM_LIB) $(FLOW_LIB) -o $@
-
-$(TARGET_TEST_CINE): tests/test_cine_camera.c $(HEADERS) $(BLOOM_LIB) $(FLOW_LIB) | dirs
-	$(CC) $(CFLAGS) tests/test_cine_camera.c $(BLOOM_LIB) $(FLOW_LIB) -o $@
-
-$(TARGET_TEST_SVGUI): tests/test_svg_ui_framework.c $(HEADERS) $(BLOOM_LIB) $(FLOW_LIB) | dirs
-	$(CC) $(CFLAGS) tests/test_svg_ui_framework.c $(BLOOM_LIB) $(FLOW_LIB) -o $@
-
-test: verify-flowy all
-	@echo ""
-	@echo "================================================================================"
-	@echo " [Gate 1/5] Core Engine Verification (Worldline, Padding, Hitstop, Wave64, Ricardian)"
-	@echo "================================================================================"
-	./$(TARGET_TEST_CORE)
-	@echo ""
-	@echo "================================================================================"
-	@echo " [Gate 2/5] SSOT + 64B Prefab + Art Bible + Wave64 + TRC Accessibility"
-	@echo "================================================================================"
-	./$(TARGET_TEST_PREFAB)
-	@echo ""
-	@echo "================================================================================"
-	@echo " [Gate 3/5] 64B Asset Pipeline (WAV/GLB/BVH/Brick), Lean-ABI, Matter & Cloud Room"
-	@echo "================================================================================"
-	./$(TARGET_TEST_ASSETS)
-	@echo ""
-	@echo "================================================================================"
-	@echo " [Gate 4/5] FlowCineRig64 Cinematography, Hysteresis & Physical Camera Optics"
-	@echo "================================================================================"
-	./$(TARGET_TEST_CINE)
-	@echo ""
-	@echo "================================================================================"
-	@echo " [Gate 5/5] BLOOM Constraint-Projected 64B Semantic UI, Glass, LaTeX & Auto-Bento"
-	@echo "================================================================================"
-	./$(TARGET_TEST_SVGUI)
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/lib/flow/Bloom.lean $(DESTDIR)$(PREFIX)/lib/flow/Bloom.olean
+	rm -rf $(DESTDIR)$(PREFIX)/share/bloom
 
 clean:
-	rm -rf build
+	rm -rf $(BUILD_DIR)

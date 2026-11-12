@@ -1,0 +1,58 @@
+name: CI
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  push:
+    branches: [ main, "feat/**", "refactor/**" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  verify-bloom:
+    name: Pure Lean 4 + Cross-Platform Shaders + Metal Co-Sim (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    steps:
+      - name: Checkout FLOW (v5.0.0)
+        uses: actions/checkout@v4
+        with:
+          repository: hianova/FLOW
+          path: FLOW
+
+      - name: Checkout UNIT (v2.0.0)
+        uses: actions/checkout@v4
+        with:
+          repository: hianova/UNIT
+          path: UNIT
+
+      - name: Checkout BLOOM
+        uses: actions/checkout@v4
+        with:
+          path: BLOOM
+
+      - name: Install Lean 4 & Clang (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang curl
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain leanprover/lean4:stable
+
+      - name: Install Lean 4 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain leanprover/lean4:stable
+
+      - name: Build Upstream FLOW & UNIT + Run BLOOM Verification Gates
+        env:
+          BLOOM_CI_ALLOW_NO_GPU: "1"
+        run: |
+          export PATH="$HOME/.elan/bin:$PATH"
+          make -C FLOW all
+          make -C UNIT all
+          make -C BLOOM clean && make -C BLOOM test
