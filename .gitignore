@@ -3,6 +3,8 @@ build/
 *.olean
 *.ppm
 
-# OS & editor metadata
+# OS, Python & editor metadata
 .DS_Store
 .obsidian/
+__pycache__/
+*.pyc

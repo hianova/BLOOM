@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- BLOOM v6.0.0 — Browser-Previewable Declarative SVG-UI Studio Blueprint -->
+<!-- Compiles 0-malloc into 64-Byte BloomUiNode64[] + BloomGlyph64[] cells -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
+  <rect x="0" y="0" width="1280" height="720" fill="#0A0E17" data-node-id="0"/>
+
+  <!-- Node 1: Top Studio Inspector Header Bar (Crystal Glass) -->
+  <rect id="top_header_bar" data-node-id="1" data-prim="1" data-glass="0"
+        x="24" y="18" width="1232" height="52" rx="14"
+        fill="#20D8FF" fill-opacity="0.22" stroke="#20D8FF" stroke-width="2"/>
+
+  <!-- Node 2: 3D SDF X-Ray Cutaway Continuous Scrubbing Slider (Pointer Capture) -->
+  <rect id="slider_xray_cutaway" data-node-id="2" data-prim="4" data-glass="1"
+        data-bind="0" data-action="1" data-init-q16="32768"
+        x="36" y="626" width="340" height="56" rx="14"
+        fill="#00E8C6" fill-opacity="0.28" stroke="#00E8C6" stroke-width="2"/>
+
+  <!-- Node 3: Non-Destructive Prefab Revert-to-SSOT Button -->
+  <rect id="btn_prefab_revert" data-node-id="3" data-prim="1" data-glass="1"
+        data-action="2" data-init-q16="65536"
+        x="396" y="626" width="180" height="56" rx="14"
+        fill="#FFB020" fill-opacity="0.28" stroke="#FFB020" stroke-width="2"/>
+
+  <!-- Node 4: Cycle Constitutive Matter Preset Button -->
+  <rect id="btn_cycle_matter" data-node-id="4" data-prim="1" data-glass="2"
+        data-action="3" data-init-q16="49152"
+        x="596" y="626" width="180" height="56" rx="14"
+        fill="#58A8FF" fill-opacity="0.28" stroke="#58A8FF" stroke-width="2"/>
+
+  <!-- Node 5: FLOW v6.0.0 @swap Chart Mode Button -->
+  <rect id="btn_swap_chart" data-node-id="5" data-prim="1" data-glass="1"
+        data-action="4" data-init-q16="32768"
+        x="796" y="626" width="180" height="56" rx="14"
+        fill="#FF4870" fill-opacity="0.28" stroke="#FF4870" stroke-width="2"/>
+
+  <!-- Node 6: Reactive Telemetry Ring Gauge -->
+  <circle id="ring_telemetry_sla" data-node-id="6" data-prim="2" data-glass="0"
+          data-bind="1" data-init-q16="52428"
+          cx="1042" cy="654" r="28" stroke="#20F0B8" stroke-width="7" fill="#20F0B8" fill-opacity="0.20"/>
+
+  <!-- Node 7: 7-Segment Numeric Readout (Bound Channel 2: Kelvin / Selected ID) -->
+  <rect id="readout_kelvin" data-node-id="7" data-prim="6" data-glass="1"
+        data-bind="2" data-init-q16="300"
+        x="1096" y="626" width="152" height="56" rx="12"
+        fill="#20FFD0" fill-opacity="0.22" stroke="#20FFD0" stroke-width="2"/>
+
+  <!-- Node 8: Analytic SDF LaTeX Formula Glass Card -->
+  <rect id="panel_latex_optics" data-node-id="8" data-prim="5" data-glass="0"
+        data-init-q16="65536"
+        x="936" y="88" width="312" height="76" rx="14"
+        fill="#FFD848" fill-opacity="0.18" stroke="#FFD848" stroke-width="2"/>
+
+  <!-- Vector Icon Glyph 1: 3D Cube / Reticle Path -->
+  <path id="icon_reticle" data-glyph-id="1"
+        d="M 480 360 L 640 240 L 800 360 L 640 480 Z"
+        fill="none" stroke="#00FFCC" stroke-width="4"/>
+
+  <!-- Vector Icon Glyph 2: Crosshair Lines -->
+  <line data-glyph-id="2" x1="600" y1="360" x2="680" y2="360" stroke="#20D8FF" stroke-width="3"/>
+  <line data-glyph-id="2" x1="640" y1="320" x2="640" y2="400" stroke="#20D8FF" stroke-width="3"/>
+</svg>
