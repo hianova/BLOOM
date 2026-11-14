@@ -12,18 +12,18 @@ on:
 
 jobs:
   build-and-verify-bloom:
-    name: BLOOM v6.0.0 Compile-Time Boundary Gate (${{ matrix.os }})
+    name: BLOOM v7.0.1 Compile-Time Boundary Gate (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ ubuntu-latest, macos-latest ]
     steps:
-      - name: Checkout FLOW (v6.0.0)
+      - name: Checkout FLOW (v7.0.1)
         uses: actions/checkout@v4
         with:
           repository: hianova/FLOW
-          ref: v6.0.0
+          ref: v7.0.1
           path: FLOW
 
       - name: Checkout BLOOM

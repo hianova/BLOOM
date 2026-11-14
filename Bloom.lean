@@ -1,10 +1,12 @@
 /-
-  BLOOM v6.0.0 — 64-Byte Three.js + React Native + Prefab SSOT Engine
+  BLOOM v7.0.1 — 64-Byte Three.js + React Native + Prefab SSOT Engine
   ===================================================================
-  Top-Level Interactive Lean 4 Host + Formal Verification Kernel (`0 sorryAx`).
-  Bridges directly via Zero-Copy JSI (`@[extern]`) over a 16,384-byte (256 × 64B)
-  VM-page-aligned Arena shared with `libbloom.a`, `FLOW v6.0.0`, and the single-source
-  `shaders/bloom_core.wgsl` compute kernel via SDL3 GPU (Metal MSL 2.4 & Vulkan SPIR-V).
+  AOT Formal Verification Kernel (`22` Theorems, `0 sorryAx`) + Declarative
+  React-Native Nested Flexbox Compiler (`UiElement` -> `16,384B` `.bloom` Arena).
+  Compiles and seals `build/studio.bloom` (`256 × 64B` VM page) consumed directly
+  by the standalone zero-Lean-runtime pure C17 native runner (`build/bloom`) over
+  `libbloom.a`, `FLOW v7.0.1` (`flow.h` + `searu.h` + `flow_opt_params.h`), and
+  `shaders/bloom_core.wgsl` (`SDL3 GPU`).
 -/
 
 import Flow
@@ -12,7 +14,7 @@ import Std.Tactic.BVDecide
 
 namespace Bloom
 
-def version       : String := "6.0.0"
+def version       : String := "7.0.1"
 def cellBytes     : Nat    := 64
 def arenaCells    : Nat    := 256
 def arenaBytes    : Nat    := arenaCells * cellBytes
@@ -143,6 +145,17 @@ theorem prefab_revert_idempotent (inst : PrefabInstModel) :
     revertToSSOT (revertToSSOT inst) = revertToSSOT inst := by
   rfl
 
+/-- Nested React-Native Flexbox child span `[parentLo + pad + offset, parentLo + pad + offset + childSpan]`
+    never overflows the padded parent container `[parentLo + pad, parentHi - pad]`. -/
+theorem flex_child_span_bounded (parentLo parentHi pad offset childSpan : Int)
+    (hPad : 0 <= pad) (hOff : 0 <= offset) (hSpan : 0 <= childSpan)
+    (hFit : 2 * pad + offset + childSpan <= parentHi - parentLo) :
+    parentLo <= parentLo + pad + offset ∧
+    parentLo + pad + offset <= parentLo + pad + offset + childSpan ∧
+    parentLo + pad + offset + childSpan <= parentHi - pad ∧
+    parentHi - pad <= parentHi := by
+  omega
+
 /-! ### Machine-Word Hardware & ABI Bit-Blasted Theorems (`Std.Tactic.BVDecide` CaDiCaL SAT) -/
 
 /-- Exact C17/WGSL 32-bit masked arena slot index `idx & 0xFFu` is OOB-immune across all `2^32` words. -/
@@ -232,6 +245,32 @@ theorem prefab_override_revert_flags_bv16 (flags : BitVec 16) (hClean : (flags &
     (ovr &&& 4#16) = 4#16 ∧ rev = flags ∧ (rev &&& 4#16) = 0#16 := by
   bv_decide
 
+/-- Exact C17/WGSL inline UI label table (`BLOOM_SLOT_UI_LABEL_BASE = 250`, 4 × 16B labels per 64B cell)
+    maps any masked UI node index `idx & 15` strictly into Arena Slots `[250 .. 253]` (`< 254`). -/
+theorem ui_label_slot_inbounds_bv32 (idx : BitVec 32) :
+    let slot := 250#32 + ((idx &&& 15#32) >>> 2#32)
+    BitVec.ule 250#32 slot = true ∧ BitVec.ult slot 254#32 = true := by
+  bv_decide
+
+/-- Exact 64-bit `searu_heal_and_swap` phase-gate predicate (`FLOW v7.0.1`):
+    SEARU wakes ONLY at `!CONVERGED && dt == 0` barriers, guaranteeing zero-chaos silence
+    whenever `FLOW_STATUS_CONVERGED` (`bit 0`) is asserted or `dt != 0` (active 2-Jet descent). -/
+def searuHealGateBV64 (status64 dt64 : BitVec 64) : Bool :=
+  ((status64 &&& 1#64) == 0#64) && (dt64 == 0#64)
+
+theorem searu_phase_gate_silence_bv64 (status64 dt64 : BitVec 64)
+    (hSmooth : (status64 &&& 1#64) != 0#64 ∨ dt64 != 0#64) :
+    searuHealGateBV64 status64 dt64 = false := by
+  unfold searuHealGateBV64
+  bv_decide
+
+/-- Exact 64-bit `SEARU_SOLVE_INLINE` / `searu_ring0_step_1bit` Kan-pinned Sparse-`k` XOR mutation
+    `cur ^^^ (flip &&& ~~~kanPin)` strictly preserves all hardware-pinned bits across `2^192` states. -/
+theorem searu_kan_pin_flip_invariant_bv64 (cur flip kanPin : BitVec 64) :
+    let next := cur ^^^ (flip &&& ~~~kanPin)
+    (next &&& kanPin) = (cur &&& kanPin) := by
+  bv_decide
+
 /-! ## Part 2: Declarative Three.js + React Native + Prefab SSOT JSI Host API -/
 
 /-! ### Canonical Constitutive Physical Matter Presets (`Slots 8..15`) -/
@@ -258,7 +297,27 @@ namespace Prefab
   def thermalReactor : UInt32 := 8
 end Prefab
 
-/-! ### Built-in Declarative SVG-UI Action Opcodes (`data-action`) -/
+/-! ### Declarative UI Primitive Kinds (`BloomUiNode64.prim_type`) -/
+namespace UiPrim
+  def none        : UInt32 := 0
+  def rectGlass   : UInt32 := 1
+  def circleRing  : UInt32 := 2
+  def iconGlyph   : UInt32 := 3
+  def sliderBar   : UInt32 := 4
+  def latexPanel  : UInt32 := 5
+  def readout7Seg : UInt32 := 6
+  def textInput   : UInt32 := 7
+end UiPrim
+
+/-! ### Physical Liquid Glass Optical Modes (`style_and_state[0..3]`) -/
+namespace GlassMode
+  def crystal     : UInt32 := 0
+  def beerLambert : UInt32 := 1
+  def iridescent  : UInt32 := 2
+  def mercury     : UInt32 := 3
+end GlassMode
+
+/-! ### Built-in Declarative UI Action Opcodes (`BloomUiNode64.action_opcode`) -/
 namespace UiAction
   def none         : UInt32 := 0
   def scrubXRay    : UInt32 := 1
@@ -269,7 +328,16 @@ namespace UiAction
   def focusInput   : UInt32 := 6
 end UiAction
 
-/-! ### FLOW v6.0.0 Canonical Manifold Chart Indices (`Slots 232..247`) -/
+/-! ### Frame Header Bitflags (`BloomFrameHeader64.flags`) -/
+namespace FrameFlag
+  def idleSleep      : UInt32 := 1
+  def xrayEnabled    : UInt32 := 2
+  def trcSafe        : UInt32 := 4
+  def colorblindGeom : UInt32 := 8
+  def studioGi       : UInt32 := 16
+end FrameFlag
+
+/-! ### FLOW v7.0.1 Canonical Manifold Chart Indices (`Slots 232..247`) -/
 namespace Chart
   def uiSpring     : UInt32 := 0
   def uiScrub      : UInt32 := 1
@@ -314,6 +382,33 @@ opaque loadSvgUI (eng : @& Engine) (svgPath : @& String) : IO UInt32
 @[extern "bloom_jsi_compile_latex"]
 opaque compileLatex (eng : @& Engine) (latex : @& String)
     (xQ16 yQ16 emQ16 : Int32) (rgb24 : UInt32) : IO UInt32
+
+@[extern "bloom_jsi_clear_ui_dom"]
+opaque clearUiDom (eng : @& Engine) (flexModePack padQ16 gapQ16 : UInt32) : IO Unit
+
+@[extern "bloom_jsi_mount_ui_node"]
+opaque mountUiNodeRaw (eng : @& Engine) (metaPack posPack sizePack radValPack : UInt64)
+    (label : @& String) : IO UInt32
+
+@[extern "bloom_jsi_config_text_input"]
+opaque configureTextInput (eng : @& Engine) (boundNodeId action : UInt32)
+    (initText : @& String) (anchorXQ16 anchorYQ16 : Int32) : IO Unit
+
+@[extern "bloom_jsi_compile_latex_card"]
+opaque compileLatexCardRaw (eng : @& Engine) (latex : @& String)
+    (posPack sizePack emPanelPack : UInt64) (rgb24 : UInt32) : IO UInt32
+
+@[extern "bloom_jsi_set_frame_flags"]
+opaque setFrameFlags (eng : @& Engine) (enableMask disableMask : UInt32) : IO Unit
+
+@[extern "bloom_jsi_sync_camera_now"]
+opaque syncCameraOrbitNow (eng : @& Engine) (yawQ16 pitchQ16 distQ16 : Int32) : IO Unit
+
+@[extern "bloom_jsi_save_image"]
+opaque saveArenaImage (eng : @& Engine) (outPath : @& String) : IO Bool
+
+@[extern "bloom_jsi_verify_latex_in_cards"]
+opaque verifyLatexInCards (eng : @& Engine) : IO Bool
 
 @[extern "bloom_jsi_spawn_prefab"]
 opaque spawnPrefab (eng : @& Engine) (prefabId : UInt32)
@@ -390,7 +485,441 @@ opaque verifySearuCore (seed : UInt64) : IO Bool
 @[extern "bloom_jsi_verify_gpu_alignment"]
 opaque verifyGpuAlignment (eng : @& Engine) : IO Bool
 
-/-! ## Part 3: Declarative Scene + SVG-UI Blueprint & Top-Level Interactive Reducer -/
+/-! ## Part 3: React-Native Style Nested Flexbox DSL & AOT Scene Compiler -/
+
+inductive FlexDir where
+  | row
+  | column
+  deriving Repr, DecidableEq, Inhabited
+
+inductive Justify where
+  | start
+  | center
+  | end_
+  | spaceBetween
+  deriving Repr, DecidableEq, Inhabited
+
+inductive Align where
+  | start
+  | center
+  | end_
+  | stretch
+  deriving Repr, DecidableEq, Inhabited
+
+def FlexDir.toCode : FlexDir → UInt32
+  | .row    => 0
+  | .column => 1
+
+def Justify.toCode : Justify → UInt32
+  | .start        => 0
+  | .center       => 1
+  | .end_         => 2
+  | .spaceBetween => 3
+
+def Align.toCode : Align → UInt32
+  | .start   => 0
+  | .center  => 1
+  | .end_    => 2
+  | .stretch => 3
+
+structure UiBoxStyle where
+  wPx      : Nat    := 0
+  hPx      : Nat    := 0
+  flexGrow : Nat    := 0
+  padPx    : Nat    := 0
+  gapPx    : Nat    := 0
+  radiusPx : Nat    := 14
+  rgb24    : UInt32 := 0x20D8FF
+  glass    : UInt32 := GlassMode.beerLambert
+  drawBg   : Bool   := false
+  deriving Repr, DecidableEq, Inhabited
+
+/-- React-Native style declarative nested Flexbox UI component tree.
+    Pure layout `.view` containers (`drawBg == false`) consume **0** `BloomUiNode64` slots. -/
+inductive UiElement where
+  | view (dir : FlexDir) (justify : Justify) (align : Align) (style : UiBoxStyle) (children : List UiElement)
+  | button (label : String) (action : UInt32) (initQ16 : Int32 := 65536) (style : UiBoxStyle := {})
+  | slider (label : String) (bindCh : UInt32) (initQ16 : Int32 := 32768) (action : UInt32 := UiAction.scrubXRay) (style : UiBoxStyle := {})
+  | textInput (placeholder : String) (initialText : String) (action : UInt32 := UiAction.focusInput) (style : UiBoxStyle := {})
+  | latexCard (formula : String) (emPx : Nat := 20) (tintRgb : UInt32 := 0xFFE878) (style : UiBoxStyle := {})
+  | ringGauge (bindCh : UInt32) (initQ16 : Int32 := 52428) (style : UiBoxStyle := {})
+  | readout7Seg (bindCh : UInt32) (initQ16 : Int32 := 300) (style : UiBoxStyle := {})
+  deriving Repr, Inhabited
+
+structure CompiledUiNode where
+  primType  : UInt32
+  glassMode : UInt32
+  bindByte  : UInt32
+  action    : UInt32
+  rgb24     : UInt32
+  cxQ16     : Int32
+  cyQ16     : Int32
+  hwQ16     : Int32
+  hhQ16     : Int32
+  radiusQ16 : Int32
+  initQ16   : Int32
+  label     : String
+  deriving Repr, Inhabited
+
+structure CompiledTextInputSpec where
+  nodeIndex   : Nat
+  action      : UInt32
+  initialText : String
+  anchorXQ16  : Int32
+  anchorYQ16  : Int32
+  deriving Repr, Inhabited
+
+structure CompiledLatexCardSpec where
+  panelIndex : Nat
+  formula    : String
+  cxQ16      : Int32
+  cyQ16      : Int32
+  hwQ16      : Int32
+  hhQ16      : Int32
+  emQ16      : Int32
+  tintRgb    : UInt32
+  deriving Repr, Inhabited
+
+structure CompiledUiLayout where
+  rootDir     : FlexDir
+  rootJustify : Justify
+  rootAlign   : Align
+  rootPadQ16  : UInt32
+  rootGapQ16  : UInt32
+  nodes       : List CompiledUiNode
+  textInput   : Option CompiledTextInputSpec
+  latexCards  : List CompiledLatexCardSpec
+  deriving Repr, Inhabited
+
+private structure RectPx where
+  x : Nat
+  y : Nat
+  w : Nat
+  h : Nat
+  deriving Repr, Inhabited
+
+private def clampInt (v lo hi : Int) : Int :=
+  if v < lo then lo else if v > hi then hi else v
+
+private def sanitizeAscii15 (s : String) : String :=
+  let chars := s.toList.filter (fun c => decide (32 <= c.toNat ∧ c.toNat <= 126))
+  String.ofList (chars.take 15)
+
+private def elemStyle : UiElement → UiBoxStyle
+  | .view _ _ _ st _      => st
+  | .button _ _ _ st      => st
+  | .slider _ _ _ _ st    => st
+  | .textInput _ _ _ st   => st
+  | .latexCard _ _ _ st   => st
+  | .ringGauge _ _ st     => st
+  | .readout7Seg _ _ st   => st
+
+private def normCenterQ16 (posPx spanPx vpExtent : Nat) : Int32 :=
+  let ext : Int := Int.ofNat (if vpExtent == 0 then 1 else vpExtent)
+  let num : Int := ((2 * Int.ofNat posPx + Int.ofNat spanPx) - ext) * 65536
+  Int32.ofInt (clampInt (num / ext) (-65536) 65536)
+
+private def normHalfQ16 (spanPx vpExtent : Nat) (minQ16 : Int := 256) : Int32 :=
+  let ext : Int := Int.ofNat (if vpExtent == 0 then 1 else vpExtent)
+  let raw : Int := (Int.ofNat spanPx * 65536) / ext
+  Int32.ofInt (clampInt raw minQ16 65536)
+
+private def normRadiusQ16 (radPx vpH : Nat) (hwQ16 hhQ16 : Int32) : Int32 :=
+  let ext : Int := Int.ofNat (if vpH == 0 then 1 else vpH)
+  let raw : Int := (Int.ofNat radPx * 2 * 65536) / ext
+  let cap : Int := min hwQ16.toInt hhQ16.toInt
+  Int32.ofInt (clampInt raw 0 (max cap 0))
+
+private def distributeGrowSizes (dir : FlexDir) (remSpace totalGrow : Nat) :
+    List UiBoxStyle → Nat → List Nat
+  | [], _ => []
+  | s :: rest, remLeft =>
+    let base := match dir with | .row => s.wPx | .column => s.hPx
+    if s.flexGrow == 0 || totalGrow == 0 then
+      let fixed := if base == 0 then 64 else base
+      fixed :: distributeGrowSizes dir remSpace totalGrow rest remLeft
+    else
+      let hasMoreGrow := rest.any (fun r => r.flexGrow > 0)
+      let extra := if hasMoreGrow then min ((remSpace * s.flexGrow) / totalGrow) remLeft else remLeft
+      (base + extra) :: distributeGrowSizes dir remSpace totalGrow rest (remLeft - extra)
+
+private def placeChildrenLoop (dir : FlexDir) (align : Align)
+    (innerX innerY innerCross cursor gapPx extraGapStep extraGapRem idx : Nat) :
+    List (UiBoxStyle × Nat) → List RectPx
+  | [] => []
+  | (st, mainSz) :: rest =>
+    let rawCross := match dir with | .row => st.hPx | .column => st.wPx
+    let crossSz :=
+      if align == .stretch && rawCross == 0 then innerCross
+      else if rawCross == 0 then min innerCross 48
+      else min rawCross innerCross
+    let crossOff :=
+      match align with
+      | .start   => 0
+      | .stretch => 0
+      | .center  => (innerCross - crossSz) / 2
+      | .end_    => innerCross - crossSz
+    let rect : RectPx :=
+      match dir with
+      | .row    => { x := innerX + cursor, y := innerY + crossOff, w := mainSz, h := crossSz }
+      | .column => { x := innerX + crossOff, y := innerY + cursor, w := crossSz, h := mainSz }
+    let bonus := if idx < extraGapRem then 1 else 0
+    let nextCursor := cursor + mainSz + gapPx + extraGapStep + bonus
+    rect :: placeChildrenLoop dir align innerX innerY innerCross nextCursor
+      gapPx extraGapStep extraGapRem (idx + 1) rest
+
+private def computeChildRects (dir : FlexDir) (justify : Justify) (align : Align)
+    (boxX boxY boxW boxH padPx gapPx : Nat) (styles : List UiBoxStyle) : List RectPx :=
+  let padX := min padPx (boxW / 2)
+  let padY := min padPx (boxH / 2)
+  let innerX := boxX + padX
+  let innerY := boxY + padY
+  let innerW := boxW - 2 * padX
+  let innerH := boxH - 2 * padY
+  let innerMain := match dir with | .row => innerW | .column => innerH
+  let innerCross := match dir with | .row => innerH | .column => innerW
+  let n := styles.length
+  if n == 0 then []
+  else
+    let totalGap := if n > 1 then (n - 1) * gapPx else 0
+    let effGap := if totalGap <= innerMain then gapPx else (if n > 1 then innerMain / (n - 1) else 0)
+    let usedGap := if n > 1 then (n - 1) * effGap else 0
+    let availMain := innerMain - usedGap
+    let fixedSum := styles.foldl (fun acc s =>
+      let b := match dir with | .row => s.wPx | .column => s.hPx
+      acc + (if s.flexGrow > 0 then b else (if b == 0 then 64 else b))) 0
+    let totalGrow := styles.foldl (fun acc s => acc + s.flexGrow) 0
+    let (mainSizes, freeMain) : List Nat × Nat :=
+      if fixedSum <= availMain then
+        let rem := availMain - fixedSum
+        if totalGrow > 0 then
+          (distributeGrowSizes dir rem totalGrow styles rem, 0)
+        else
+          let szs := styles.map (fun s =>
+            let b := match dir with | .row => s.wPx | .column => s.hPx
+            if b == 0 then 64 else b)
+          (szs, rem)
+      else
+        let denom := max fixedSum 1
+        let szs := styles.map (fun s =>
+          let b := match dir with | .row => s.wPx | .column => s.hPx
+          let raw := if s.flexGrow > 0 then b else (if b == 0 then 64 else b)
+          (raw * availMain) / denom)
+        (szs, 0)
+    let (startOff, extraStep, extraRem) :=
+      match justify with
+      | .start        => (0, 0, 0)
+      | .center       => (freeMain / 2, 0, 0)
+      | .end_         => (freeMain, 0, 0)
+      | .spaceBetween =>
+        if n > 1 then (0, freeMain / (n - 1), freeMain % (n - 1))
+        else (0, 0, 0)
+    placeChildrenLoop dir align innerX innerY innerCross startOff
+      effGap extraStep extraRem 0 (styles.zip mainSizes)
+
+private structure LayoutAcc where
+  nodes      : List CompiledUiNode := []
+  textInput  : Option CompiledTextInputSpec := none
+  latexCards : List CompiledLatexCardSpec := []
+
+private def pushRectNode (vpW vpH : Nat) (r : RectPx) (prim glass bindByte action rgb24 : UInt32)
+    (radiusPx : Nat) (initQ16 : Int32) (label : String) (acc : LayoutAcc) : LayoutAcc × Nat :=
+  let idx := acc.nodes.length
+  if idx >= 16 then
+    (acc, idx)
+  else
+    let cx := normCenterQ16 r.x r.w vpW
+    let cy := normCenterQ16 r.y r.h vpH
+    let hw := normHalfQ16 r.w vpW 256
+    let hh := normHalfQ16 r.h vpH 256
+    let rad := normRadiusQ16 radiusPx vpH hw hh
+    let nd : CompiledUiNode := {
+      primType  := prim
+      glassMode := glass
+      bindByte  := bindByte
+      action    := action
+      rgb24     := rgb24
+      cxQ16     := cx
+      cyQ16     := cy
+      hwQ16     := hw
+      hhQ16     := hh
+      radiusQ16 := rad
+      initQ16   := initQ16
+      label     := sanitizeAscii15 label
+    }
+    ({ acc with nodes := acc.nodes ++ [nd] }, idx)
+
+mutual
+  private def compileElem (vpW vpH : Nat) (el : UiElement) (r : RectPx) (acc : LayoutAcc) : LayoutAcc :=
+    match el with
+    | .view dir justify align st children =>
+      let acc1 :=
+        if st.drawBg && st.rgb24 != 0 then
+          (pushRectNode vpW vpH r UiPrim.rectGlass st.glass 0xFF UiAction.none
+            st.rgb24 st.radiusPx 65536 "" acc).1
+        else
+          acc
+      let childRects := computeChildRects dir justify align r.x r.y r.w r.h
+        st.padPx st.gapPx (children.map elemStyle)
+      compileChildren vpW vpH children childRects acc1
+
+    | .button label action initQ16 st =>
+      (pushRectNode vpW vpH r UiPrim.rectGlass st.glass 0xFF action
+        st.rgb24 st.radiusPx initQ16 label acc).1
+
+    | .slider label bindCh initQ16 action st =>
+      (pushRectNode vpW vpH r UiPrim.sliderBar st.glass (bindCh &&& 0xFF) action
+        st.rgb24 st.radiusPx initQ16 label acc).1
+
+    | .textInput placeholder initialText action st =>
+      let (acc1, idx) := pushRectNode vpW vpH r UiPrim.textInput st.glass 0xFF action
+        st.rgb24 st.radiusPx 65536 placeholder acc
+      if idx < 16 && acc1.textInput.isNone then
+        let cx := normCenterQ16 r.x r.w vpW
+        let cy := normCenterQ16 r.y r.h vpH
+        let hw := normHalfQ16 r.w vpW 256
+        let hh := normHalfQ16 r.h vpH 256
+        let ax := Int32.ofInt (clampInt (cx.toInt - hw.toInt + 1024) (-65536) 65536)
+        let ay := Int32.ofInt (clampInt (cy.toInt + hh.toInt) (-65536) 65536)
+        let spec : CompiledTextInputSpec := {
+          nodeIndex   := idx
+          action      := action
+          initialText := initialText
+          anchorXQ16  := ax
+          anchorYQ16  := ay
+        }
+        { acc1 with textInput := some spec }
+      else
+        acc1
+
+    | .latexCard formula emPx tintRgb st =>
+      let (acc1, idx) := pushRectNode vpW vpH r UiPrim.latexPanel st.glass 0xFF UiAction.none
+        st.rgb24 st.radiusPx 65536 "" acc
+      if idx < 16 then
+        let cx := normCenterQ16 r.x r.w vpW
+        let cy := normCenterQ16 r.y r.h vpH
+        let hw := normHalfQ16 r.w vpW 256
+        let hh := normHalfQ16 r.h vpH 256
+        let extH : Int := Int.ofNat (if vpH == 0 then 1 else vpH)
+        let emRaw : Int := (Int.ofNat (if emPx == 0 then 18 else emPx) * 2 * 65536) / extH
+        let card : CompiledLatexCardSpec := {
+          panelIndex := idx
+          formula    := formula
+          cxQ16      := cx
+          cyQ16      := cy
+          hwQ16      := hw
+          hhQ16      := hh
+          emQ16      := Int32.ofInt (clampInt emRaw 512 16384)
+          tintRgb    := tintRgb
+        }
+        { acc1 with latexCards := acc1.latexCards ++ [card] }
+      else
+        acc1
+
+    | .ringGauge bindCh initQ16 st =>
+      let idx := acc.nodes.length
+      if idx >= 16 then
+        acc
+      else
+        let rPx := max (min r.w r.h / 2) 6
+        let swPx := max (rPx / 4) 3
+        let innerRPx := if rPx > swPx then rPx - swPx else 1
+        let extW : Int := Int.ofNat (if vpW == 0 then 1 else vpW)
+        let outerQ := clampInt ((Int.ofNat rPx * 2 * 65536) / extW) 768 65536
+        let innerQ := clampInt ((Int.ofNat innerRPx * 2 * 65536) / extW) 512 (outerQ - 256)
+        let nd : CompiledUiNode := {
+          primType  := UiPrim.circleRing
+          glassMode := st.glass
+          bindByte  := bindCh &&& 0xFF
+          action    := UiAction.none
+          rgb24     := st.rgb24
+          cxQ16     := normCenterQ16 r.x r.w vpW
+          cyQ16     := normCenterQ16 r.y r.h vpH
+          hwQ16     := Int32.ofInt outerQ
+          hhQ16     := Int32.ofInt innerQ
+          radiusQ16 := 0
+          initQ16   := initQ16
+          label     := ""
+        }
+        { acc with nodes := acc.nodes ++ [nd] }
+
+    | .readout7Seg bindCh initQ16 st =>
+      (pushRectNode vpW vpH r UiPrim.readout7Seg st.glass (bindCh &&& 0xFF) UiAction.none
+        st.rgb24 st.radiusPx initQ16 "" acc).1
+
+  private def compileChildren (vpW vpH : Nat) : List UiElement → List RectPx → LayoutAcc → LayoutAcc
+    | [], _, acc => acc
+    | _, [], acc => acc
+    | c :: cs, rc :: rcs, acc =>
+      let acc' := compileElem vpW vpH c rc acc
+      compileChildren vpW vpH cs rcs acc'
+end
+
+/-- Pure Lean 4 React-Native Flexbox compiler: resolves arbitrary nested `<View>` trees into
+    normalized `[-1..+1]` Q16.16 `BloomUiNode64` descriptors, inline 15-char ASCII labels,
+    `BloomTextInput64` bindings, and auto-fitted `BloomLatexBox64` cards. -/
+def compileUiTree (vpW vpH : Nat) (root : UiElement) : CompiledUiLayout :=
+  let safeW := if vpW < 64 then 1280 else vpW
+  let safeH := if vpH < 64 then 720 else vpH
+  let (rDir, rJust, rAlign, rPadPx, rGapPx) :=
+    match root with
+    | .view d j a st _ => (d, j, a, st.padPx, st.gapPx)
+    | _                => (.column, .start, .stretch, 0, 0)
+  let acc := compileElem safeW safeH root { x := 0, y := 0, w := safeW, h := safeH } {}
+  let padQ16 : UInt32 := UInt32.ofNat ((rPadPx * 2 * 65536) / safeH)
+  let gapQ16 : UInt32 := UInt32.ofNat ((rGapPx * 2 * 65536) / safeH)
+  { rootDir     := rDir
+    rootJustify := rJust
+    rootAlign   := rAlign
+    rootPadQ16  := padQ16
+    rootGapQ16  := gapQ16
+    nodes       := acc.nodes
+    textInput   := acc.textInput
+    latexCards  := acc.latexCards }
+
+private def packI32Pair (lo hi : Int32) : UInt64 :=
+  lo.toUInt32.toUInt64 ||| (hi.toUInt32.toUInt64 <<< 32)
+
+/-- Mounts a compiled Flexbox `CompiledUiLayout` into the 16KB Unified Memory Arena. -/
+def mountUiLayout (eng : Engine) (layout : CompiledUiLayout) : IO (UInt32 × UInt32) := do
+  let flexPack : UInt32 :=
+    layout.rootDir.toCode |||
+    (layout.rootJustify.toCode <<< 8) |||
+    (layout.rootAlign.toCode <<< 16)
+  clearUiDom eng flexPack layout.rootPadQ16 layout.rootGapQ16
+
+  let mut uiMounted : UInt32 := 0
+  for nd in layout.nodes do
+    let p0 : UInt64 := nd.primType.toUInt64 &&& 0xFF
+    let p1 : UInt64 := (nd.glassMode.toUInt64 &&& 0xF) <<< 8
+    let p2 : UInt64 := (nd.bindByte.toUInt64 &&& 0xFF) <<< 16
+    let p3 : UInt64 := (nd.action.toUInt64 &&& 0xFFFF) <<< 24
+    let p4 : UInt64 := (nd.rgb24.toUInt64 &&& 0xFFFFFF) <<< 40
+    let metaPack : UInt64 := p0 ||| p1 ||| p2 ||| p3 ||| p4
+    let posPack := packI32Pair nd.cxQ16 nd.cyQ16
+    let sizePack := packI32Pair nd.hwQ16 nd.hhQ16
+    let radValPack := packI32Pair nd.radiusQ16 nd.initQ16
+    let nid ← mountUiNodeRaw eng metaPack posPack sizePack radValPack nd.label
+    if nid != 0 then
+      uiMounted := uiMounted + 1
+
+  match layout.textInput with
+  | some ti =>
+    configureTextInput eng (UInt32.ofNat (ti.nodeIndex + 1)) ti.action
+      ti.initialText ti.anchorXQ16 ti.anchorYQ16
+  | none => pure ()
+
+  let mut lxMounted : UInt32 := 0
+  for card in layout.latexCards do
+    let posPack := packI32Pair card.cxQ16 card.cyQ16
+    let sizePack := packI32Pair card.hwQ16 card.hhQ16
+    let panelId : UInt32 := UInt32.ofNat (card.panelIndex + 1)
+    let emPanelPack : UInt64 :=
+      card.emQ16.toUInt32.toUInt64 ||| (panelId.toUInt64 <<< 32)
+    let emitted ← compileLatexCardRaw eng card.formula posPack sizePack emPanelPack card.tintRgb
+    lxMounted := lxMounted + emitted
+
+  pure (uiMounted, lxMounted)
 
 structure PrefabNodeSpec where
   prefabId : UInt32
@@ -401,20 +930,26 @@ structure PrefabNodeSpec where
   deriving Repr
 
 structure StudioBlueprint where
-  svgPath   : String
-  latexFormula : String
-  latexXMilli  : Int := 520
-  latexYMilli  : Int := -645
-  latexEmMilli : Int := 42
-  latexRgb24   : UInt32 := 0xFFD848
-  sceneNodes   : List PrefabNodeSpec
+  refWidthPx      : Nat := 1280
+  refHeightPx     : Nat := 720
+  uiTree          : UiElement
+  orbitYawMilli   : Int := 260
+  orbitPitchMilli : Int := 280
+  orbitDistMilli  : Int := 5200
+  enableStudioGi  : Bool := true
+  sceneNodes      : List PrefabNodeSpec
   deriving Repr
 
-/-- Mounts a complete declarative SVG-UI + LaTeX + 3D Prefab scene into the 16KB Unified Memory Arena. -/
+/-- Mounts a complete React-Native Flexbox UI + LaTeX + 3D Prefab scene into the 16KB Arena. -/
 def mountBlueprint (eng : Engine) (bp : StudioBlueprint) : IO (UInt32 × UInt32 × List UInt32) := do
-  let uiCnt ← loadSvgUI eng bp.svgPath
-  let lxCnt ← compileLatex eng bp.latexFormula
-    (q16Milli bp.latexXMilli) (q16Milli bp.latexYMilli) (q16Milli bp.latexEmMilli) bp.latexRgb24
+  let layout := compileUiTree bp.refWidthPx bp.refHeightPx bp.uiTree
+  let (uiCnt, lxCnt) ← mountUiLayout eng layout
+  syncCameraOrbitNow eng
+    (q16Milli bp.orbitYawMilli) (q16Milli bp.orbitPitchMilli) (q16Milli bp.orbitDistMilli)
+  if bp.enableStudioGi then
+    setFrameFlags eng FrameFlag.studioGi 0
+  else
+    setFrameFlags eng 0 FrameFlag.studioGi
   let mut ids : List UInt32 := []
   for item in bp.sceneNodes do
     let iid ← spawnPrefab eng item.prefabId
@@ -456,22 +991,65 @@ def reduceStudioAction (eng : Engine) (st : StudioState) (action : UInt32) : IO 
   else
     pure st
 
-/-- Default Studio blueprint shared between runtime Studio and compile-time boundary verification. -/
+/-- Canonical v7.0.1 Studio Blueprint authored via React-Native nested `<View>` Flexbox DSL
+    (`1280 x 720` reference viewport, scaled cleanly to any resolution). -/
 def defaultStudioBlueprint : StudioBlueprint := {
-  svgPath      := "specs/studio_inspector.svg"
-  latexFormula := "\\int \\frac{\\sqrt{\\eta^2 + \\kappa^2}}{2\\pi} d\\Omega"
-  sceneNodes   := [
-    { prefabId := Prefab.jadeVessel,     xMilli := 0,     yMilli := 0,    zMilli := 0,    scaleMil := 1150 },
-    { prefabId := Prefab.citadelCore,    xMilli := -1650, yMilli := -100, zMilli := 350,  scaleMil := 950  },
-    { prefabId := Prefab.quantumTorus,   xMilli := 1650,  yMilli := 120,  zMilli := 250,  scaleMil := 950  },
-    { prefabId := Prefab.thermalReactor, xMilli := 0,     yMilli := 1250, zMilli := -600, scaleMil := 850  }
+  refWidthPx      := 1280
+  refHeightPx     := 720
+  orbitYawMilli   := 180
+  orbitPitchMilli := 235
+  orbitDistMilli  := 6400
+  enableStudioGi  := true
+  uiTree :=
+    .view .column .spaceBetween .stretch { padPx := 20 } [
+      -- 1. Top Header Row: Brand Pill + Live Command TextInput + Auto-Fitted Optical LaTeX Card
+      .view .row .spaceBetween .center { hPx := 64, gapPx := 16 } [
+        .button "BLOOM 7.0" UiAction.none 65536
+          { wPx := 196, hPx := 52, radiusPx := 26, rgb24 := 0x28EAFF, glass := GlassMode.crystal },
+        .textInput "CMD" "JADE / 860K" UiAction.focusInput
+          { flexGrow := 1, hPx := 52, radiusPx := 14, rgb24 := 0x18B8E8, glass := GlassMode.beerLambert },
+        .latexCard "\\int \\frac{\\sqrt{\\eta^2 + \\kappa^2}}{2\\pi} d\\Omega" 19 0xFFE878
+          { wPx := 360, hPx := 64, radiusPx := 16, rgb24 := 0xFFD258, glass := GlassMode.beerLambert }
+      ],
+      -- 2. Bottom Control Dock Row: X-Ray Scrub + Revert + Matter + @swap + Ring Gauge + 7-Seg Readout
+      .view .row .spaceBetween .center { hPx := 58, gapPx := 14 } [
+        .slider "X-RAY" 0 32768 UiAction.scrubXRay
+          { flexGrow := 2, hPx := 56, radiusPx := 14, rgb24 := 0x00E8C6, glass := GlassMode.beerLambert },
+        .button "REVERT" UiAction.prefabRevert 65536
+          { flexGrow := 1, hPx := 56, radiusPx := 14, rgb24 := 0xFFB020, glass := GlassMode.beerLambert },
+        .button "MATTER" UiAction.cycleMatter 49152
+          { flexGrow := 1, hPx := 56, radiusPx := 14, rgb24 := 0x58A8FF, glass := GlassMode.iridescent },
+        .button "@SWAP" UiAction.swapChart 32768
+          { flexGrow := 1, hPx := 56, radiusPx := 14, rgb24 := 0xFF4870, glass := GlassMode.beerLambert },
+        .ringGauge 1 52428
+          { wPx := 56, hPx := 56, rgb24 := 0x20F0B8, glass := GlassMode.crystal },
+        .readout7Seg 2 300
+          { wPx := 148, hPx := 56, radiusPx := 14, rgb24 := 0x20FFD0, glass := GlassMode.beerLambert }
+      ]
+    ]
+  sceneNodes := [
+    { prefabId := Prefab.jadeVessel,     xMilli := 0,     yMilli := -180, zMilli := -120, scaleMil := 1020 },
+    { prefabId := Prefab.citadelCore,    xMilli := -2350, yMilli := -240, zMilli := 260,  scaleMil := 860  },
+    { prefabId := Prefab.quantumTorus,   xMilli := 2350,  yMilli := -180, zMilli := 220,  scaleMil := 920  },
+    { prefabId := Prefab.thermalReactor, xMilli := -1120, yMilli := 480,  zMilli := -1350, scaleMil := 720 }
   ]
 }
 
 /-- Single-source WGSL compute shader path (resolved to build/bloom_core.{metal,spv} by SDL3 GPU host). -/
 def defaultShaderPath : String := "shaders/bloom_core.wgsl"
 
-/-- Default 60Hz interactive Studio launcher (`0 lean -c`, invoked via `--load-dynlib`). -/
+/-- Canonical sealed 16,384-byte AOT `.bloom` Studio image path consumed by `build/bloom`. -/
+def defaultStudioImagePath : String := "build/studio.bloom"
+
+/-- Compiles `bp` at `(widthPx, heightPx)` and exports a verified `16,384`-byte `.bloom` image. -/
+def exportStudioImage (outPath : String := defaultStudioImagePath)
+    (widthPx : UInt32 := 1280) (heightPx : UInt32 := 720)
+    (bp : StudioBlueprint := defaultStudioBlueprint) : IO Bool := do
+  let eng ← createEngine widthPx heightPx defaultShaderPath
+  let _ ← mountBlueprint eng bp
+  saveArenaImage eng outPath
+
+/-- Default 60Hz interactive Studio launcher (also available natively via `./build/bloom`). -/
 def launchDefaultStudio (widthPx : UInt32 := 1280) (heightPx : UInt32 := 720) : IO Unit := do
   let eng ← createEngine widthPx heightPx defaultShaderPath
   let _ ← mountBlueprint eng defaultStudioBlueprint
@@ -485,7 +1063,7 @@ def launchDefaultStudio (widthPx : UInt32 := 1280) (heightPx : UInt32 := 720) : 
     let _ ← stepAndRender eng 0x0001 false)
   pure ()
 
-/-! ## Part 4: Compile-Time JSI & Hardware Boundary Gate (`0` External Test Files)
+/-! ## Part 4: Compile-Time JSI, Flexbox, Hardware Boundary & AOT `.bloom` Export Gate
     Executed once during `Bloom.lean -> Bloom.olean` elaboration (`--load-dynlib`);
     not serialized into `.olean` runtime initialization, keeping `leanchecker` and
     downstream `import Bloom` pure and zero-overhead. -/
@@ -501,11 +1079,20 @@ private def requireContract (label : String) (cond : Bool) : IO Unit := do
     throw (IO.userError s!"[BLOOM Compile-Time Boundary Violation] {label}")
 
 private def compileTimeBoundaryGate : IO Unit := do
-  -- 0. Pure-CPU `libbloom.a` Public API + SEARU `DualChaosState` & `Epiphany` Torture Gate
+  -- 0. Pure-CPU `libbloom.a` Public API + FLOW v7.0.1 Symbiotic SEARU x 2-Jet Gate
   let searuOk ← verifySearuCore 0xB100A60020265EA4
-  requireContract "SEARU Core API + BVH==CSG 0-ULP + UTF-8/IME + DQ/Brick torture" searuOk
+  requireContract "FLOW v7.0.1 SEARU (heal_and_swap + SOLVE_INLINE) + BVH==CSG 0-ULP + UTF-8/IME" searuOk
 
-  -- 1. Hostile & Singular Boundary Sweep + 8-Prefab / X-Ray / UI CPU-vs-GPU Spatial Alignment Gate
+  -- 1. Pure Lean 4 Nested React-Native Flexbox Layout Compiler Invariants
+  let studioLayout := compileUiTree 1280 720 defaultStudioBlueprint.uiTree
+  requireContract "Pure layout <View> wrappers cost 0 BloomUiNode64 slots (exact 9 leaf widgets)"
+    (studioLayout.nodes.length == 9 && studioLayout.textInput.isSome && studioLayout.latexCards.length == 1)
+  let wrapZero := compileUiTree 1280 720 (.view .column .center .center {} [.view .row .start .stretch {} []])
+  let wrapBg := compileUiTree 0 0 (.view .row .end_ .end_ { rgb24 := 0x102030, drawBg := true } [])
+  requireContract "Nested <View> 0-slot wrapper vs drawBg glass panel & 0x0 singular viewport guard"
+    (wrapZero.nodes.isEmpty && wrapBg.nodes.length == 1)
+
+  -- 2. Hostile & Singular Boundary Sweep + 8-Prefab / X-Ray / UI CPU-vs-GPU Spatial Alignment Gate
   let engEdge ← createEngine 320 180 defaultShaderPath
   let alignOk ← verifyGpuAlignment engEdge
   requireContract "8-Prefab + X-Ray Cutaway + UI Bento CPU Q16.16 vs GPU WGSL f32 alignment" alignOk
@@ -536,7 +1123,7 @@ private def compileTimeBoundaryGate : IO Unit := do
   let edgeSealed ← sealAndVerifyArena engEdge
   requireContract "Adversarial boundary Arena Merkle seal intact" edgeSealed
 
-  -- 2. Dual-Engine 256-Trial SplitMix64 Property Sweep & Pixel-Exact Determinism Gate
+  -- 3. Dual-Engine 256-Trial SplitMix64 Property Sweep & Pixel-Exact Determinism Gate
   let wPx : UInt32 := 640
   let hPx : UInt32 := 360
   let engA ← createEngine wPx hPx defaultShaderPath
@@ -544,8 +1131,10 @@ private def compileTimeBoundaryGate : IO Unit := do
 
   let (uiA, lxA, idsA) ← mountBlueprint engA defaultStudioBlueprint
   let (uiB, lxB, idsB) ← mountBlueprint engB defaultStudioBlueprint
-  requireContract "Canonical Blueprint UI/LaTeX/Prefab isomorphism"
-    (uiA == uiB && lxA == lxB && idsA == idsB && uiA >= 6 && lxA >= 6)
+  let lxFitA ← verifyLatexInCards engA
+  let lxFitB ← verifyLatexInCards engB
+  requireContract "Canonical Flexbox Blueprint UI/LaTeX/Prefab isomorphism & zero LaTeX card overflow"
+    (uiA == 9 && uiA == uiB && lxA == lxB && idsA == idsB && lxA >= 8 && lxFitA && lxFitB)
 
   let mut stA : StudioState := {}
   let mut stB : StudioState := {}
@@ -615,7 +1204,7 @@ private def compileTimeBoundaryGate : IO Unit := do
   for _ in [0:512] do
     convergedA ← stepAndRender engA 0x0001 false
     convergedB ← stepAndRender engB 0x0001 false
-  requireContract "FLOW v6.0.0 Lyapunov convergence to 0-FPS Idle Sleep" (convergedA && convergedB)
+  requireContract "FLOW v7.0.1 Lyapunov convergence to 0-FPS Idle Sleep" (convergedA && convergedB)
 
   let statsBefore ← getDispatchStats engA
   for _ in [0:16] do
@@ -646,6 +1235,18 @@ private def compileTimeBoundaryGate : IO Unit := do
   let sealedA ← sealAndVerifyArena engA
   let sealedB ← sealAndVerifyArena engB
   requireContract ".bloom 64B Merkle container superblock integrity" (sealedA && sealedB)
+
+  -- 4. AOT Canonical 1280x720 `build/studio.bloom` Export & Exact 16KB Verification
+  let engStudio ← createEngine 1280 720 defaultShaderPath
+  let (uiS, lxS, idsS) ← mountBlueprint engStudio defaultStudioBlueprint
+  let _ ← dispatchPointer engStudio 0 (q16Milli 60) 0 false true
+  let lxFitS ← verifyLatexInCards engStudio
+  requireContract "Canonical 1280x720 Studio Arena layout & LaTeX card bounds exact"
+    (uiS == 9 && lxS >= 8 && idsS.length == 4 && lxFitS)
+  let savedOk ← saveArenaImage engStudio defaultStudioImagePath
+  requireContract "AOT build/studio.bloom Merkle seal & write succeeded" savedOk
+  let imgBytes ← IO.FS.readBinFile defaultStudioImagePath
+  requireContract "AOT build/studio.bloom is exact 16,384-byte VM page" (imgBytes.size == arenaBytes)
 
 #eval compileTimeBoundaryGate
 

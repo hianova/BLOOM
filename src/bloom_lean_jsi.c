@@ -7,10 +7,11 @@
 #include <string.h>
 
 #include "bloom.h"
+#include "searu.h"
 
 /*
  * ============================================================================
- * BLOOM v6.0.0 — Zero-Copy Lean 4 Dynamic Plugin JSI Bridge (0 `lean -c`)
+ * BLOOM v7.0.1 — Zero-Copy Lean 4 Dynamic Plugin JSI Bridge (0 `lean -c`)
  * ============================================================================
  * Exports both direct C symbols (`bloom_jsi_*`) AND Lean 4 VM interpreter
  * boxed symbols (`l_Bloom_*___boxed`), enabling pure `lean --load-dynlib=...`
@@ -293,6 +294,18 @@ LEAN_EXPORT lean_obj_res bloom_jsi_set_camera(b_lean_obj_arg eng,
     return lean_io_result_mk_ok(lean_box(0));
 }
 
+static void bloom_jsi_stamp_mac(void *block64, uint64_t seed, uint32_t *out_lo, uint32_t *out_hi) {
+    uint64_t mac = bloom_hash56_fnv1a(block64, seed);
+    *out_lo = (uint32_t)(mac & 0xFFFFFFFFULL);
+    *out_hi = (uint32_t)(mac >> 32ULL);
+}
+
+static int32_t bloom_jsi_clamp64(int64_t v, int32_t lo, int32_t hi) {
+    if (v < (int64_t)lo) return lo;
+    if (v > (int64_t)hi) return hi;
+    return (int32_t)v;
+}
+
 static uint32_t bloom_jsi_dispatch_pointer_core(BloomEngineArena *arena,
                                                 int32_t cx_q16,
                                                 int32_t cy_q16,
@@ -300,8 +313,28 @@ static uint32_t bloom_jsi_dispatch_pointer_core(BloomEngineArena *arena,
                                                 bool down,
                                                 bool clicked) {
     BloomFrameHeader64 *hdr = &arena->map.frame_hdr;
+    BloomDomState64 *dom = &arena->map.dom;
+    BloomTextInput64 *tinput = &arena->map.text_input;
+    BloomIme64 *ime = &arena->map.ime;
+
     uint32_t action = bloom_ui_step_pointer_arena(arena, cx_q16, cy_q16, dx_q16, down, clicked);
-    if (clicked && action == BLOOM_ACTION_NONE && arena->map.dom.hovered_node_id == 0U) {
+    if (clicked) {
+        bool hit_input = (action == BLOOM_ACTION_FOCUS_INPUT) ||
+                         (tinput->bound_node_id != 0U && dom->active_node_id == tinput->bound_node_id);
+        if (hit_input) {
+            tinput->focused = 1U;
+            bloom_jsi_stamp_mac(tinput, 0x7EC70064ULL, &tinput->hash_lo32, &tinput->hash_hi32);
+            dom->focused_input_id = tinput->bound_node_id;
+            bloom_jsi_stamp_mac(dom, 0xD0A00064ULL, &dom->mac_lo32, &dom->mac_hi32);
+        } else if (tinput->focused != 0U || dom->focused_input_id != 0U) {
+            tinput->focused = 0U;
+            bloom_jsi_stamp_mac(tinput, 0x7EC70064ULL, &tinput->hash_lo32, &tinput->hash_hi32);
+            dom->focused_input_id = 0U;
+            bloom_jsi_stamp_mac(dom, 0xD0A00064ULL, &dom->mac_lo32, &dom->mac_hi32);
+            (void)bloom_ime_set_preedit64(ime, "", 0U);
+        }
+    }
+    if (clicked && action == BLOOM_ACTION_NONE && dom->hovered_node_id == 0U) {
         BloomRaycastHit64 *hit = &arena->map.ray_hit;
         if (bloom_scene_raycast64(arena, cx_q16, cy_q16, hit)) {
             hdr->selected_inst_id = hit->hit_inst_id;
@@ -347,23 +380,326 @@ LEAN_EXPORT lean_obj_res bloom_jsi_poll_window_input(b_lean_obj_arg eng) {
 
     if (down && dom->captured_node_id == 0U && dom->hovered_node_id == 0U &&
         (win->drag_dx_q16 != 0 || win->drag_dy_q16 != 0)) {
-        cam->orbit_yaw_q16 += win->drag_dx_q16 * 2;
-        int32_t np = cam->orbit_pitch_q16 + win->drag_dy_q16;
-        if (np < -85000) np = -85000;
-        if (np >  85000) np =  85000;
-        cam->orbit_pitch_q16 = np;
+        cam->orbit_yaw_q16 = bloom_jsi_clamp64(
+            (int64_t)cam->orbit_yaw_q16 + (int64_t)win->drag_dx_q16 * 2LL,
+            -BLOOM_MAX_Q16, BLOOM_MAX_Q16);
+        cam->orbit_pitch_q16 = bloom_jsi_clamp64(
+            (int64_t)cam->orbit_pitch_q16 + (int64_t)win->drag_dy_q16,
+            -85000, 85000);
         hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
     }
 
     if (win->scroll_dy_q16 != 0) {
-        int32_t nd = cam->orbit_dist_q16 - win->scroll_dy_q16 * 4;
-        if (nd < 2 * BLOOM_Q16_ONE) nd = 2 * BLOOM_Q16_ONE;
-        if (nd > 14 * BLOOM_Q16_ONE) nd = 14 * BLOOM_Q16_ONE;
-        cam->orbit_dist_q16 = nd;
+        cam->orbit_dist_q16 = bloom_jsi_clamp64(
+            (int64_t)cam->orbit_dist_q16 - (int64_t)win->scroll_dy_q16 * 4LL,
+            2 * BLOOM_Q16_ONE, 14 * BLOOM_Q16_ONE);
         hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
     }
 
     return lean_io_result_mk_ok(lean_box_uint32(action));
+}
+
+LEAN_EXPORT lean_obj_res bloom_jsi_clear_ui_dom(b_lean_obj_arg eng,
+                                                uint32_t flex_mode_pack,
+                                                uint32_t pad_q16,
+                                                uint32_t gap_q16) {
+    BloomJsiHandle *h = bloom_jsi_unwrap(eng);
+    BloomEngineArena *arena = h->arena;
+    BloomFrameHeader64 *hdr = &arena->map.frame_hdr;
+    BloomDomState64 *dom = &arena->map.dom;
+
+    memset(arena->map.ui_nodes, 0, sizeof(arena->map.ui_nodes));
+    memset(arena->map.ui_labels, 0, sizeof(arena->map.ui_labels));
+    memset(arena->map.latex_boxes, 0, sizeof(arena->map.latex_boxes));
+    hdr->ui_count = 0U;
+    hdr->latex_count = 0U;
+
+    uint16_t dir   = (uint16_t)(flex_mode_pack & 0xFFU);
+    uint16_t just  = (uint16_t)((flex_mode_pack >> 8U) & 0xFFU);
+    uint16_t align = (uint16_t)((flex_mode_pack >> 16U) & 0xFFU);
+    bloom_flex_init64(&arena->map.flex, dir, just, align, 0, 0,
+                      BLOOM_Q16_ONE, BLOOM_Q16_ONE, (int32_t)pad_q16, (int32_t)gap_q16);
+
+    uint32_t next_epoch = dom->hot_reload_epoch + 1U;
+    memset(dom, 0, sizeof(*dom));
+    dom->hot_reload_epoch = next_epoch;
+    bloom_jsi_stamp_mac(dom, 0xD0A00064ULL, &dom->mac_lo32, &dom->mac_hi32);
+
+    hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_obj_res bloom_jsi_mount_ui_node(b_lean_obj_arg eng,
+                                                 uint64_t meta_pack,
+                                                 uint64_t pos_pack,
+                                                 uint64_t size_pack,
+                                                 uint64_t rad_val_pack,
+                                                 b_lean_obj_arg label_str) {
+    BloomJsiHandle *h = bloom_jsi_unwrap(eng);
+    BloomEngineArena *arena = h->arena;
+    BloomFrameHeader64 *hdr = &arena->map.frame_hdr;
+    BloomDomState64 *dom = &arena->map.dom;
+    BloomFlexContainer64 *flex = &arena->map.flex;
+
+    if (hdr->ui_count >= BLOOM_MAX_UI_NODES) {
+        return lean_io_result_mk_ok(lean_box_uint32(0U));
+    }
+
+    uint32_t idx = hdr->ui_count++;
+    uint32_t node_id = idx + 1U;
+
+    uint32_t prim_type  = (uint32_t)(meta_pack & 0xFFULL);
+    uint32_t glass_mode = (uint32_t)((meta_pack >> 8U) & 0xFULL);
+    uint32_t bind_byte  = (uint32_t)((meta_pack >> 16U) & 0xFFULL);
+    uint32_t bind_ch    = (bind_byte < BLOOM_REG_CHANNELS) ? bind_byte : 0xFFFFFFFFU;
+    uint32_t action     = (uint32_t)((meta_pack >> 24U) & 0xFFFFULL);
+    uint32_t rgb24      = (uint32_t)((meta_pack >> 40U) & 0xFFFFFFULL);
+
+    int32_t cx_q16   = (int32_t)(uint32_t)(pos_pack & 0xFFFFFFFFULL);
+    int32_t cy_q16   = (int32_t)(uint32_t)(pos_pack >> 32U);
+    int32_t hw_q16   = (int32_t)(uint32_t)(size_pack & 0xFFFFFFFFULL);
+    int32_t hh_q16   = (int32_t)(uint32_t)(size_pack >> 32U);
+    int32_t rad_q16  = (int32_t)(uint32_t)(rad_val_pack & 0xFFFFFFFFULL);
+    int32_t init_q16 = (int32_t)(uint32_t)(rad_val_pack >> 32U);
+
+    BloomUiNode64 *nd = &arena->map.ui_nodes[idx];
+    memset(nd, 0, sizeof(*nd));
+    nd->node_id = node_id;
+    nd->prim_type = prim_type;
+    nd->anchor_mode = BLOOM_UI_ANCHOR_CENTER;
+    nd->bind_channel = bind_ch;
+    nd->offset_x_q16 = cx_q16;
+    nd->offset_y_q16 = cy_q16;
+    nd->half_w_q16 = hw_q16;
+    nd->half_h_q16 = hh_q16;
+    nd->corner_radius_q16 = rad_q16;
+    nd->scale_jet_v_q16 = BLOOM_Q16_ONE;
+    nd->bound_value_q16 = init_q16;
+    nd->style_and_state = glass_mode | BLOOM_UI_STATE_GLASS_BIT | (rgb24 << 8U);
+    nd->action_opcode = action;
+    bloom_ui_compute_wave64_mask(cx_q16, cy_q16, hw_q16, hh_q16,
+                                 &nd->tile_mask_lo32, &nd->tile_mask_hi32);
+
+    memset(arena->map.ui_labels[idx], 0, 16U);
+    const char *lbl = lean_string_cstr(label_str);
+    if (lbl) {
+        size_t out_k = 0U;
+        for (size_t k = 0U; lbl[k] != '\0' && out_k < 15U; ++k) {
+            uint8_t c = (uint8_t)lbl[k];
+            if (c >= 0x20U && c <= 0x7EU) {
+                arena->map.ui_labels[idx][out_k++] = (char)c;
+            }
+        }
+        arena->map.ui_labels[idx][out_k] = '\0';
+    }
+
+    if (bind_ch < BLOOM_REG_CHANNELS) {
+        bloom_reg_bank_set_q16(&arena->map.reg_bank, bind_ch, init_q16);
+    }
+
+    dom->compiled_node_count = hdr->ui_count;
+    dom->dom_mask_lo32 |= nd->tile_mask_lo32;
+    dom->dom_mask_hi32 |= nd->tile_mask_hi32;
+    bloom_jsi_stamp_mac(dom, 0xD0A00064ULL, &dom->mac_lo32, &dom->mac_hi32);
+
+    flex->child_count = hdr->ui_count;
+    flex->tile_mask_lo32 |= nd->tile_mask_lo32;
+    flex->tile_mask_hi32 |= nd->tile_mask_hi32;
+    bloom_jsi_stamp_mac(flex, 0xF1EC0064ULL, &flex->mac_lo32, &flex->mac_hi32);
+
+    hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    return lean_io_result_mk_ok(lean_box_uint32(node_id));
+}
+
+LEAN_EXPORT lean_obj_res bloom_jsi_config_text_input(b_lean_obj_arg eng,
+                                                     uint32_t bound_node_id,
+                                                     uint32_t action,
+                                                     b_lean_obj_arg init_text,
+                                                     uint32_t anchor_x_q16,
+                                                     uint32_t anchor_y_q16) {
+    BloomJsiHandle *h = bloom_jsi_unwrap(eng);
+    BloomEngineArena *arena = h->arena;
+    BloomTextInput64 *tinput = &arena->map.text_input;
+    BloomIme64 *ime = &arena->map.ime;
+    BloomDomState64 *dom = &arena->map.dom;
+
+    bloom_text_input_init64(tinput, bound_node_id, action);
+    const char *txt = lean_string_cstr(init_text);
+    if (txt) {
+        for (size_t i = 0U; txt[i] != '\0'; ++i) {
+            (void)bloom_text_input_insert_char64(tinput, txt[i]);
+        }
+    }
+    tinput->focused = 0U;
+    bloom_jsi_stamp_mac(tinput, 0x7EC70064ULL, &tinput->hash_lo32, &tinput->hash_hi32);
+
+    bloom_ime_init64(ime, bound_node_id);
+    ime->anchor_x_q16 = (int32_t)anchor_x_q16;
+    ime->anchor_y_q16 = (int32_t)anchor_y_q16;
+    bloom_jsi_stamp_mac(ime, 0x1AE00064ULL, &ime->mac_lo32, &ime->mac_hi32);
+
+    dom->focused_input_id = 0U;
+    bloom_jsi_stamp_mac(dom, 0xD0A00064ULL, &dom->mac_lo32, &dom->mac_hi32);
+
+    arena->map.frame_hdr.flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_obj_res bloom_jsi_compile_latex_card(b_lean_obj_arg eng,
+                                                      b_lean_obj_arg latex_str,
+                                                      uint64_t pos_pack,
+                                                      uint64_t size_pack,
+                                                      uint64_t em_panel_pack,
+                                                      uint32_t rgb24) {
+    BloomJsiHandle *h = bloom_jsi_unwrap(eng);
+    BloomEngineArena *arena = h->arena;
+    BloomFrameHeader64 *hdr = &arena->map.frame_hdr;
+
+    if (hdr->latex_count >= BLOOM_MAX_LATEX_BOXES) {
+        return lean_io_result_mk_ok(lean_box_uint32(0U));
+    }
+
+    int32_t cx_q16    = (int32_t)(uint32_t)(pos_pack & 0xFFFFFFFFULL);
+    int32_t cy_q16    = (int32_t)(uint32_t)(pos_pack >> 32U);
+    int32_t hw_q16    = (int32_t)(uint32_t)(size_pack & 0xFFFFFFFFULL);
+    int32_t hh_q16    = (int32_t)(uint32_t)(size_pack >> 32U);
+    int32_t em_in_q16 = (int32_t)(uint32_t)(em_panel_pack & 0xFFFFFFFFULL);
+    uint32_t panel_id = (uint32_t)(em_panel_pack >> 32U);
+
+    int64_t hw64 = (hw_q16 > 1024) ? (int64_t)hw_q16 : 1024LL;
+    int64_t hh64 = (hh_q16 > 1024) ? (int64_t)hh_q16 : 1024LL;
+    int64_t pad_x = (hw64 / 7LL > 1400LL) ? (hw64 / 7LL) : 1400LL;
+    int64_t pad_y = (hh64 / 5LL > 700LL)  ? (hh64 / 5LL) : 700LL;
+    int64_t avail_w = 2LL * hw64 - 2LL * pad_x;
+    int64_t avail_h = 2LL * hh64 - 2LL * pad_y;
+    if (avail_w < 1024LL) avail_w = 1024LL;
+    if (avail_h < 1024LL) avail_h = 1024LL;
+
+    int64_t em = (em_in_q16 > 512) ? (int64_t)em_in_q16 : 2048LL;
+    if (2LL * em > avail_h) {
+        em = avail_h / 2LL;
+    }
+    if (em < 512LL) em = 512LL;
+    if (em > 32768LL) em = 32768LL;
+
+    size_t base_idx = (size_t)hdr->latex_count;
+    size_t rem_cap = (size_t)BLOOM_MAX_LATEX_BOXES - base_idx;
+    const char *src = lean_string_cstr(latex_str);
+
+    BloomLatexBox64 probe_boxes[BLOOM_MAX_LATEX_BOXES];
+    int32_t total_w = 0;
+    (void)bloom_latex_compile_boxes64(src, 0, cy_q16, (int32_t)em, rgb24,
+                                      probe_boxes, rem_cap, &total_w);
+    if (total_w > 0 && (int64_t)total_w > avail_w) {
+        em = (em * avail_w) / (int64_t)total_w;
+        if (em < 512LL) em = 512LL;
+        (void)bloom_latex_compile_boxes64(src, 0, cy_q16, (int32_t)em, rgb24,
+                                          probe_boxes, rem_cap, &total_w);
+    }
+
+    int32_t origin_x = bloom_jsi_clamp64(
+        (int64_t)cx_q16 - ((int64_t)total_w / 2LL), -262144, 262144);
+    size_t emitted = bloom_latex_compile_boxes64(src, origin_x, cy_q16, (int32_t)em, rgb24,
+                                                 &arena->map.latex_boxes[base_idx],
+                                                 rem_cap, &total_w);
+    for (size_t k = 0U; k < emitted; ++k) {
+        BloomLatexBox64 *bx = &arena->map.latex_boxes[base_idx + k];
+        bx->box_id = (uint32_t)(base_idx + k + 1U);
+        bx->parent_panel_id = panel_id;
+        bloom_jsi_stamp_mac(bx, 0x1A7EC064ULL, &bx->mac_lo32, &bx->mac_hi32);
+    }
+    hdr->latex_count = (uint32_t)(base_idx + emitted);
+    hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    return lean_io_result_mk_ok(lean_box_uint32((uint32_t)emitted));
+}
+
+LEAN_EXPORT lean_obj_res bloom_jsi_set_frame_flags(b_lean_obj_arg eng,
+                                                   uint32_t enable_mask,
+                                                   uint32_t disable_mask) {
+    BloomJsiHandle *h = bloom_jsi_unwrap(eng);
+    BloomFrameHeader64 *hdr = &h->arena->map.frame_hdr;
+    hdr->flags = (hdr->flags | enable_mask) & (~disable_mask);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_obj_res bloom_jsi_sync_camera_now(b_lean_obj_arg eng,
+                                                   uint32_t yaw_q16,
+                                                   uint32_t pitch_q16,
+                                                   uint32_t dist_q16) {
+    BloomJsiHandle *h = bloom_jsi_unwrap(eng);
+    BloomEngineArena *arena = h->arena;
+    BloomCamera64 *cam = &arena->map.camera;
+
+    cam->orbit_yaw_q16 = (int32_t)yaw_q16;
+    cam->orbit_pitch_q16 = bloom_jsi_clamp64((int64_t)(int32_t)pitch_q16, -85000, 85000);
+    cam->orbit_dist_q16 = bloom_jsi_clamp64((int64_t)(int32_t)dist_q16, 2 * BLOOM_Q16_ONE, 14 * BLOOM_Q16_ONE);
+    cam->focus_dist_q16 = cam->orbit_dist_q16;
+    bloom_camera_sync_from_orbit(cam);
+
+    arena->map.flow_states[BLOOM_FLOW_CH_CAM_YAW][3]   = (uint64_t)(int64_t)cam->orbit_yaw_q16;
+    arena->map.flow_states[BLOOM_FLOW_CH_CAM_YAW][4]   = 0ULL;
+    arena->map.flow_states[BLOOM_FLOW_CH_CAM_PITCH][3] = (uint64_t)(int64_t)cam->orbit_pitch_q16;
+    arena->map.flow_states[BLOOM_FLOW_CH_CAM_PITCH][4] = 0ULL;
+    arena->map.flow_states[BLOOM_FLOW_CH_CAM_DIST][3]  = (uint64_t)(int64_t)cam->orbit_dist_q16;
+    arena->map.flow_states[BLOOM_FLOW_CH_CAM_DIST][4]  = 0ULL;
+    arena->map.flow_states[BLOOM_FLOW_CH_CAM_FOCUS][3] = (uint64_t)(int64_t)cam->focus_dist_q16;
+    arena->map.flow_states[BLOOM_FLOW_CH_CAM_FOCUS][4] = 0ULL;
+
+    arena->map.frame_hdr.flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_obj_res bloom_jsi_save_image(b_lean_obj_arg eng, b_lean_obj_arg out_path) {
+    BloomJsiHandle *h = bloom_jsi_unwrap(eng);
+    BloomEngineArena *arena = h->arena;
+    bloom_image_seal_arena(arena);
+    if (!bloom_image_verify_arena(arena)) {
+        return lean_io_result_mk_ok(lean_box(0));
+    }
+    const char *path = lean_string_cstr(out_path);
+    if (!path || path[0] == '\0') {
+        return lean_io_result_mk_ok(lean_box(0));
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        return lean_io_result_mk_ok(lean_box(0));
+    }
+    size_t nw = fwrite(arena, 1U, sizeof(BloomEngineArena), fp);
+    int rc = fclose(fp);
+    bool ok = (nw == sizeof(BloomEngineArena)) && (rc == 0);
+    return lean_io_result_mk_ok(lean_box(ok ? 1 : 0));
+}
+
+LEAN_EXPORT lean_obj_res bloom_jsi_verify_latex_in_cards(b_lean_obj_arg eng) {
+    BloomJsiHandle *h = bloom_jsi_unwrap(eng);
+    const BloomEngineArena *arena = h->arena;
+    const BloomFrameHeader64 *hdr = &arena->map.frame_hdr;
+    uint32_t lcnt = (hdr->latex_count > BLOOM_MAX_LATEX_BOXES) ? BLOOM_MAX_LATEX_BOXES : hdr->latex_count;
+    uint32_t ucnt = (hdr->ui_count > BLOOM_MAX_UI_NODES) ? BLOOM_MAX_UI_NODES : hdr->ui_count;
+    if (lcnt == 0U) {
+        return lean_io_result_mk_ok(lean_box(0));
+    }
+    for (uint32_t i = 0U; i < lcnt; ++i) {
+        const BloomLatexBox64 *bx = &arena->map.latex_boxes[i];
+        int64_t bx_l = (int64_t)bx->x_q16 - (int64_t)bx->half_w_q16;
+        int64_t bx_r = (int64_t)bx->x_q16 + (int64_t)bx->half_w_q16;
+        int64_t bx_t = (int64_t)bx->y_q16 - (int64_t)bx->half_h_q16;
+        int64_t bx_b = (int64_t)bx->y_q16 + (int64_t)bx->half_h_q16;
+        if (bx_l < -65536LL || bx_r > 65536LL || bx_t < -65536LL || bx_b > 65536LL) {
+            return lean_io_result_mk_ok(lean_box(0));
+        }
+        if (bx->parent_panel_id > 0U && bx->parent_panel_id <= ucnt) {
+            const BloomUiNode64 *nd = &arena->map.ui_nodes[bx->parent_panel_id - 1U];
+            int64_t p_l = (int64_t)nd->offset_x_q16 - (int64_t)nd->half_w_q16;
+            int64_t p_r = (int64_t)nd->offset_x_q16 + (int64_t)nd->half_w_q16;
+            int64_t p_t = (int64_t)nd->offset_y_q16 - (int64_t)nd->half_h_q16;
+            int64_t p_b = (int64_t)nd->offset_y_q16 + (int64_t)nd->half_h_q16;
+            if (bx_l < p_l || bx_r > p_r || bx_t < p_t || bx_b > p_b) {
+                return lean_io_result_mk_ok(lean_box(0));
+            }
+        }
+    }
+    return lean_io_result_mk_ok(lean_box(1));
 }
 
 LEAN_EXPORT lean_obj_res bloom_jsi_step_and_render(b_lean_obj_arg eng,
@@ -453,57 +789,19 @@ LEAN_EXPORT lean_obj_res bloom_jsi_run_window(b_lean_obj_arg eng, lean_obj_arg o
 }
 
 /* ============================================================================
- * Compile-Time SEARU Torture + CPU Q16.16 vs GPU WGSL f32 Alignment Gates
+ * Compile-Time FLOW v7.0.1 SEARU Torture + CPU Q16.16 vs GPU WGSL f32 Gates
  * ============================================================================ */
 
-typedef struct {
-    uint64_t sm64;
-    uint32_t xs32;
-    uint32_t epiphanies;
-} BloomSearuState;
-
-static void searu_init(BloomSearuState *st, uint64_t seed) {
-    st->sm64 = seed | 1ULL;
-    uint32_t fold = (uint32_t)((seed ^ (seed >> 32U)) & 0xFFFFFFFFULL);
-    st->xs32 = fold ? fold : 0xCAFEBABEU;
-    st->epiphanies = 0U;
+static int64_t searu_levy_coord_q16(uint64_t *rng) {
+    uint64_t swan_mask = UINT64_C(0);
+    uint64_t jump = searu_zipf_jump(rng, SEARU_OPT_CHAOS_MAX_Q8, &swan_mask);
+    uint64_t r = searu_rng_next(rng);
+    int64_t mag = (int64_t)((jump <= UINT64_C(32768)) ? (jump * UINT64_C(4096)) : UINT64_C(0x40000000));
+    return ((r & UINT64_C(1)) != UINT64_C(0)) ? mag : -mag;
 }
 
-static uint64_t searu_next_u64(BloomSearuState *st) {
-    st->sm64 += UINT64_C(0x9E3779B97F4A7C15);
-    uint64_t z = st->sm64;
-    z = (z ^ (z >> 30U)) * UINT64_C(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27U)) * UINT64_C(0x94D049BB133111EB);
-    return z ^ (z >> 31U);
-}
-
-static uint32_t searu_next_u32(BloomSearuState *st) {
-    uint32_t x = st->xs32;
-    x ^= x << 13U;
-    x ^= x >> 17U;
-    x ^= x << 5U;
-    st->xs32 = x ? x : 1U;
-    return st->xs32;
-}
-
-/* Pure-integer SEARU DualChaosState Levy-flight / Black-Swan generator:
- * Heavy-tailed inverse-power jump in [1 .. 10000], hitting 10000 on Black Swan */
-static int64_t searu_next_levy_step(BloomSearuState *st, int64_t scale_q16, bool *out_black_swan) {
-    uint32_t r = searu_next_u32(st) & 0xFFFFU;
-    int64_t zipf_mag = 10000LL;
-    if (r > 12U) {
-        /* Heavy-tailed Pareto ~ (65536 / r) capped at 10000 */
-        zipf_mag = (int64_t)(65536U / r);
-        if (zipf_mag < 1LL) zipf_mag = 1LL;
-        if (zipf_mag > 10000LL) zipf_mag = 10000LL;
-    }
-    if (out_black_swan) *out_black_swan = (zipf_mag >= 5000LL);
-    int64_t sign = (searu_next_u32(st) & 1U) ? 1LL : -1LL;
-    return sign * ((zipf_mag * scale_q16) / 1000LL);
-}
-
-static int32_t searu_hostile_i32(BloomSearuState *st) {
-    uint64_t r = searu_next_u64(st);
+static int32_t searu_hostile_i32(uint64_t *rng) {
+    uint64_t r = searu_rng_next(rng);
     switch (r & 7ULL) {
     case 0ULL: return INT32_MIN;
     case 1ULL: return INT32_MAX;
@@ -566,9 +864,156 @@ static void searu_put_u32_le(uint8_t *p, uint32_t v) {
         }                                                                         \
     } while (0)
 
+#define SEARU_V7_CHECK(cond, msg) \
+    do {                          \
+        if (!(cond)) return msg;  \
+    } while (0)
+
+static const char *searu_verify_flow_v7(uint64_t seed, BloomEngineArena *heal_arena) {
+    bloom_arena_init_default(heal_arena, 640U, 360U);
+
+    const BloomBilevelTerm terms[4] = {
+        { -20LL * FLOW_Q16_ONE, 0LL,          0LL, UINT64_C(50000) }, /* bit 0: Kan-pinned OFF */
+        { -6LL * FLOW_Q16_ONE,  FLOW_Q16_ONE, 0LL, UINT64_C(0)     }, /* bit 1: -6.0 + +1.0 slope */
+        { -6LL * FLOW_Q16_ONE,  0LL,          0LL, UINT64_C(0)     }, /* bit 2: -6.0 offset */
+        { +8LL * FLOW_Q16_ONE,  0LL,          0LL, UINT64_C(8000)  }  /* bit 3: +8.0 decoy */
+    };
+    uint64_t heal_seed = seed ^ UINT64_C(0x5EA407002026CAFE);
+    uint32_t heal_epoch = 10U;
+
+    /* 7a. Phase-gate silence: converged channel must return false in O(1) without touching seed/epoch */
+    uint64_t seed_before = heal_seed;
+    SEARU_V7_CHECK(!bloom_arena_heal_and_swap(heal_arena, BLOOM_FLOW_CH_SCROLL, terms, 4U, UINT64_C(0x1),
+                                              0LL, 0LL, 8U, &heal_seed, &heal_epoch, 512U),
+                   "searu_heal_and_swap silent on converged channel");
+    SEARU_V7_CHECK(heal_seed == seed_before && heal_epoch == 10U,
+                   "searu_heal_and_swap O(1) zero entropy on converged");
+
+    /* 7b. Trap Chart 6 at a quadratic discriminant barrier: R(x) = +12.0 + x^2 >= 12.0 > 0 (Delta < 0) */
+    uint64_t barrier_chart[8] = {
+        (uint64_t)(12LL * FLOW_Q16_ONE),
+        0ULL,
+        (uint64_t)(2LL * FLOW_Q16_ONE),
+        ((uint64_t)(uint32_t)(-FLOW_MAX_Q16) << 32U) | (uint64_t)(uint32_t)FLOW_MAX_Q16,
+        ((uint64_t)(uint32_t)(16 * FLOW_Q16_ONE) << 32U) | (uint64_t)(uint32_t)FLOW_Q16_ONE,
+        (6ULL << 24U) | (6ULL << 16U),
+        1ULL << 32U,
+        0ULL
+    };
+    flow_arena_publish_bound((flow_cell *)heal_arena->map.flow_charts, 6U, BLOOM_FLOW_CHART_MASK, 2U, barrier_chart);
+    SEARU_V7_CHECK(bloom_arena_try_swap_chart(heal_arena, BLOOM_FLOW_CH_SCROLL, 6U, 0U),
+                   "Swapped scroll channel to Chart 6");
+
+    uint64_t *scroll_st = heal_arena->map.flow_states[BLOOM_FLOW_CH_SCROLL];
+    scroll_st[3] = (uint64_t)(4LL * FLOW_Q16_ONE); /* start away from vertex x=0 -> actively moving */
+    flow_step_atlas(scroll_st, scroll_st, (const flow_cell *)heal_arena->map.flow_charts, BLOOM_FLOW_CHART_MASK, 0LL, 0U);
+    SEARU_V7_CHECK(scroll_st[4] != 0ULL && (scroll_st[6] & FLOW_STATUS_CONVERGED) == 0ULL,
+                   "Channel actively descending toward barrier vertex");
+    SEARU_V7_CHECK(!bloom_arena_heal_and_swap(heal_arena, BLOOM_FLOW_CH_SCROLL, terms, 4U, UINT64_C(0x1),
+                                              0LL, 0LL, 8U, &heal_seed, &heal_epoch, 512U),
+                   "searu_heal_and_swap silent while dt != 0");
+
+    /* Settle onto barrier vertex x = 0 where !CONVERGED && dt == 0 */
+    for (uint32_t s = 0U; s < 8U; ++s) {
+        flow_step_atlas(scroll_st, scroll_st, (const flow_cell *)heal_arena->map.flow_charts, BLOOM_FLOW_CHART_MASK, 0LL, 0U);
+    }
+    SEARU_V7_CHECK((scroll_st[6] & FLOW_STATUS_CONVERGED) == 0ULL && scroll_st[4] == 0ULL,
+                   "Channel trapped at discriminant barrier (!CONVERGED && dt == 0)");
+
+    /* Wake SEARU x FLOW 2-Jet co-solver & commit healed chart via lock-free @swap */
+    SEARU_V7_CHECK(bloom_arena_heal_and_swap(heal_arena, BLOOM_FLOW_CH_SCROLL, terms, 4U, UINT64_C(0x1),
+                                             0LL, 0LL, 8U, &heal_seed, &heal_epoch, 512U),
+                   "bloom_arena_heal_and_swap healed trapped barrier chart via @swap");
+    SEARU_V7_CHECK(heal_epoch > 10U && (int64_t)heal_arena->map.flow_charts[6][0] == 0LL,
+                   "Healed Chart 6 committed with Kan-pinned bit 0 untouched");
+    for (uint32_t s = 0U; s < 8U; ++s) {
+        flow_step_atlas(scroll_st, scroll_st, (const flow_cell *)heal_arena->map.flow_charts, BLOOM_FLOW_CHART_MASK, 0LL, 0U);
+    }
+    SEARU_V7_CHECK((scroll_st[6] & FLOW_STATUS_CONVERGED) != 0ULL && (int64_t)scroll_st[3] == 0LL,
+                   "Post-heal 2-Jet trajectory converged to exact equilibrium x = 0");
+
+    /* 7c. Zero-BLR `bloom_ui_solve_glass_tracks64` (`SEARU_SOLVE_INLINE`) with Kan-pinned Node 0 */
+    BloomUiNode64 gnodes[8];
+    memset(gnodes, 0, sizeof(gnodes));
+    for (size_t i = 0U; i < 8U; ++i) {
+        gnodes[i].style_and_state = BLOOM_UI_STATE_GLASS_BIT | BLOOM_GLASS_IRIDESCENT;
+    }
+    const uint16_t ui_edges[14] = {
+        SEARU_EDGE_U16(0, 1), SEARU_EDGE_U16(0, 2), SEARU_EDGE_U16(0, 3),
+        SEARU_EDGE_U16(1, 2), SEARU_EDGE_U16(2, 3), SEARU_EDGE_U16(3, 4),
+        SEARU_EDGE_U16(4, 5), SEARU_EDGE_U16(5, 6), SEARU_EDGE_U16(6, 7),
+        SEARU_EDGE_U16(7, 1), SEARU_EDGE_U16(1, 4), SEARU_EDGE_U16(2, 5),
+        SEARU_EDGE_U16(3, 6), SEARU_EDGE_U16(4, 7)
+    };
+    uint32_t unsat = 99U;
+    SEARU_V7_CHECK(bloom_ui_solve_glass_tracks64(gnodes, 8U, ui_edges, 14U, UINT64_C(0x3),
+                                                 seed ^ UINT64_C(0xBEEF7000), 2048U, &unsat),
+                   "Zero-BLR SEARU_SOLVE_INLINE solved 8-node UI glass contrast graph");
+    SEARU_V7_CHECK(unsat == 0U && (gnodes[0].style_and_state & 0x3U) == BLOOM_GLASS_IRIDESCENT,
+                   "Kan-pinned UI Node 0 glass mode preserved");
+    for (uint32_t e = 0U; e < 14U; ++e) {
+        uint32_t u = (uint32_t)(ui_edges[e] >> 8U) & 0xFU;
+        uint32_t v = (uint32_t)ui_edges[e] & 0xFU;
+        SEARU_V7_CHECK((gnodes[u].style_and_state & 0x3U) != (gnodes[v].style_and_state & 0x3U),
+                       "Adjacent UI glass nodes assigned distinct optical tracks");
+    }
+
+    /* 7d. Ring-0 1-Bit Engram, Ring-0 Bilevel Step & Petersen Graph 3-Coloring / 3-SAT (`searu.h`) */
+    uint64_t engram_in[8] = { UINT64_C(0xA5A5A5A55A5A5A5A), 0ULL, 0ULL, 0ULL, 12ULL, 224ULL, seed | 1ULL, 0ULL };
+    uint64_t engram_out[8] = { 0 };
+    const uint64_t r0_pin[4] = { UINT64_C(0xFFFF0000FFFF0000), UINT64_C(~0), UINT64_C(~0), UINT64_C(~0) };
+    const uint64_t r0_frust[4] = { UINT64_C(0x0000FFFF0000FFFF), 0ULL, 0ULL, 0ULL };
+    uint64_t jump0 = searu_ring0_step_1bit(engram_out, engram_in, r0_pin, r0_frust);
+    SEARU_V7_CHECK(jump0 >= 1ULL && (engram_out[0] & r0_pin[0]) == (engram_in[0] & r0_pin[0]),
+                   "searu_ring0_step_1bit branchless Kan-pin invariant");
+
+    const searu_bilevel_term r0_terms[4] = {
+        { -4LL * FLOW_Q16_ONE, FLOW_Q16_ONE, 0LL, 0ULL },
+        { -4LL * FLOW_Q16_ONE, 0LL,          0LL, 0ULL },
+        { -4LL * FLOW_Q16_ONE, 0LL,          0LL, 0ULL },
+        {  0LL,                0LL,          0LL, 0ULL }
+    };
+    uint64_t r0_state[8] = { (uint64_t)(12LL * FLOW_Q16_ONE), 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL };
+    uint64_t r0_rng = seed | 1ULL;
+    uint64_t r0_bits = 0ULL;
+    for (uint32_t k = 0U; k < 16U; ++k) {
+        (void)searu_ring0_bilevel_step(r0_state, r0_state, barrier_chart, r0_terms, &r0_rng, &r0_bits);
+    }
+    SEARU_V7_CHECK(flow_abs_i64((int64_t)r0_state[0]) <= (uint64_t)(12LL * FLOW_Q16_ONE),
+                   "searu_ring0_bilevel_step monotone residual bound");
+
+    const uint16_t petersen[15] = {
+        SEARU_EDGE_U16(0, 1), SEARU_EDGE_U16(1, 2), SEARU_EDGE_U16(2, 3), SEARU_EDGE_U16(3, 4), SEARU_EDGE_U16(4, 0),
+        SEARU_EDGE_U16(5, 7), SEARU_EDGE_U16(7, 9), SEARU_EDGE_U16(9, 6), SEARU_EDGE_U16(6, 8), SEARU_EDGE_U16(8, 5),
+        SEARU_EDGE_U16(0, 5), SEARU_EDGE_U16(1, 6), SEARU_EDGE_U16(2, 7), SEARU_EDGE_U16(3, 8), SEARU_EDGE_U16(4, 9)
+    };
+    searu_result col_res;
+    SEARU_V7_CHECK(searu_solve_graph_color(&col_res, petersen, 15U, 10U, 3U, NULL, UINT64_C(0x1),
+                                           seed ^ UINT64_C(0xC0104), 4096U) == 0ULL,
+                   "searu_solve_graph_color 3-colored Petersen graph to 0 conflicts");
+
+    const uint32_t sat_clauses[6] = {
+        SEARU_SAT3_CLAUSE(0, 0, 1, 0, 2, 0),
+        SEARU_SAT3_CLAUSE(0, 1, 1, 0, 3, 0),
+        SEARU_SAT3_CLAUSE(1, 1, 2, 0, 3, 1),
+        SEARU_SAT3_CLAUSE(2, 1, 3, 0, 4, 0),
+        SEARU_SAT3_CLAUSE(0, 0, 3, 1, 4, 1),
+        SEARU_SAT3_CLAUSE(1, 0, 2, 1, 4, 0)
+    };
+    const uint64_t sat_init[4] = { UINT64_C(0x1), 0ULL, 0ULL, 0ULL };
+    const uint64_t sat_pin[4]  = { UINT64_C(0x1), 0ULL, 0ULL, 0ULL };
+    searu_result sat_res;
+    SEARU_V7_CHECK(searu_solve_3sat(&sat_res, sat_clauses, 6U, 5U, sat_init, sat_pin,
+                                    seed ^ UINT64_C(0x35A7), 2048U) == 0ULL &&
+                   (sat_res.canvas[0] & UINT64_C(1)) == UINT64_C(1),
+                   "searu_solve_3sat solved Kan-pinned 3-SAT to 0 unsat clauses");
+    return NULL;
+}
+
+#undef SEARU_V7_CHECK
+
 LEAN_EXPORT lean_obj_res bloom_jsi_verify_searu_core(uint64_t seed) {
-    BloomSearuState rng;
-    searu_init(&rng, seed);
+    uint64_t rng = seed | UINT64_C(1);
 
     /* 1. Binary glTF (.glb) Hostile / 0xFFFFFFFF Overflow / Valid Ingestion */
     {
@@ -677,10 +1122,9 @@ LEAN_EXPORT lean_obj_res bloom_jsi_verify_searu_core(uint64_t seed) {
         SEARU_REQ(n_mix > 0U, "BVH mixed CSG build succeeded");
 
         for (uint32_t q = 0U; q < 384U; ++q) {
-            bool swan = false;
-            int64_t px = (q < 8U) ? ((q & 1U) ? INT64_MAX : INT64_MIN) : searu_next_levy_step(&rng, 65536LL, &swan);
-            int64_t py = (q < 8U) ? ((q & 2U) ? INT64_MAX : INT64_MIN) : searu_next_levy_step(&rng, 65536LL, &swan);
-            int64_t pz = (q < 8U) ? ((q & 4U) ? INT64_MAX : INT64_MIN) : searu_next_levy_step(&rng, 65536LL, &swan);
+            int64_t px = (q < 8U) ? ((q & 1U) ? INT64_MAX : INT64_MIN) : searu_levy_coord_q16(&rng);
+            int64_t py = (q < 8U) ? ((q & 2U) ? INT64_MAX : INT64_MIN) : searu_levy_coord_q16(&rng);
+            int64_t pz = (q < 8U) ? ((q & 4U) ? INT64_MAX : INT64_MIN) : searu_levy_coord_q16(&rng);
             uint32_t vis = 0U, mat = 0U;
             int64_t ub = bloom_bvh_eval_csg_q16(bvh, n_mix, ops_mix, 6U, px, py, pz, &vis);
             int64_t uc = bloom_csg_eval_program_q16(ops_mix, 6U, px, py, pz, &mat);
@@ -809,10 +1253,8 @@ LEAN_EXPORT lean_obj_res bloom_jsi_verify_searu_core(uint64_t seed) {
         SEARU_REQ(searu_utf8_valid(inp.utf8_buf, BLOOM_TEXT_INPUT_CAP, NULL), "UTF-8 valid after mid-cp IME commit");
     }
 
-    /* 6. SEARU DualChaosState + Epiphany Simulated Annealing across Flex/Bento/LOD/SVG/LaTeX/Matter/Style */
+    /* 6. FLOW v7.0.1 CLZ Zipf Lévy-Flight Torture across Flex/Bento/LOD/SVG/LaTeX/Matter/Style */
     {
-        int64_t temp_q16 = 65536LL;
-        int64_t best_fit = INT64_MIN;
         BloomFlexContainer64 flex;
         BloomUiNode64 nodes[8];
         BloomIntent64 intents[6];
@@ -847,10 +1289,9 @@ LEAN_EXPORT lean_obj_res bloom_jsi_verify_searu_core(uint64_t seed) {
         SEARU_REQ(!hot, "Thermal 755K exits below 760K");
 
         for (uint32_t iter = 0U; iter < 192U; ++iter) {
-            bool black_swan = false;
-            int64_t step = searu_next_levy_step(&rng, temp_q16, &black_swan);
+            int64_t step = searu_levy_coord_q16(&rng);
 
-            int32_t ox = (iter < 16U) ? searu_hostile_i32(&rng) : (int32_t)(step & 0x7FFFFFFFLL);
+            int32_t ox = (iter < 16U) ? searu_hostile_i32(&rng) : (int32_t)(uint32_t)((uint64_t)step & 0x7FFFFFFFULL);
             int32_t oy = searu_hostile_i32(&rng);
             int32_t hw = searu_hostile_i32(&rng);
             int32_t hh = searu_hostile_i32(&rng);
@@ -891,17 +1332,6 @@ LEAN_EXPORT lean_obj_res bloom_jsi_verify_searu_core(uint64_t seed) {
             uint32_t cn = bloom_prefab_cull_wave64(insts, 16U, eye_ext, searu_hostile_i32(&rng),
                                                    searu_hostile_i32(&rng), compacted, &mask64);
             SEARU_REQ(cn == 8U && mask64 == 0xAAAAULL, "Wave64 LOD culling exact under extreme coords");
-
-            int64_t fit = (int64_t)dom.dom_mask_lo32 + (int64_t)flex.tile_mask_lo32;
-            if (black_swan && fit > best_fit) {
-                /* SEARU Epiphany re-heat! */
-                rng.epiphanies++;
-                temp_q16 = (temp_q16 * 4LL <= 65536LL) ? (temp_q16 * 4LL) : 65536LL;
-                best_fit = fit;
-            } else {
-                temp_q16 = (temp_q16 * 63LL) >> 6U;
-                if (temp_q16 < 1024LL) temp_q16 = 1024LL;
-            }
         }
 
         /* Malformed SVG & deeply nested LaTeX hostile string torture */
@@ -916,6 +1346,18 @@ LEAN_EXPORT lean_obj_res bloom_jsi_verify_searu_core(uint64_t seed) {
         size_t lc = bloom_latex_compile_boxes64(deep_lx, INT32_MIN, INT32_MAX, INT32_MIN, 0xFFFFFFU, lboxes, 16U, &lw);
         SEARU_REQ(lc > 0U && lc <= 16U, "Deep hostile LaTeX bounded");
         (void)bloom_latex_eval_box_sdf_q16(&lboxes[0], INT32_MIN, INT32_MAX);
+    }
+
+    /* 7. FLOW v7.0.1 Symbiotic SEARU x 2-Jet (`searu_heal_and_swap`, `SEARU_SOLVE_INLINE` & Ring-0) */
+    {
+        BloomEngineArena *heal_arena = NULL;
+        SEARU_REQ(posix_memalign((void **)&heal_arena, BLOOM_VM_PAGE_ALIGN, sizeof(BloomEngineArena)) == 0 && heal_arena != NULL,
+                  "16KB aligned heal_arena allocated");
+        const char *v7_err = searu_verify_flow_v7(seed, heal_arena);
+        free(heal_arena);
+        if (v7_err != NULL) {
+            return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(v7_err)));
+        }
     }
 
     return lean_io_result_mk_ok(lean_box(1));
@@ -1405,6 +1847,79 @@ LEAN_EXPORT lean_obj_res l_Bloom_verifySearuCore___boxed(lean_obj_arg seed, lean
 LEAN_EXPORT lean_obj_res l_Bloom_verifyGpuAlignment___boxed(lean_obj_arg eng, lean_obj_arg world) {
     (void)world;
     lean_obj_res r = bloom_jsi_verify_gpu_alignment(eng);
+    lean_dec(eng);
+    return r;
+}
+
+LEAN_EXPORT lean_obj_res l_Bloom_clearUiDom___boxed(lean_obj_arg eng, lean_obj_arg fpack, lean_obj_arg pad, lean_obj_arg gap, lean_obj_arg world) {
+    (void)world;
+    uint32_t uf = lean_unbox_uint32(fpack), upad = lean_unbox_uint32(pad), ugap = lean_unbox_uint32(gap);
+    lean_dec(fpack); lean_dec(pad); lean_dec(gap);
+    lean_obj_res r = bloom_jsi_clear_ui_dom(eng, uf, upad, ugap);
+    lean_dec(eng);
+    return r;
+}
+
+LEAN_EXPORT lean_obj_res l_Bloom_mountUiNodeRaw___boxed(lean_obj_arg eng, lean_obj_arg meta, lean_obj_arg pos, lean_obj_arg sz, lean_obj_arg rv, lean_obj_arg lbl, lean_obj_arg world) {
+    (void)world;
+    uint64_t umeta = lean_unbox_uint64(meta), upos = lean_unbox_uint64(pos), usz = lean_unbox_uint64(sz), urv = lean_unbox_uint64(rv);
+    lean_dec(meta); lean_dec(pos); lean_dec(sz); lean_dec(rv);
+    lean_obj_res r = bloom_jsi_mount_ui_node(eng, umeta, upos, usz, urv, lbl);
+    lean_dec(eng);
+    lean_dec(lbl);
+    return r;
+}
+
+LEAN_EXPORT lean_obj_res l_Bloom_configureTextInput___boxed(lean_obj_arg eng, lean_obj_arg nid, lean_obj_arg act, lean_obj_arg txt, lean_obj_arg ax, lean_obj_arg ay, lean_obj_arg world) {
+    (void)world;
+    uint32_t unid = lean_unbox_uint32(nid), uact = lean_unbox_uint32(act), uax = lean_unbox_uint32(ax), uay = lean_unbox_uint32(ay);
+    lean_dec(nid); lean_dec(act); lean_dec(ax); lean_dec(ay);
+    lean_obj_res r = bloom_jsi_config_text_input(eng, unid, uact, txt, uax, uay);
+    lean_dec(eng);
+    lean_dec(txt);
+    return r;
+}
+
+LEAN_EXPORT lean_obj_res l_Bloom_compileLatexCardRaw___boxed(lean_obj_arg eng, lean_obj_arg lstr, lean_obj_arg pos, lean_obj_arg sz, lean_obj_arg ep, lean_obj_arg rgb, lean_obj_arg world) {
+    (void)world;
+    uint64_t upos = lean_unbox_uint64(pos), usz = lean_unbox_uint64(sz), uep = lean_unbox_uint64(ep);
+    uint32_t urgb = lean_unbox_uint32(rgb);
+    lean_dec(pos); lean_dec(sz); lean_dec(ep); lean_dec(rgb);
+    lean_obj_res r = bloom_jsi_compile_latex_card(eng, lstr, upos, usz, uep, urgb);
+    lean_dec(eng);
+    lean_dec(lstr);
+    return r;
+}
+
+LEAN_EXPORT lean_obj_res l_Bloom_setFrameFlags___boxed(lean_obj_arg eng, lean_obj_arg en, lean_obj_arg dis, lean_obj_arg world) {
+    (void)world;
+    uint32_t uen = lean_unbox_uint32(en), udis = lean_unbox_uint32(dis);
+    lean_dec(en); lean_dec(dis);
+    lean_obj_res r = bloom_jsi_set_frame_flags(eng, uen, udis);
+    lean_dec(eng);
+    return r;
+}
+
+LEAN_EXPORT lean_obj_res l_Bloom_syncCameraOrbitNow___boxed(lean_obj_arg eng, lean_obj_arg yaw, lean_obj_arg pitch, lean_obj_arg dist, lean_obj_arg world) {
+    (void)world;
+    uint32_t uy = lean_unbox_uint32(yaw), up = lean_unbox_uint32(pitch), ud = lean_unbox_uint32(dist);
+    lean_dec(yaw); lean_dec(pitch); lean_dec(dist);
+    lean_obj_res r = bloom_jsi_sync_camera_now(eng, uy, up, ud);
+    lean_dec(eng);
+    return r;
+}
+
+LEAN_EXPORT lean_obj_res l_Bloom_saveArenaImage___boxed(lean_obj_arg eng, lean_obj_arg opath, lean_obj_arg world) {
+    (void)world;
+    lean_obj_res r = bloom_jsi_save_image(eng, opath);
+    lean_dec(eng);
+    lean_dec(opath);
+    return r;
+}
+
+LEAN_EXPORT lean_obj_res l_Bloom_verifyLatexInCards___boxed(lean_obj_arg eng, lean_obj_arg world) {
+    (void)world;
+    lean_obj_res r = bloom_jsi_verify_latex_in_cards(eng);
     lean_dec(eng);
     return r;
 }

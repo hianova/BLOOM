@@ -9,7 +9,7 @@ extern "C" {
 
 /*
  * ============================================================================
- * BLOOM v6.0.0 — Single-Track Cross-Platform SDL3 GPU & Window Host ABI
+ * BLOOM v7.0.1 — Single-Track Cross-Platform SDL3 GPU & Window Host ABI
  * ============================================================================
  * Pure C17 cross-platform GPU compute & native window host built atop SDL3 GPU:
  *   - Consumes the single-source shaders/bloom_core.wgsl compiled by W3C Naga

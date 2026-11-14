@@ -1,7 +1,7 @@
 #include "bloom_prefab.h"
 #include "bloom_scene.h"
 #include "bloom_ui.h"
-#include "flow.h"
+#include "searu.h"
 
 #include <limits.h>
 #include <string.h>
@@ -9,9 +9,12 @@
 /*
  * ============================================================================
  * Pillar 3 ("Prefab SSOT"): Reusable 64B Blueprints, Live Non-Destructive
- * Overrides, Revert-to-SSOT, X-Ray Cutaway, Wave64 LOD, TRC Guard & FLOW v6.0.0
+ * Overrides, Revert-to-SSOT, X-Ray Cutaway, Wave64 LOD, TRC Guard & FLOW v7.0.1
  * ============================================================================
  */
+
+BLOOM_STATIC_ASSERT(sizeof(BloomBilevelTerm) == sizeof(searu_bilevel_term),
+                    "BloomBilevelTerm must match searu_bilevel_term ABI");
 
 static inline int32_t pf_clamp64_to_32(int64_t v, int32_t lo, int32_t hi) {
     if (v < (int64_t)lo) return lo;
@@ -360,7 +363,7 @@ uint32_t bloom_prefab_cull_wave64(const BloomPrefabInst64 *instances,
     return out_n;
 }
 
-/* 6. FLOW v6.0.0 Arena Initialization, @swap & Full Dynamical Step */
+/* 6. FLOW v7.0.1 Arena Initialization, @swap, SEARU Heal & Full Dynamical Step */
 static void pf_pack_flow_chart(uint64_t out[8],
                                int64_t b0,
                                int64_t b1,
@@ -415,7 +418,7 @@ void bloom_arena_init_default(BloomEngineArena *arena, uint32_t width_px, uint32
     bloom_matter_init_canonical(arena->map.matters);
     bloom_prefab_init_canonical(arena->map.styles, arena->map.prefabs);
 
-    /* Publish Canonical FLOW v6.0.0 16-Chart Manifold Atlas (Slots 232..247) */
+    /* Publish Canonical FLOW v7.0.1 16-Chart Manifold Atlas (Slots 232..247) */
     flow_cell *charts = (flow_cell *)arena->map.flow_charts;
     uint64_t tmp[8];
     /* Chart 0: UI Crisp Tactile Micro-Spring (horizon 2560 Q16 ~= 0.039/step, zero overshoot) */
@@ -453,7 +456,7 @@ void bloom_arena_init_default(BloomEngineArena *arena, uint32_t width_px, uint32
         flow_arena_publish_bound(charts, c, BLOOM_FLOW_CHART_MASK, 1U, tmp);
     }
 
-    /* Initialize 32 FLOW v6.0.0 State Channels */
+    /* Initialize 32 FLOW v7.0.1 State Channels */
     const BloomCamera64 *cam = &arena->cells[BLOOM_SLOT_CAMERA].camera;
     pf_pack_flow_state(arena->cells[BLOOM_SLOT_FLOW_STATE_BASE + BLOOM_FLOW_CH_CAM_YAW].u64,
                        cam->orbit_yaw_q16, BLOOM_CHART_CAMERA_RIG, 0U);
@@ -496,6 +499,38 @@ bool bloom_arena_try_swap_chart(BloomEngineArena *arena,
     uint16_t next_mode = (uint16_t)((mode_req & (uint16_t)(~kan_lock)) | (cur_mode & kan_lock));
     st[5] = ((uint64_t)(target_chart_idx & BLOOM_FLOW_CHART_MASK) << 16U) | (uint64_t)next_mode;
     return true;
+}
+
+bool bloom_arena_heal_and_swap(BloomEngineArena *arena,
+                               uint32_t flow_slot,
+                               const BloomBilevelTerm *terms,
+                               uint32_t term_count,
+                               uint64_t kan_bit_pin,
+                               int64_t u_ext_q16,
+                               int64_t target_x_q16,
+                               uint32_t jet_steps,
+                               uint64_t *io_seed,
+                               uint32_t *io_epoch,
+                               uint32_t max_iters) {
+    if (!arena || flow_slot >= BLOOM_MAX_FLOW_STATES || !terms || term_count == 0U) {
+        return false;
+    }
+    const uint64_t *st = arena->cells[BLOOM_SLOT_FLOW_STATE_BASE + flow_slot].u64;
+    if (((st[6] & (uint64_t)FLOW_STATUS_CONVERGED) != UINT64_C(0)) || (st[4] != UINT64_C(0))) {
+        return false;
+    }
+    uint32_t n = (term_count > SEARU_BILEVEL_MAX_VARS) ? SEARU_BILEVEL_MAX_VARS : term_count;
+    searu_bilevel_term s_terms[SEARU_BILEVEL_MAX_VARS];
+    for (uint32_t i = 0U; i < n; ++i) {
+        s_terms[i].db0_q16 = terms[i].db0_q16;
+        s_terms[i].db1_q16 = terms[i].db1_q16;
+        s_terms[i].db2_q16 = terms[i].db2_q16;
+        s_terms[i].weight_cost = terms[i].weight_cost;
+    }
+    flow_cell *charts = (flow_cell *)arena->cells[BLOOM_SLOT_FLOW_CHART_BASE].u64;
+    return searu_heal_and_swap(charts, BLOOM_FLOW_CHART_MASK, st, s_terms, n,
+                               kan_bit_pin, u_ext_q16, target_x_q16, jet_steps,
+                               io_seed, io_epoch, max_iters, NULL);
 }
 
 bool bloom_arena_step_dynamics(BloomEngineArena *arena, uint16_t mode_req) {

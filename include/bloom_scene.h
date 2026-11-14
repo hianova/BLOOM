@@ -161,7 +161,7 @@ void bloom_matter_eval_radiance_q16(const BloomMatter64 *matter,
 void bloom_matter_format_hex128(const BloomMatter64 *matter, char out_hex129[129]);
 bool bloom_matter_parse_hex128(const char *hex128, BloomMatter64 *out_matter);
 
-/* 6. Thin-Lens Physical Orbit Camera (FLOW v6.0.0 Driven) & 3D Raycaster */
+/* 6. Thin-Lens Physical Orbit Camera (FLOW v7.0.1 Driven) & 3D Raycaster */
 void bloom_camera_init64(BloomCamera64 *cam,
                          int32_t yaw_q16,
                          int32_t pitch_q16,

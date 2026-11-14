@@ -103,13 +103,32 @@ uint32_t bloom_prefab_cull_wave64(const BloomPrefabInst64 *instances,
                                   BloomPrefabInst64 *out_compacted,
                                   uint64_t *out_active_mask);
 
-/* 6. FLOW v6.0.0 Arena Init, @swap Safe Chart Switch & Full Frame Step (with 0-FPS Idle) */
+/* 6. FLOW v7.0.1 Arena Init, @swap Safe Chart Switch, SEARU Heal & Full Frame Step */
+typedef struct {
+    int64_t  db0_q16;
+    int64_t  db1_q16;
+    int64_t  db2_q16;
+    uint64_t weight_cost;
+} BloomBilevelTerm;
+
 void bloom_arena_init_default(BloomEngineArena *arena, uint32_t width_px, uint32_t height_px);
 
 bool bloom_arena_try_swap_chart(BloomEngineArena *arena,
                                 uint32_t flow_slot,
                                 uint32_t target_chart_idx,
                                 uint16_t mode_req);
+
+bool bloom_arena_heal_and_swap(BloomEngineArena *arena,
+                               uint32_t flow_slot,
+                               const BloomBilevelTerm *terms,
+                               uint32_t term_count,
+                               uint64_t kan_bit_pin,
+                               int64_t u_ext_q16,
+                               int64_t target_x_q16,
+                               uint32_t jet_steps,
+                               uint64_t *io_seed,
+                               uint32_t *io_epoch,
+                               uint32_t max_iters);
 
 bool bloom_arena_step_dynamics(BloomEngineArena *arena, uint16_t mode_req);
 

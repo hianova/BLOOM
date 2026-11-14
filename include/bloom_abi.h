@@ -11,7 +11,7 @@ extern "C" {
 
 /*
  * ============================================================================
- * BLOOM v6.0.0 — Unified 64-Byte Cache-Line Wire, Unified-Memory & GPU ABI
+ * BLOOM v7.0.1 — Unified 64-Byte Cache-Line Wire, Unified-Memory & GPU ABI
  * ============================================================================
  * Every runtime, scene, prefab, UI, and .bloom mmap block is strictly 64 bytes
  * (16 x 32-bit words / 8 x 64-bit lanes), aligned to 64 bytes, with 0 padding
@@ -19,7 +19,7 @@ extern "C" {
  *
  * The complete BloomEngineArena occupies 256 x 64B = 16,384 Bytes (exact 16KB
  * hardware VM page), enabling 0-memcpy in-process sharing across Lean 4 JSI,
- * C17 libbloom.a, and FLOW v6.0.0, and deterministic GPU compute execution via
+ * C17 libbloom.a, and FLOW v7.0.1, and deterministic GPU compute execution via
  * single-source WGSL + SDL3 GPU (Metal MSL 2.4 & Vulkan SPIR-V).
  * ============================================================================
  */
@@ -44,8 +44,8 @@ extern "C" {
 #error "BLOOM requires ISO C11+ or ISO C++11+ for 64-byte ABI static_assert/alignof"
 #endif
 
-#define BLOOM_MAGIC_U32       0x424C4D36U /* "BLM6" */
-#define BLOOM_VERSION_U32     0x00060000U /* v6.0.0 */
+#define BLOOM_MAGIC_U32       0x424C4D37U /* "BLM7" */
+#define BLOOM_VERSION_U32     0x00070001U /* v7.0.1 */
 #define BLOOM_Q16_SHIFT       16
 #define BLOOM_Q16_ONE         65536
 #define BLOOM_MAX_Q16         0x7FFFFFFF
@@ -108,8 +108,9 @@ extern "C" {
 
 #define BLOOM_SLOT_RAYCAST_HIT    248U
 #define BLOOM_SLOT_IMAGE_HDR      249U
+#define BLOOM_SLOT_UI_LABEL_BASE  250U /* 4 slots: 250..253 (16 x 16B inline UI labels) */
 
-/* Dedicated FLOW v6.0.0 State Channel Assignments within [0..31] */
+/* Dedicated FLOW v7.0.1 State Channel Assignments within [0..31] */
 #define BLOOM_FLOW_CH_CAM_YAW     0U
 #define BLOOM_FLOW_CH_CAM_PITCH   1U
 #define BLOOM_FLOW_CH_CAM_DIST    2U
@@ -119,7 +120,7 @@ extern "C" {
 #define BLOOM_FLOW_CH_SCROLL      21U
 #define BLOOM_FLOW_CH_PREFAB0     22U /* 22..31: Prefab / App Dynamical States */
 
-/* Dedicated FLOW v6.0.0 Chart Indices within [0..15] */
+/* Dedicated FLOW v7.0.1 Chart Indices within [0..15] */
 #define BLOOM_CHART_UI_SPRING     0U
 #define BLOOM_CHART_UI_SCRUB      1U
 #define BLOOM_CHART_CAMERA_RIG    2U
@@ -132,6 +133,7 @@ extern "C" {
 #define BLOOM_FLAG_XRAY_ENABLED    (1U << 1)
 #define BLOOM_FLAG_TRC_SAFE        (1U << 2)
 #define BLOOM_FLAG_COLORBLIND_GEOM (1U << 3)
+#define BLOOM_FLAG_STUDIO_GI       (1U << 4)
 
 /* 0. Frame & Scene Header (Slot 0, 64B) */
 typedef struct BLOOM_ALIGN64 {
@@ -514,7 +516,7 @@ BLOOM_STATIC_ASSERT64(BloomRaycastHit64);
 
 /* 21. Unified .bloom Memory-Mapped Container Superblock (Slot 249, 64B) */
 #define BLOOM_IMAGE_MAGIC_LO 0x4D4F4C42U /* "BLOM" */
-#define BLOOM_IMAGE_MAGIC_HI 0x36474D49U /* "IMG6" */
+#define BLOOM_IMAGE_MAGIC_HI 0x37474D49U /* "IMG7" */
 
 typedef struct BLOOM_ALIGN64 {
     uint32_t magic_lo32;
@@ -591,7 +593,8 @@ typedef struct BLOOM_ALIGN64 {
     uint64_t             flow_charts[BLOOM_MAX_FLOW_CHARTS][8]; /* Slots 232..247*/
     BloomRaycastHit64    ray_hit;                               /* Slot 248      */
     BloomImageHeader64   img_hdr;                               /* Slot 249      */
-    BloomCell64          reserved_tail[6];                      /* Slots 250..255*/
+    char                 ui_labels[BLOOM_MAX_UI_NODES][16];     /* Slots 250..253*/
+    BloomCell64          reserved_tail[2];                      /* Slots 254..255*/
 } BloomEngineArenaMap;
 
 /* Complete 16,384-Byte (256 x 64B) Unified Memory Engine Arena */
@@ -615,6 +618,8 @@ BLOOM_STATIC_ASSERT(offsetof(BloomEngineArenaMap, ui_nodes) == (size_t)BLOOM_SLO
                     "Arena map.ui_nodes must align to Slot 152");
 BLOOM_STATIC_ASSERT(offsetof(BloomEngineArenaMap, img_hdr) == (size_t)BLOOM_SLOT_IMAGE_HDR * 64ULL,
                     "Arena map.img_hdr must align to Slot 249");
+BLOOM_STATIC_ASSERT(offsetof(BloomEngineArenaMap, ui_labels) == (size_t)BLOOM_SLOT_UI_LABEL_BASE * 64ULL,
+                    "Arena map.ui_labels must align to Slot 250");
 
 /* Portable 32-Bit Pair Wave64 Bitmask Helpers */
 static inline bool bloom_wave64_test_u32x2(uint32_t lo32, uint32_t hi32, uint32_t bit_idx) {

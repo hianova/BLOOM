@@ -517,6 +517,12 @@ static int32_t bloom_norm_coord_q16(double pos, double extent) {
     return (int32_t)(n * 65536.0);
 }
 
+static void bloom_host_stamp_mac(void *block64, uint64_t seed, uint32_t *out_lo, uint32_t *out_hi) {
+    uint64_t mac = bloom_hash56_fnv1a(block64, seed);
+    *out_lo = (uint32_t)(mac & 0xFFFFFFFFULL);
+    *out_hi = (uint32_t)(mac >> 32ULL);
+}
+
 int bloom_gpu_run_window(BloomGpuCtx *ctx,
                          BloomEngineArena *arena,
                          void (*step_cb)(void *),
@@ -526,7 +532,7 @@ int bloom_gpu_run_window(BloomGpuCtx *ctx,
     }
 
     SDL_Window *win = SDL_CreateWindow(
-        "BLOOM v6.0.0 Studio",
+        "BLOOM v7.0.1 Studio",
         (int)ctx->width,
         (int)ctx->height,
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
@@ -544,6 +550,7 @@ int bloom_gpu_run_window(BloomGpuCtx *ctx,
     (void)SDL_StartTextInput(win);
 
     BloomFrameHeader64 *hdr = &arena->cells[BLOOM_SLOT_HEADER].frame_hdr;
+    BloomDomState64 *dom = &arena->cells[BLOOM_SLOT_DOM].dom;
     BloomWindow64 *wcell = &arena->cells[BLOOM_SLOT_WINDOW].window;
     BloomTextInput64 *tinput = &arena->cells[BLOOM_SLOT_TEXT_INPUT].text_input;
     BloomIme64 *ime = &arena->cells[BLOOM_SLOT_IME].ime;
@@ -580,6 +587,10 @@ int bloom_gpu_run_window(BloomGpuCtx *ctx,
         wcell->key_code = 0U;
 
         (void)SDL_GetWindowSize(win, &lw, &lh);
+        if (lw > 0 && lh > 0) {
+            wcell->logical_w_px = (uint32_t)lw;
+            wcell->logical_h_px = (uint32_t)lh;
+        }
         double vw = (lw > 1) ? (double)lw : (double)ctx->width;
         double vh = (lh > 1) ? (double)lh : (double)ctx->height;
 
@@ -608,6 +619,9 @@ int bloom_gpu_run_window(BloomGpuCtx *ctx,
                     prev_px = nx;
                     prev_py = ny;
                     has_prev = true;
+                }
+                if (nx != prev_px || ny != prev_py) {
+                    hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
                 }
                 wcell->drag_dx_q16 += (nx - prev_px);
                 wcell->drag_dy_q16 += (ny - prev_py);
@@ -641,25 +655,47 @@ int bloom_gpu_run_window(BloomGpuCtx *ctx,
                 wcell->scroll_dy_q16 = (int32_t)(wy * 1024.0);
                 hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
             } else if (ev.type == SDL_EVENT_KEY_DOWN) {
-                wcell->key_code = (uint32_t)ev.key.key;
                 if (ev.key.key == SDLK_ESCAPE) {
-                    running = false;
+                    if (tinput->focused != 0U) {
+                        tinput->focused = 0U;
+                        bloom_host_stamp_mac(tinput, 0x7EC70064ULL, &tinput->hash_lo32, &tinput->hash_hi32);
+                        dom->focused_input_id = 0U;
+                        bloom_host_stamp_mac(dom, 0xD0A00064ULL, &dom->mac_lo32, &dom->mac_hi32);
+                        (void)bloom_ime_set_preedit64(ime, "", 0U);
+                        wcell->key_code = 27U;
+                        hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+                    } else {
+                        running = false;
+                    }
                 } else if (ev.key.key == SDLK_BACKSPACE) {
-                    (void)bloom_text_input_backspace64(tinput);
+                    wcell->key_code = 8U;
+                    if (tinput->focused != 0U) {
+                        (void)bloom_text_input_backspace64(tinput);
+                        hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+                    }
+                } else if (ev.key.key == SDLK_RETURN || ev.key.key == SDLK_KP_ENTER) {
+                    wcell->key_code = 13U;
+                    hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+                } else {
+                    wcell->key_code = (uint32_t)ev.key.key;
                     hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
                 }
             } else if (ev.type == SDL_EVENT_TEXT_EDITING) {
-                const char *pre = ev.edit.text ? ev.edit.text : "";
-                (void)bloom_ime_set_preedit64(ime, pre, 0U);
-                hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
-            } else if (ev.type == SDL_EVENT_TEXT_INPUT) {
-                (void)bloom_ime_set_preedit64(ime, "", 0U);
-                if (ev.text.text) {
-                    for (const char *p = ev.text.text; *p != '\0'; ++p) {
-                        (void)bloom_text_input_insert_char64(tinput, *p);
-                    }
+                if (tinput->focused != 0U) {
+                    const char *pre = ev.edit.text ? ev.edit.text : "";
+                    (void)bloom_ime_set_preedit64(ime, pre, 0U);
+                    hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
                 }
-                hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+            } else if (ev.type == SDL_EVENT_TEXT_INPUT) {
+                if (tinput->focused != 0U) {
+                    (void)bloom_ime_set_preedit64(ime, "", 0U);
+                    if (ev.text.text) {
+                        for (const char *p = ev.text.text; *p != '\0'; ++p) {
+                            (void)bloom_text_input_insert_char64(tinput, *p);
+                        }
+                    }
+                    hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+                }
             }
         }
 

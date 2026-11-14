@@ -1,7 +1,7 @@
 #include "bloom_ui.h"
 #include "bloom_scene.h"
 #include "bloom_prefab.h"
-#include "flow.h"
+#include "searu.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -11,7 +11,7 @@
  * ============================================================================
  * Pillar 2 ("React Native"): Declarative SVG Compiler, Zero-VDOM Flexbox /
  * Auto-Bento Layout, Wave64 Dual-Culling, Pointer Capture, IME & LaTeX SDF
- * Zero FloatOps | Zero Heap Allocations | FLOW v6.0.0 Native Tactile Physics
+ * Zero FloatOps | Zero Heap Allocations | FLOW v7.0.1 + SEARU Native Physics
  * ============================================================================
  */
 
@@ -388,10 +388,46 @@ size_t bloom_svg_compile_file(const char *svg_path,
     if (!svg_path) return 0U;
     FILE *fp = fopen(svg_path, "rb");
     if (!fp) return 0U;
-    char svg_buf[16384];
-    size_t n_read = fread(svg_buf, 1U, sizeof(svg_buf) - 1U, fp);
+    char svg_buf[3328];
+    char chunk[256];
+    size_t n_out = 0U;
+    bool prev_ws = false;
+    uint32_t cstate = 0U; /* 0=norm,1='<',2='<!',3='<!-',4=in_cmt,5=cmt'-',6=cmt'--' */
+    for (;;) {
+        size_t nr = fread(chunk, 1U, sizeof(chunk), fp);
+        for (size_t i = 0U; i < nr && n_out + 4U < sizeof(svg_buf); ++i) {
+            char c = chunk[i];
+            if (cstate == 0U) {
+                if (c == '<') {
+                    cstate = 1U;
+                } else if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                    if (!prev_ws) { svg_buf[n_out++] = ' '; prev_ws = true; }
+                } else {
+                    svg_buf[n_out++] = c;
+                    prev_ws = false;
+                }
+            } else if (cstate == 1U) {
+                if (c == '!') { cstate = 2U; }
+                else { svg_buf[n_out++] = '<'; svg_buf[n_out++] = c; prev_ws = false; cstate = 0U; }
+            } else if (cstate == 2U) {
+                if (c == '-') { cstate = 3U; }
+                else { svg_buf[n_out++] = '<'; svg_buf[n_out++] = '!'; svg_buf[n_out++] = c; prev_ws = false; cstate = 0U; }
+            } else if (cstate == 3U) {
+                if (c == '-') { cstate = 4U; }
+                else { svg_buf[n_out++] = '<'; svg_buf[n_out++] = '!'; svg_buf[n_out++] = '-'; svg_buf[n_out++] = c; prev_ws = false; cstate = 0U; }
+            } else if (cstate == 4U) {
+                if (c == '-') cstate = 5U;
+            } else if (cstate == 5U) {
+                cstate = (c == '-') ? 6U : 4U;
+            } else {
+                if (c == '>') cstate = 0U;
+                else if (c != '-') cstate = 4U;
+            }
+        }
+        if (nr < sizeof(chunk) || n_out + 4U >= sizeof(svg_buf)) break;
+    }
     fclose(fp);
-    svg_buf[n_read] = '\0';
+    svg_buf[n_out] = '\0';
     return bloom_svg_compile_text(svg_buf, out_nodes, max_nodes,
                                   out_glyphs, max_glyphs, out_glyph_count, out_dom);
 }
@@ -672,7 +708,7 @@ int32_t bloom_ui_eval_glass_transmittance_q16(uint32_t fill_rgb24, int32_t bevel
     return ui_clamp32(BLOOM_Q16_ONE - (int32_t)atten, 4096, BLOOM_Q16_ONE);
 }
 
-/* 5. Wave64 Hit-Testing, Pointer Capture Scrubbing Arena & FLOW v6.0.0 Tactile Springs */
+/* 5. Wave64 Hit-Testing, Pointer Capture, Zero-BLR SEARU Solver & FLOW v7.0.1 Tactile Springs */
 uint32_t bloom_ui_step_pointer_arena(BloomEngineArena *arena,
                                      int32_t cursor_x_q16,
                                      int32_t cursor_y_q16,
@@ -763,7 +799,7 @@ uint32_t bloom_ui_step_pointer_arena(BloomEngineArena *arena,
             }
         }
 
-        /* Drive UI Node's 2-Jet tactile spring via FLOW v6.0.0 flow_step_atlas!
+        /* Drive UI Node's 2-Jet tactile spring via FLOW v7.0.1 flow_step_atlas!
            Target equilibrium: normal=65536 (1.0x), hovered=72089 (1.10x), active=60293 (0.92x) */
         int64_t target_scale = BLOOM_Q16_ONE;
         if ((nd->style_and_state & BLOOM_UI_STATE_ACTIVE_BIT) != 0U) {
@@ -783,6 +819,55 @@ uint32_t bloom_ui_step_pointer_arena(BloomEngineArena *arena,
     dom->hovered_node_id = hovered_id;
     ui_stamp_mac(dom, 0xD0A00064ULL, &dom->mac_lo32, &dom->mac_hi32);
     return fired_action;
+}
+
+bool bloom_ui_solve_glass_tracks64(BloomUiNode64 *nodes,
+                                   size_t node_count,
+                                   const uint16_t *conflict_edges,
+                                   uint32_t edge_count,
+                                   uint64_t kan_bit_pin,
+                                   uint64_t seed,
+                                   uint32_t max_iters,
+                                   uint32_t *out_unsat_edges) {
+    if (!nodes || node_count == 0U) {
+        if (out_unsat_edges) *out_unsat_edges = 0U;
+        return false;
+    }
+    size_t n = (node_count > BLOOM_MAX_UI_NODES) ? BLOOM_MAX_UI_NODES : node_count;
+    if (!conflict_edges || edge_count == 0U) {
+        if (out_unsat_edges) *out_unsat_edges = 0U;
+        return true;
+    }
+    uint64_t init_canvas[SEARU_CANVAS_WORDS] = {0ULL, 0ULL, 0ULL, 0ULL};
+    for (size_t i = 0U; i < n; ++i) {
+        uint64_t g = (uint64_t)(nodes[i].style_and_state & 0x3U);
+        init_canvas[0] |= (g << (uint32_t)(2U * i));
+    }
+    const uint64_t pin_mask[SEARU_CANVAS_WORDS] = {kan_bit_pin, 0ULL, 0ULL, 0ULL};
+    searu_result res;
+    SEARU_SOLVE_INLINE(&res, (uint32_t)(n * 2U), init_canvas, pin_mask, seed, max_iters,
+                       cand, frust, energy, {
+        for (uint32_t e = 0U; e < edge_count; ++e) {
+            uint32_t u = (uint32_t)((conflict_edges[e] >> 8U) & 0xFU);
+            uint32_t v = (uint32_t)(conflict_edges[e] & 0xFU);
+            if (u < (uint32_t)n && v < (uint32_t)n && u != v) {
+                uint64_t cu = (cand[0] >> (2U * u)) & UINT64_C(3);
+                uint64_t cv = (cand[0] >> (2U * v)) & UINT64_C(3);
+                if (cu == cv) {
+                    ++energy;
+                    frust[0] |= (UINT64_C(3) << (2U * u)) | (UINT64_C(3) << (2U * v));
+                }
+            }
+        }
+    });
+    for (size_t i = 0U; i < n; ++i) {
+        uint32_t solved_g = (uint32_t)((res.canvas[0] >> (uint32_t)(2U * i)) & UINT64_C(3));
+        nodes[i].style_and_state = (nodes[i].style_and_state & ~0xFU) | solved_g;
+    }
+    if (out_unsat_edges) {
+        *out_unsat_edges = (res.best_energy > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)res.best_energy;
+    }
+    return res.best_energy == UINT64_C(0);
 }
 
 /* 6. Single-Pass 256-Byte ASCII Jump-Table DFA -> Zero-Font-Atlas Analytic SDF LaTeX Compiler */

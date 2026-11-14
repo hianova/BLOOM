@@ -6,14 +6,15 @@ Proves static `-mgeneral-regs-only` FPU/SIMD purity and dynamic observational
 completeness across `build/bloom_scene.o`, `build/bloom_ui.o`, and
 `build/bloom_prefab.o` with ZERO SDL3 / GPU startup overhead (~5ms/mutant):
 
-  - Suite A (9 Static Purity Mutants): Injects forbidden A64 FPU/SIMD/NEON
+  - Suite A (12 Static ISA Purity Mutants): Injects forbidden A64 FPU/SIMD/NEON
     opcodes (`fadd`, `fsub`, `fmul`, `scvtf`, `fcvtzs`, `fmov`, `umov`, `ins`,
-    `dup`) across all 3 core Mach-O objects and verifies the `otool -tv`
-    zero-float/zero-SIMD static gate catches 100% of them.
-  - Suite B (81 Stratified Pure-GPR Datapath & Predicate Mutants): Mutates
+    `dup`) and ROP-gadget `blr` indirect calls across all 3 core Mach-O objects
+    and verifies the `otool -tv` zero-float / zero-SIMD / zero-BLR gate catches
+    100% of them.
+  - Suite B (88 Stratified Pure-GPR Datapath & Predicate Mutants): Mutates
     A64 machine instructions (`CSEL/CSINC/CSINV/CSNEG` condition flips,
     `MADD<->MSUB` / `SMULH<->UMULH` multiplier flips, `ADD<->SUB` arithmetic
-    flips, and `CBZ<->CBNZ` branch flips) across 30 core functions
+    flips, and `CBZ<->CBNZ` branch flips) across 32 core functions
     (`bloom_glb_*`, `bloom_bvh_*`, `bloom_csg_*`, `bloom_smin_*`,
     `bloom_joint_dq64_*`, `bloom_skeleton_*`, `bloom_sdf_brick64_*`,
     `bloom_matter_*`, `bloom_scene_raycast64`, `bloom_text_input_*`,
@@ -37,7 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 FPU_MNEMONIC_RE = re.compile(
-    r"^(fadd|fsub|fmul|fdiv|fsqrt|fmadd|fmsub|fcmp|fccmp|fcsel|scvtf|ucvtf|fcvtzs|fcvtzu|fmov|umov|smov|ins|dup|mov\.[bhsdq])$"
+    r"^(fadd|fsub|fmul|fdiv|fsqrt|fmadd|fmsub|fcmp|fccmp|fcsel|scvtf|ucvtf|fcvtzs|fcvtzu|fmov|umov|smov|ins|dup|mov\.[bhsdq]|blr)$"
 )
 
 PROBE_C_SOURCE = r"""
@@ -48,6 +49,7 @@ PROBE_C_SOURCE = r"""
 #include <string.h>
 
 #include "bloom.h"
+#include "searu.h"
 
 static uint64_t g_acc = UINT64_C(0xCBF29CE484222325);
 
@@ -531,6 +533,20 @@ static int run_probe(uint64_t *out_digest) {
         CHECK(act1 == BLOOM_ACTION_SCRUB_XRAY && act2 == BLOOM_ACTION_SCRUB_XRAY);
         mix_u64((uint64_t)(uint32_t)arena.map.frame_hdr.xray_plane_q16);
         mix_bytes(arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0], 2U * sizeof(arena.map.flow_states[0]));
+        {
+            uint64_t saved_ch[8];
+            uint32_t ch_slot = (uint32_t)((arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0][5] >> 16U) & BLOOM_FLOW_CHART_MASK);
+            memcpy(saved_ch, arena.map.flow_charts[ch_slot], sizeof(saved_ch));
+            arena.map.flow_charts[ch_slot][0] = (uint64_t)(int64_t)-0x7FFFFFFFLL;
+            arena.map.flow_charts[ch_slot][1] = (uint64_t)0x7FFFFFFFLL;
+            arena.map.flow_charts[ch_slot][2] = (uint64_t)0x7FFFFFFFLL;
+            arena.map.flow_charts[ch_slot][4] = (0x7FFFFFFFULL << 32U) | 0x00010000ULL;
+            arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0][3] = (uint64_t)(int64_t)-0x5D3A9B71LL;
+            (void)bloom_ui_step_pointer_arena(&arena, 0, 0, 0, false, false);
+            mix_bytes(arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0], sizeof(arena.map.flow_states[0]));
+            memcpy(arena.map.flow_charts[ch_slot], saved_ch, sizeof(saved_ch));
+            arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0][3] = (uint64_t)BLOOM_Q16_ONE;
+        }
         (void)bloom_ui_step_pointer_arena(&arena, 0, 0, 0, false, false);
 
         uint32_t fslot = arena.map.instances[0].flow_slot;
@@ -575,6 +591,129 @@ static int run_probe(uint64_t *out_digest) {
         mix_bytes(&arena.map.img_hdr, sizeof(BloomImageHeader64));
         arena.cells[12].bytes[7] ^= 0x01U;
         CHECK(!bloom_image_verify_arena(&arena));
+
+        /* --- FLOW v7.0.1 SEARU Symbiotic Co-Solver & Zero-BLR Inline Solver --- */
+        {
+            BloomUiNode64 gnodes[16];
+            memset(gnodes, 0, sizeof(gnodes));
+            uint32_t unsat = 77U;
+            CHECK(!bloom_ui_solve_glass_tracks64(NULL, 8U, NULL, 0U, 0ULL, 1ULL, 64U, &unsat) && unsat == 0U);
+            CHECK(!bloom_ui_solve_glass_tracks64(gnodes, 0U, NULL, 0U, 0ULL, 1ULL, 64U, &unsat) && unsat == 0U);
+            CHECK(bloom_ui_solve_glass_tracks64(gnodes, 8U, NULL, 0U, 0ULL, 1ULL, 64U, &unsat) && unsat == 0U);
+
+            for (size_t i = 0U; i < 8U; ++i) {
+                gnodes[i].style_and_state = BLOOM_UI_STATE_GLASS_BIT | BLOOM_GLASS_IRIDESCENT;
+            }
+            const uint16_t ui_edges[15] = {
+                SEARU_EDGE_U16(0, 1), SEARU_EDGE_U16(0, 2), SEARU_EDGE_U16(0, 3),
+                SEARU_EDGE_U16(1, 2), SEARU_EDGE_U16(2, 3), SEARU_EDGE_U16(3, 4),
+                SEARU_EDGE_U16(4, 5), SEARU_EDGE_U16(5, 6), SEARU_EDGE_U16(6, 7),
+                SEARU_EDGE_U16(7, 1), SEARU_EDGE_U16(1, 4), SEARU_EDGE_U16(2, 5),
+                SEARU_EDGE_U16(3, 6), SEARU_EDGE_U16(2, 2), SEARU_EDGE_U16(14, 15)
+            };
+            CHECK(bloom_ui_solve_glass_tracks64(gnodes, 8U, ui_edges, 15U, UINT64_C(0x3),
+                                                UINT64_C(0x7000CAFE2026), 1024U, &unsat));
+            CHECK(unsat == 0U && (gnodes[0].style_and_state & 0x3U) == BLOOM_GLASS_IRIDESCENT);
+            for (size_t i = 0U; i < 8U; ++i) {
+                mix_u64(gnodes[i].style_and_state);
+            }
+            /* Uncolorable K_5 clique with 4 glass modes -> unsat >= 1, returns false */
+            const uint16_t k5_edges[10] = {
+                SEARU_EDGE_U16(0, 1), SEARU_EDGE_U16(0, 2), SEARU_EDGE_U16(0, 3), SEARU_EDGE_U16(0, 4),
+                SEARU_EDGE_U16(1, 2), SEARU_EDGE_U16(1, 3), SEARU_EDGE_U16(1, 4),
+                SEARU_EDGE_U16(2, 3), SEARU_EDGE_U16(2, 4), SEARU_EDGE_U16(3, 4)
+            };
+            CHECK(!bloom_ui_solve_glass_tracks64(gnodes, 20U, k5_edges, 10U, UINT64_C(0xF),
+                                                 UINT64_C(0x12345678), 32U, &unsat) && unsat >= 1U);
+            mix_u64(unsat);
+            /* Odd node_count = 5U exercises scalar remainder tail of vectorized write-back (+ sentinel guard on 5..15) */
+            for (size_t i = 5U; i < 16U; ++i) {
+                gnodes[i].style_and_state = 0x77777777U;
+            }
+            CHECK(!bloom_ui_solve_glass_tracks64(gnodes, 5U, k5_edges, 10U, UINT64_C(0x3),
+                                                 UINT64_C(0x9ABCDEF0), 32U, &unsat) && unsat >= 1U);
+            for (size_t i = 0U; i < 16U; ++i) {
+                mix_u64(gnodes[i].style_and_state);
+            }
+
+            const BloomBilevelTerm terms[4] = {
+                { -20LL * FLOW_Q16_ONE, 0LL,          0LL, UINT64_C(50000) },
+                { -6LL * FLOW_Q16_ONE,  FLOW_Q16_ONE, 0LL, UINT64_C(0)     },
+                { -6LL * FLOW_Q16_ONE,  0LL,          0LL, UINT64_C(0)     },
+                { +8LL * FLOW_Q16_ONE,  0LL,          0LL, UINT64_C(8000)  }
+            };
+            uint64_t hseed = UINT64_C(0x5EA40700BEEF);
+            uint32_t hepoch = 12U;
+            CHECK(!bloom_arena_heal_and_swap(NULL, 0U, terms, 4U, 0ULL, 0LL, 0LL, 6U, &hseed, &hepoch, 128U));
+            CHECK(!bloom_arena_heal_and_swap(&arena, 99U, terms, 4U, 0ULL, 0LL, 0LL, 6U, &hseed, &hepoch, 128U));
+            CHECK(!bloom_arena_heal_and_swap(&arena, BLOOM_FLOW_CH_SCROLL, NULL, 4U, 0ULL, 0LL, 0LL, 6U, &hseed, &hepoch, 128U));
+            CHECK(!bloom_arena_heal_and_swap(&arena, BLOOM_FLOW_CH_SCROLL, terms, 0U, 0ULL, 0LL, 0LL, 6U, &hseed, &hepoch, 128U));
+            /* Converged channel -> false */
+            CHECK(!bloom_arena_heal_and_swap(&arena, BLOOM_FLOW_CH_SCROLL, terms, 4U, UINT64_C(0x1),
+                                             0LL, 0LL, 6U, &hseed, &hepoch, 256U));
+
+            uint64_t bchart[8] = {
+                (uint64_t)(12LL * FLOW_Q16_ONE),
+                0ULL,
+                (uint64_t)(2LL * FLOW_Q16_ONE),
+                ((uint64_t)(uint32_t)(-FLOW_MAX_Q16) << 32U) | (uint64_t)(uint32_t)FLOW_MAX_Q16,
+                ((uint64_t)(uint32_t)(16 * FLOW_Q16_ONE) << 32U) | (uint64_t)(uint32_t)FLOW_Q16_ONE,
+                (6ULL << 24U) | (6ULL << 16U),
+                1ULL << 32U,
+                0ULL
+            };
+            flow_arena_publish_bound((flow_cell *)arena.map.flow_charts, 6U, BLOOM_FLOW_CHART_MASK, 2U, bchart);
+            CHECK(bloom_arena_try_swap_chart(&arena, BLOOM_FLOW_CH_SCROLL, 6U, 0U));
+            uint64_t *sst = arena.map.flow_states[BLOOM_FLOW_CH_SCROLL];
+            sst[3] = (uint64_t)(3LL * FLOW_Q16_ONE);
+            flow_step_atlas(sst, sst, (const flow_cell *)arena.map.flow_charts, BLOOM_FLOW_CHART_MASK, 0LL, 0U);
+            /* Moving (dt != 0) -> false */
+            CHECK(!bloom_arena_heal_and_swap(&arena, BLOOM_FLOW_CH_SCROLL, terms, 4U, UINT64_C(0x1),
+                                             0LL, 0LL, 6U, &hseed, &hepoch, 256U));
+            for (int q = 0; q < 8; ++q) {
+                flow_step_atlas(sst, sst, (const flow_cell *)arena.map.flow_charts, BLOOM_FLOW_CHART_MASK, 0LL, 0U);
+            }
+            /* Trapped at barrier (!CONVERGED && dt == 0): first test >64 clamp (UBSan bounds guard), then 4-var heal */
+            BloomBilevelTerm terms70[70];
+            memset(terms70, 0, sizeof(terms70));
+            CHECK(!bloom_arena_heal_and_swap(&arena, BLOOM_FLOW_CH_SCROLL, terms70, 70U, UINT64_C(0x1),
+                                             0LL, 0LL, 4U, &hseed, &hepoch, 8U));
+            CHECK(bloom_arena_heal_and_swap(&arena, BLOOM_FLOW_CH_SCROLL, terms, 4U, UINT64_C(0x1),
+                                            0LL, 0LL, 8U, &hseed, &hepoch, 512U));
+            CHECK(hepoch == 13U && (int64_t)arena.map.flow_charts[6][0] == 0LL);
+            mix_bytes(arena.map.flow_charts[6], sizeof(arena.map.flow_charts[6]));
+            mix_u64(hseed ^ (uint64_t)hepoch);
+
+            /* Deep cooling + coupled 2-XOR Black-Swan Epiphany reheat trajectory (iters > 1200 -> temp_q12 < init_temp/4) */
+            BloomBilevelTerm deep_terms[64];
+            for (uint32_t ti = 0U; ti < 64U; ++ti) {
+                if (ti == 0U) {
+                    deep_terms[ti] = (BloomBilevelTerm){ 0LL, 0LL, 0LL, UINT64_C(0) };
+                } else if (ti == 1U) {
+                    deep_terms[ti] = (BloomBilevelTerm){ -14LL * FLOW_Q16_ONE, 0LL, 0LL, UINT64_C(40000) };
+                } else if ((ti & 1U) == 0U) {
+                    deep_terms[ti] = (BloomBilevelTerm){ +30LL * FLOW_Q16_ONE, (int64_t)(ti * 16U), 0LL, UINT64_C(100) + ti * 7U };
+                } else {
+                    deep_terms[ti] = (BloomBilevelTerm){ -30LL * FLOW_Q16_ONE, -(int64_t)((ti - 1U) * 16U), 0LL, UINT64_C(100) + ti * 7U };
+                }
+            }
+            for (uint32_t k = 1U; k < 16U; ++k) {
+                deep_terms[2U * k].db0_q16 = +20LL * FLOW_Q16_ONE;
+                deep_terms[2U * k + 1U].db0_q16 = -34LL * FLOW_Q16_ONE;
+                deep_terms[2U * k].weight_cost = UINT64_C(200) + k * 50U;
+                deep_terms[2U * k + 1U].weight_cost = UINT64_C(200) + k * 50U;
+            }
+            flow_arena_publish_bound((flow_cell *)arena.map.flow_charts, 6U, BLOOM_FLOW_CHART_MASK, 20U, bchart);
+            sst[3] = (uint64_t)(2LL * FLOW_Q16_ONE);
+            sst[4] = 0ULL;
+            sst[6] = 0ULL;
+            uint64_t dseed = UINT64_C(0x1000000000000001) + UINT64_C(5) * UINT64_C(0x9E3779B97F4A7C15);
+            uint32_t depoch = 30U;
+            CHECK(bloom_arena_heal_and_swap(&arena, BLOOM_FLOW_CH_SCROLL, deep_terms, 64U, UINT64_C(0x1),
+                                            0LL, 12345LL, 1U, &dseed, &depoch, 2600U));
+            mix_bytes(arena.map.flow_charts[6], sizeof(arena.map.flow_charts[6]));
+            mix_u64(dseed ^ (uint64_t)depoch);
+        }
     }
 
     *out_digest = g_acc;
@@ -759,25 +898,28 @@ def build_mutants(
 ) -> list[Mutant]:
     mutants: list[Mutant] = []
 
-    # --- Suite A: Static FPU/SIMD Opcode Purity Injections across all 3 core objects (9 Mutants) ---
+    # --- Suite A: Static FPU/SIMD & Indirect-BLR ISA Purity Injections (12 Mutants) ---
     fpu_injections = [
         ("scene", "_bloom_csg_eval_single_q16", "STATIC_FADD_S0", 0x1E202800),
         ("scene", "_bloom_bvh_eval_csg_q16", "STATIC_FMUL_D0", 0x1E600800),
         ("scene", "_bloom_joint_dq64_blend", "STATIC_SCVTF_D0", 0x9E620000),
+        ("scene", "_bloom_scene_raycast64", "STATIC_BLR_X8_SCENE", 0xD63F0100),
         ("ui", "_bloom_flex_apply64", "STATIC_FSUB_S0", 0x1E203800),
         ("ui", "_bloom_text_input_insert_char64", "STATIC_FMOV_D0_X0", 0x9E670000),
         ("ui", "_bloom_latex_compile_boxes64", "STATIC_FCVTZS_X0", 0x9E780000),
+        ("ui", "_bloom_ui_solve_glass_tracks64", "STATIC_BLR_X8_UI", 0xD63F0100),
         ("prefab", "_bloom_prefab_eval_sdf_q16", "STATIC_UMOV_W0", 0x0E043C00),
         ("prefab", "_bloom_prefab_cull_wave64", "STATIC_INS_V0", 0x4E081C00),
         ("prefab", "_bloom_arena_step_dynamics", "STATIC_DUP_V0", 0x4E080C00),
+        ("prefab", "_bloom_arena_heal_and_swap", "STATIC_BLR_X8_PREFAB", 0xD63F0100),
     ]
     for obj_key, fname, mname, bad_op in fpu_injections:
         _, _, insns, funcs = parsed_objs[obj_key]
         lo, hi = funcs[fname]
         anchor = (lo + hi) // 2
-        mutants.append(Mutant(mname, "static_fpu_purity", obj_key, fname, anchor, insns[anchor], bad_op))
+        mutants.append(Mutant(mname, "static_isa_purity", obj_key, fname, anchor, insns[anchor], bad_op))
 
-    # --- Suite B: Stratified Pure-GPR Datapath & Predicate Mutants across 29 core functions ---
+    # --- Suite B: Stratified Pure-GPR Datapath & Predicate Mutants across 32 core functions ---
     target_plan: list[tuple[str, str, int]] = [
         ("scene", "_bloom_smin_q16", 2),
         ("scene", "_bloom_glb_parse_to_csg64", 4),
@@ -798,6 +940,7 @@ def build_mutants(
         ("ui", "_bloom_flex_apply64", 3),
         ("ui", "_bloom_ui_synthesize_bento64", 3),
         ("ui", "_bloom_ui_step_pointer_arena", 3),
+        ("ui", "_bloom_ui_solve_glass_tracks64", 3),
         ("ui", "_bloom_latex_compile_boxes64", 3),
         ("ui", "_bloom_latex_eval_box_sdf_q16", 2),
         ("ui", "_bloom_text_input_insert_char64", 3),
@@ -807,6 +950,7 @@ def build_mutants(
         ("prefab", "_bloom_prefab_eval_sdf_q16", 3),
         ("prefab", "_bloom_style_resolve_thermal", 2),
         ("prefab", "_bloom_prefab_cull_wave64", 2),
+        ("prefab", "_bloom_arena_heal_and_swap", 4),
         ("prefab", "_bloom_arena_step_dynamics", 3),
         ("prefab", "_bloom_image_verify_arena", 2),
     ]
@@ -978,7 +1122,7 @@ def main() -> int:
 
         mutants = build_mutants(parsed_objs)
         print("================================================================================")
-        print("  BLOOM v6.0.0 — Mach-O ARM64 Binary Sabotage & Purity Audit (Zero-SDL3 Probe)")
+        print("  BLOOM v7.0.1 — Mach-O ARM64 Binary Sabotage & Purity Audit (Zero-SDL3 Probe)")
         print("================================================================================")
         print(f"  golden_baseline_status : PASS (exit 0, digest=0x{golden_digest}, {total_insns} A64 insns)")
         print(f"  adversarial_mutants    : {len(mutants)} Mach-O mutants across scene/ui/prefab")

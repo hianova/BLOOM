@@ -22,6 +22,7 @@ extern "C" {
 #define BLOOM_UI_PRIM_SLIDER_BAR   4U
 #define BLOOM_UI_PRIM_LATEX_PANEL  5U
 #define BLOOM_UI_PRIM_READOUT_7SEG 6U
+#define BLOOM_UI_PRIM_TEXT_INPUT   7U
 
 /* Responsive Screen Anchors */
 #define BLOOM_UI_ANCHOR_CENTER        0U
@@ -146,13 +147,22 @@ void bloom_ui_bind_reg_bank64(BloomUiNode64 *nodes,
 
 int32_t bloom_ui_eval_glass_transmittance_q16(uint32_t fill_rgb24, int32_t bevel_q16);
 
-/* 5. Wave64 Hit-Testing, Pointer Capture Scrubbing Arena & FLOW v6.0.0 Tactile Springs */
+/* 5. Wave64 Hit-Testing, Pointer Capture, Zero-BLR SEARU Solver & FLOW v7.0.1 Tactile Springs */
 uint32_t bloom_ui_step_pointer_arena(BloomEngineArena *arena,
                                      int32_t cursor_x_q16,
                                      int32_t cursor_y_q16,
                                      int32_t drag_dx_q16,
                                      bool mouse_down,
                                      bool mouse_just_clicked);
+
+bool bloom_ui_solve_glass_tracks64(BloomUiNode64 *nodes,
+                                   size_t node_count,
+                                   const uint16_t *conflict_edges,
+                                   uint32_t edge_count,
+                                   uint64_t kan_bit_pin,
+                                   uint64_t seed,
+                                   uint32_t max_iters,
+                                   uint32_t *out_unsat_edges);
 
 /* 6. Single-Pass 256B Jump-Table DFA -> Zero-Font-Atlas Analytic SDF LaTeX Compiler */
 size_t bloom_latex_compile_boxes64(const char *latex_src,
