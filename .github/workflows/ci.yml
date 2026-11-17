@@ -12,18 +12,18 @@ on:
 
 jobs:
   build-and-verify-bloom:
-    name: BLOOM v7.0.1 Compile-Time Boundary Gate (${{ matrix.os }})
+    name: BLOOM v9.0.0 Compile-Time Boundary Gate (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ ubuntu-latest, macos-latest ]
     steps:
-      - name: Checkout FLOW (v7.0.1)
+      - name: Checkout FLOW (main)
         uses: actions/checkout@v4
         with:
           repository: hianova/FLOW
-          ref: v7.0.1
+          ref: main
           path: FLOW
 
       - name: Checkout BLOOM
@@ -52,7 +52,7 @@ jobs:
             -DSDL_TESTS=OFF
           sudo cmake --build /tmp/sdl3/build --target install
           sudo ldconfig
-          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain leanprover/lean4:v4.35.0
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain leanprover/lean4:v4.36.0
 
       - name: Install W3C WebGPU Naga Compiler (Linux)
         if: runner.os == 'Linux'
@@ -64,7 +64,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install llvm naga-cli sdl3 pkg-config
-          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain leanprover/lean4:v4.35.0
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain leanprover/lean4:v4.36.0
 
       - name: Build FLOW & Compile BLOOM (Single-Track WGSL + SDL3 GPU Gate)
         run: |

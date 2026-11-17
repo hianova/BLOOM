@@ -1,275 +1,319 @@
 /-
-  BLOOM v7.0.1 — 64-Byte Three.js + React Native + Prefab SSOT Engine
-  ===================================================================
-  AOT Formal Verification Kernel (`22` Theorems, `0 sorryAx`) + Declarative
-  React-Native Nested Flexbox Compiler (`UiElement` -> `16,384B` `.bloom` Arena).
-  Compiles and seals `build/studio.bloom` (`256 × 64B` VM page) consumed directly
-  by the standalone zero-Lean-runtime pure C17 native runner (`build/bloom`) over
-  `libbloom.a`, `FLOW v7.0.1` (`flow.h` + `searu.h` + `flow_opt_params.h`), and
-  `shaders/bloom_core.wgsl` (`SDL3 GPU`).
+  BLOOM v9.0.0 — Pure Config, Flexbox DSL & AOT Arena Image Compiler (`import Flow`)
+  ================================================================================
+  SSOT compliance: all formal machine-word, interval, convexity, SEARU, 2-Jet,
+  and full-512b C17+WGSL Schema compilers reside in domain-free `../FLOW/Flow/*.lean`.
+  This file configures the 256-slot `16,384B` `bloomArenaSchema`, declares the
+  React-Native `<View>` Flexbox `defaultStudioBlueprint`, executes elaboration-time
+  SDL3 GPU/CPU parity gates (`compileTimeBoundaryGate`), and seals `build/studio.bloom`
+  with ZERO local theorems (`0 theorem`, `0 sorryAx`).
 -/
 
 import Flow
-import Std.Tactic.BVDecide
 
 namespace Bloom
 
-def version       : String := "7.0.1"
-def cellBytes     : Nat    := 64
-def arenaCells    : Nat    := 256
-def arenaBytes    : Nat    := arenaCells * cellBytes
-def trcMaxHzQ16   : Int    := 3 * Flow.q16One
-def crystalFloor  : Int    := 4096
+def version    : String := "9.0.0"
+def cellBytes  : Nat    := 64
+def arenaCells : Nat    := 256
+def arenaBytes : Nat    := arenaCells * cellBytes
 
-/-! ## Part 1: Formal Invariants & Mathematical Proofs (`0 sorryAx`) -/
+/-! ## Part 1: SSOT 256-Slot (`16,384B`) Arena & Full-512b C17/WGSL Schema Config -/
 
-/-- Exact 64-byte cell width and 16,384-byte (16KB VM page) Unified Memory Arena bijection. -/
-theorem arena_page_bijection :
-    cellBytes = 64 ∧ arenaCells = 256 ∧ arenaBytes = 16384 := by
-  decide
+def bloomFrameHeaderLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "frame_hdr" "BloomFrameHeader64" "frame_hdr" [
+    ("magic", .u32, 1), ("version", .u32, 1), ("width_px", .u32, 1), ("height_px", .u32, 1),
+    ("dpi_scale_q16", .i32, 1), ("frame_seq", .u32, 1), ("inst_count", .u32, 1), ("csg_count", .u32, 1),
+    ("bvh_count", .u32, 1), ("ui_count", .u32, 1), ("glyph_count", .u32, 1), ("latex_count", .u32, 1),
+    ("xray_plane_q16", .i32, 1), ("selected_inst_id", .u32, 1), ("flags", .u32, 1), ("cap_mask", .u32, 1)
+  ]
 
-/-- OOB-immune Z/256Z masked slot addressing always stays strictly inside `[0, 255]`. -/
-theorem arena_slot_mask_inbounds (idx : Nat) :
-    idx % 256 < arenaCells := by
-  unfold arenaCells
-  omega
+def bloomCameraLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "camera" "BloomCamera64" "camera" [
+    ("eye_q16", .i32, 3), ("target_q16", .i32, 3), ("up_q16", .i32, 3), ("focal_mm_q16", .i32, 1),
+    ("aperture_fstop_q16", .i32, 1), ("focus_dist_q16", .i32, 1), ("exposure_q16", .i32, 1),
+    ("orbit_yaw_q16", .i32, 1), ("orbit_pitch_q16", .i32, 1), ("orbit_dist_q16", .i32, 1)
+  ]
 
-/-- Polynomial Smooth-Min CSG union (`min a b - corr` with `corr >= 0`) strictly encloses both operands. -/
-def polySminModel (a b corr : Int) : Int :=
-  (if a <= b then a else b) - corr
+def bloomRegBankLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "reg_bank" "BloomRegBank64" "reg_bank" [
+    ("channels_q16", .i32, 12), ("dirty_mask", .u32, 1), ("epoch", .u32, 1),
+    ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-theorem poly_smin_le_operands (a b corr : Int) (hCorr : 0 <= corr) :
-    polySminModel a b corr <= a ∧ polySminModel a b corr <= b := by
-  unfold polySminModel
-  split <;> omega
+def bloomDomStateLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "dom" "BloomDomState64" "dom" [
+    ("compiled_node_count", .u32, 1), ("hovered_node_id", .u32, 1), ("active_node_id", .u32, 1),
+    ("captured_node_id", .u32, 1), ("last_action_opcode", .u32, 1), ("cursor_norm_x_q16", .i32, 1),
+    ("cursor_norm_y_q16", .i32, 1), ("click_dispatch_count", .u32, 1), ("wave64_cull_skips", .u32, 1),
+    ("hot_reload_epoch", .u32, 1), ("focused_input_id", .u32, 1), ("reserved0", .u32, 1),
+    ("dom_mask_lo32", .u32, 1), ("dom_mask_hi32", .u32, 1), ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-/-- Pointer-free Linear BVH parent union AABB strictly encloses both child AABBs. -/
-structure Interval1D where
-  lo : Int
-  hi : Int
-  deriving Repr, DecidableEq
+def bloomFlexLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "flex" "BloomFlexContainer64" "flex" [
+    ("direction", .u16, 1), ("justify_mode", .u16, 1), ("align_items", .u16, 1), ("overflow_mode", .u16, 1),
+    ("origin_x_q16", .i32, 1), ("origin_y_q16", .i32, 1), ("half_w_q16", .i32, 1), ("half_h_q16", .i32, 1),
+    ("padding_q16", .i32, 1), ("gap_q16", .i32, 1), ("scroll_offset_q16", .i32, 1), ("content_extent_q16", .i32, 1),
+    ("max_scroll_q16", .i32, 1), ("child_count", .u32, 1), ("tile_mask_lo32", .u32, 1), ("tile_mask_hi32", .u32, 1),
+    ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-def Interval1D.contains (iv : Interval1D) (x : Int) : Prop :=
-  iv.lo <= x ∧ x <= iv.hi
+def bloomTextInputLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "text_input" "BloomTextInput64" "text_input" [
+    ("utf8_buf", .cchar, 40), ("byte_len", .u8, 1), ("cursor_pos", .u8, 1), ("anchor_pos", .u8, 1),
+    ("focused", .u8, 1), ("bound_node_id", .u32, 1), ("submit_action_id", .u32, 1),
+    ("edit_revision", .u32, 1), ("hash_lo32", .u32, 1), ("hash_hi32", .u32, 1)
+  ]
 
-def Interval1D.union (a b : Interval1D) : Interval1D :=
-  { lo := if a.lo <= b.lo then a.lo else b.lo
-    hi := if a.hi >= b.hi then a.hi else b.hi }
+def bloomImeLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "ime" "BloomIme64" "ime" [
+    ("target_node_id", .u32, 1), ("preedit_len", .u8, 1), ("cursor_offset", .u8, 1),
+    ("candidate_index", .u8, 1), ("ime_active", .u8, 1), ("preedit_utf8", .cchar, 36),
+    ("anchor_x_q16", .i32, 1), ("anchor_y_q16", .i32, 1), ("committed_count", .u32, 1),
+    ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-theorem bvh_parent_encloses_children (left right : Interval1D) (x : Int)
-    (h : left.contains x ∨ right.contains x) :
-    (left.union right).contains x := by
-  unfold Interval1D.contains Interval1D.union at *
-  dsimp
-  rcases h with ⟨hl0, hl1⟩ | ⟨hr0, hr1⟩
-  · constructor <;> split <;> omega
-  · constructor <;> split <;> omega
+def bloomWindowLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "window" "BloomWindow64" "window" [
+    ("backend_api", .u32, 1), ("logical_w_px", .u32, 1), ("logical_h_px", .u32, 1), ("fb_w_px", .u32, 1),
+    ("fb_h_px", .u32, 1), ("dpi_scale_q16", .i32, 1), ("target_fps", .u32, 1), ("host_flags", .u32, 1),
+    ("pointer_x_q16", .i32, 1), ("pointer_y_q16", .i32, 1), ("drag_dx_q16", .i32, 1), ("drag_dy_q16", .i32, 1),
+    ("scroll_dy_q16", .i32, 1), ("key_code", .u32, 1), ("frame_epoch_lo32", .u32, 1), ("frame_epoch_hi32", .u32, 1)
+  ]
 
-/-- Beer-Lambert Liquid Glass transmittance stays strictly inside `[4096, 65536]` (crystal floor & energy conservation). -/
-def clampTransmittance (rawQ16 : Int) : Int :=
-  if rawQ16 < crystalFloor then crystalFloor
-  else if rawQ16 > Flow.q16One then Flow.q16One
-  else rawQ16
+def bloomMatterLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "matter" "BloomMatter64" "matter" [
+    ("matter_id", .u32, 1), ("ior_eta_q16", .i32, 1), ("extinction_kappa_q16", .i32, 1),
+    ("viscosity_quench_q16", .i32, 1), ("surface_relief_q16", .i32, 1), ("micro_roughness_q16", .i32, 1),
+    ("mie_scatter_q16", .i32, 1), ("absorb_rgb_q16", .i32, 3), ("lattice_wire_q16", .i32, 1),
+    ("thickness_mm_q16", .i32, 1), ("thermal_kelvin", .u32, 1), ("density_kg_m3", .u32, 1),
+    ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-theorem beer_lambert_crystal_floor_bounded (rawQ16 : Int) :
-    4096 <= clampTransmittance rawQ16 ∧ clampTransmittance rawQ16 <= 65536 := by
-  unfold clampTransmittance crystalFloor Flow.q16One
-  split
-  · omega
-  · split <;> omega
+def bloomArtStyleLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "style" "BloomArtStyle64" "style" [
+    ("style_id", .u32, 1), ("base_rgb24", .u32, 1), ("accent_rgb24", .u32, 1), ("roughness_q16", .i32, 1),
+    ("metallic_q16", .i32, 1), ("emissive_gain_q16", .i32, 1), ("sdf_noise_freq_q16", .i32, 1),
+    ("sdf_noise_amp_q16", .i32, 1), ("msdf_stroke_q16", .i32, 1), ("strobe_hz_q16", .i32, 1),
+    ("thermal_shift_q16", .i32, 1), ("flags", .u32, 1), ("matter_slot", .u32, 1), ("reserved0", .u32, 1),
+    ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-/-- Harding / Console TRC Photosensitive Guard strictly clamps flash frequency to `<= 3.0 Hz` (`196,608` Q16). -/
-def clampTrcStrobe (hzQ16 : Int) (safeEnabled : Bool) : Int :=
-  let nonNeg := if hzQ16 < 0 then 0 else hzQ16
-  if safeEnabled then
-    if nonNeg > trcMaxHzQ16 then trcMaxHzQ16 else nonNeg
-  else nonNeg
+def bloomPrefabDescLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "prefab" "BloomPrefabDesc64" "prefab" [
+    ("prefab_id", .u32, 1), ("art_style_id", .u32, 1), ("matter_id", .u32, 1), ("csg_op_mask", .u32, 1),
+    ("bounding_radius_q16", .i32, 1), ("prim_params_q16", .i32, 6), ("csg_start_idx", .u32, 1),
+    ("csg_count", .u32, 1), ("flags", .u32, 1), ("hash_lo32", .u32, 1), ("hash_hi32", .u32, 1)
+  ]
 
-theorem trc_strobe_clamp_safe (hzQ16 : Int) :
-    0 <= clampTrcStrobe hzQ16 true ∧ clampTrcStrobe hzQ16 true <= 196608 := by
-  unfold clampTrcStrobe trcMaxHzQ16 Flow.q16One
-  dsimp
-  split <;> split <;> omega
+def bloomPrefabInstLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "inst" "BloomPrefabInst64" "inst" [
+    ("inst_id", .u32, 1), ("prefab_id", .u32, 1), ("style_override_id", .u32, 1), ("matter_override_id", .u32, 1),
+    ("pos_q16", .i32, 3), ("rot_euler_q16", .i32, 3), ("scale_q16", .i32, 1), ("thermal_kelvin", .u32, 1),
+    ("active_layer", .u16, 1), ("flags", .u16, 1), ("flow_slot", .u32, 1), ("param_override_q16", .i32, 1),
+    ("kin_vel_packed", .u32, 1)
+  ]
 
-/-- Golden-Ratio Auto-Bento partition around cut `c` with gap `2 * halfGap` (`halfGap >= 1`) yields strictly disjoint panels inside `[x0, x1]`. -/
-theorem bento_split_disjoint (x0 c x1 halfGap : Int)
-    (hOrder : x0 + halfGap <= c ∧ c + halfGap <= x1) (hGap : 1 <= halfGap) :
-    x0 <= c - halfGap ∧ (c - halfGap) < (c + halfGap) ∧ c + halfGap <= x1 := by
-  omega
+def bloomCsgOpLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "csg_op" "BloomCsgOp64" "csg_op" [
+    ("op_id", .u32, 1), ("prim_type", .u32, 1), ("bool_op", .u32, 1), ("matter_id", .u32, 1),
+    ("pos_q16", .i32, 3), ("extents_q16", .i32, 3), ("smooth_k_q16", .i32, 1), ("bevel_r_q16", .i32, 1),
+    ("stage_mask_lo32", .u32, 1), ("stage_mask_hi32", .u32, 1), ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-/-- Portable `u32x2` (`lo32`, `hi32`) Wave64 bitmask decomposition is a total bijection on `[0, 63]`. -/
-def wave64Decompose (bitIdx : Nat) : Nat × Nat :=
-  (bitIdx / 32, bitIdx % 32)
+def bloomBvhNodeLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "bvh_node" "BloomBvhNode64" "bvh_node" [
+    ("node_id", .u32, 1), ("left_or_first", .u32, 1), ("right_or_count", .u32, 1), ("is_leaf", .u32, 1),
+    ("aabb_min_q16", .i32, 3), ("aabb_max_q16", .i32, 3), ("morton_lo32", .u32, 1), ("morton_hi32", .u32, 1),
+    ("stage_mask_lo32", .u32, 1), ("stage_mask_hi32", .u32, 1), ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-def wave64Reconstruct (pair : Nat × Nat) : Nat :=
-  pair.1 * 32 + pair.2
+def bloomJointDqLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "joint_dq" "BloomJointDq64" "joint_dq" [
+    ("joint_id", .u32, 1), ("parent_id", .u32, 1), ("q_real_q16", .i32, 4), ("q_dual_q16", .i32, 4),
+    ("bone_len_q16", .i32, 1), ("bone_radius_q16", .i32, 1), ("smooth_k_q16", .i32, 1), ("matter_id", .u32, 1),
+    ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-theorem wave64_u32x2_bijection (bitIdx : Nat) (h : bitIdx < 64) :
-    let p := wave64Decompose bitIdx
-    p.1 < 2 ∧ p.2 < 32 ∧ wave64Reconstruct p = bitIdx := by
-  unfold wave64Decompose wave64Reconstruct
-  dsimp
-  omega
+def bloomSdfBrickLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "sdf_brick" "BloomSdfBrick64" "sdf_brick" [
+    ("brick_id", .u32, 1), ("matter_id", .u32, 1), ("origin_q16", .i32, 3), ("voxel_step_q16", .i32, 1),
+    ("sdf_words", .u32, 8), ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-/-- Non-destructive Prefab Instance Override & O(1) Revert-to-SSOT idempotence. -/
-structure PrefabInstModel where
-  prefabId        : Nat
-  styleOverride   : Nat := 0
-  matterOverride  : Nat := 0
-  paramOverride   : Int := 0
-  thermalKelvin   : Nat := 300
-  overridden      : Bool := false
-  deriving Repr, DecidableEq
+def bloomUiNodeLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "ui_node" "BloomUiNode64" "ui_node" [
+    ("node_id", .u32, 1), ("prim_type", .u32, 1), ("anchor_mode", .u32, 1), ("bind_channel", .u32, 1),
+    ("offset_x_q16", .i32, 1), ("offset_y_q16", .i32, 1), ("half_w_q16", .i32, 1), ("half_h_q16", .i32, 1),
+    ("corner_radius_q16", .i32, 1), ("scale_jet_v_q16", .i32, 1), ("scale_jet_d1_q16", .i32, 1),
+    ("bound_value_q16", .i32, 1), ("style_and_state", .u32, 1), ("action_opcode", .u32, 1),
+    ("tile_mask_lo32", .u32, 1), ("tile_mask_hi32", .u32, 1)
+  ]
 
-def applyOverride (inst : PrefabInstModel) (style matter : Nat) (delta : Int) : PrefabInstModel :=
-  { inst with
-    styleOverride  := style
-    matterOverride := matter
-    paramOverride  := delta
-    overridden     := true }
+def bloomGlyphLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "glyph" "BloomGlyph64" "glyph" [
+    ("glyph_id", .u32, 1), ("stroke_count", .u32, 1), ("stroke_width_q16", .i32, 1),
+    ("stroke_rgb24", .u32, 1), ("seg_coords_q8", .i16, 20), ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-def revertToSSOT (inst : PrefabInstModel) : PrefabInstModel :=
-  { inst with
-    styleOverride  := 0
-    matterOverride := 0
-    paramOverride  := 0
-    thermalKelvin  := 300
-    overridden     := false }
+def bloomLatexBoxLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "latex_box" "BloomLatexBox64" "latex_box" [
+    ("box_id", .u32, 1), ("box_kind", .u32, 1), ("codepoint_or_op", .u32, 1), ("tint_rgb24", .u32, 1),
+    ("x_q16", .i32, 1), ("y_q16", .i32, 1), ("half_w_q16", .i32, 1), ("half_h_q16", .i32, 1),
+    ("stroke_q16", .i32, 1), ("baseline_shift_q16", .i32, 1), ("parent_panel_id", .u32, 1), ("flags", .u32, 1),
+    ("tile_mask_lo32", .u32, 1), ("tile_mask_hi32", .u32, 1), ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-theorem prefab_revert_restores_ssot (pid style matter : Nat) (delta : Int) :
-    let base : PrefabInstModel := { prefabId := pid }
-    revertToSSOT (applyOverride base style matter delta) = base := by
-  rfl
+def bloomIntentLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "intent" "BloomIntent64" "intent" [
+    ("intent_id", .u32, 1), ("bind_channel", .u32, 1), ("action_opcode", .u32, 1), ("priority_weight", .u32, 1),
+    ("lo_exit_q16", .i32, 1), ("hi_enter_q16", .i32, 1), ("current_val_q16", .i32, 1), ("optical_state", .u32, 1),
+    ("prim_type", .u32, 1), ("glass_mode", .u32, 1), ("reserved", .u32, 4), ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-theorem prefab_revert_idempotent (inst : PrefabInstModel) :
-    revertToSSOT (revertToSSOT inst) = revertToSSOT inst := by
-  rfl
+def bloomRaycastHitLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "ray_hit" "BloomRaycastHit64" "ray_hit" [
+    ("hit_valid", .u32, 1), ("hit_inst_id", .u32, 1), ("hit_prefab_id", .u32, 1), ("bvh_nodes_visited", .u32, 1),
+    ("t_hit_q16", .i32, 1), ("sdf_dist_q16", .i32, 1), ("hit_pos_q16", .i32, 3), ("hit_normal_q16", .i32, 3),
+    ("ray_origin_q16", .i32, 2), ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-/-- Nested React-Native Flexbox child span `[parentLo + pad + offset, parentLo + pad + offset + childSpan]`
-    never overflows the padded parent container `[parentLo + pad, parentHi - pad]`. -/
-theorem flex_child_span_bounded (parentLo parentHi pad offset childSpan : Int)
-    (hPad : 0 <= pad) (hOff : 0 <= offset) (hSpan : 0 <= childSpan)
-    (hFit : 2 * pad + offset + childSpan <= parentHi - parentLo) :
-    parentLo <= parentLo + pad + offset ∧
-    parentLo + pad + offset <= parentLo + pad + offset + childSpan ∧
-    parentLo + pad + offset + childSpan <= parentHi - pad ∧
-    parentHi - pad <= parentHi := by
-  omega
+def bloomImageHeaderLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "img_hdr" "BloomImageHeader64" "img_hdr" [
+    ("magic_lo32", .u32, 1), ("magic_hi32", .u32, 1), ("block_cap_mask", .u32, 1), ("version", .u32, 1),
+    ("prefab_off", .u32, 1), ("prefab_count", .u32, 1), ("csg_off", .u32, 1), ("csg_count", .u32, 1),
+    ("ui_off", .u32, 1), ("ui_count", .u32, 1), ("flow_chart_off", .u32, 1), ("flow_chart_count", .u32, 1),
+    ("schema_lo32", .u32, 1), ("schema_hi32", .u32, 1), ("merkle_lo32", .u32, 1), ("merkle_hi32", .u32, 1)
+  ]
 
-/-! ### Machine-Word Hardware & ABI Bit-Blasted Theorems (`Std.Tactic.BVDecide` CaDiCaL SAT) -/
+def bloomSectionSpecLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "section_spec" "BloomSectionSpec64" "section_spec" [
+    ("section_mode", .u32, 1), ("inspect_flags", .u32, 1), ("joint_count", .u16, 1), ("brick_count", .u16, 1),
+    ("mesh_tri_count", .u16, 1), ("mesh_bvh_count", .u16, 1), ("plane_norm_q16", .i32, 3),
+    ("plane_dist_q16", .i32, 1), ("slab_half_q16", .i32, 1), ("min_wall_q16", .i32, 1),
+    ("iso_pitch_q16", .i32, 1), ("clearance_tol_q16", .i32, 1), ("global_csg_start", .u16, 1),
+    ("global_csg_count", .u16, 1), ("mesh_matter_style", .u32, 1), ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-/-- Exact C17/WGSL 32-bit masked arena slot index `idx & 0xFFu` is OOB-immune across all `2^32` words. -/
-theorem arena_slot_mask_bv32_inbounds (idx : BitVec 32) :
-    BitVec.ult (idx &&& 0xFF#32) 256#32 = true := by
-  bv_decide
+def bloomPhysicsSummaryLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "phys_summary" "BloomPhysicsSummary64" "phys_summary" [
+    ("step_epoch", .u32, 1), ("interference_pairs", .u16, 1), ("clearance_warn_pairs", .u16, 1),
+    ("ccd_hit_count", .u16, 1), ("pair_inst_a", .u16, 1), ("pair_inst_b", .u16, 1), ("phys_flags", .u16, 1),
+    ("min_clearance_q16", .i32, 1), ("earliest_toi_q16", .i32, 1), ("peak_kelvin", .u32, 1),
+    ("max_penetration_q16", .i32, 1), ("contact_pos_q16", .i32, 3), ("contact_norm_q16", .i32, 3),
+    ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-/-- Exact C17/WGSL `u32x2` (`lo32`, `hi32`) Wave64 bit-set models matching `bloom_wave64_set_u32x2`. -/
-def wave64SetLoBV (lo32 bitIdx : BitVec 32) : BitVec 32 :=
-  if BitVec.ult bitIdx 32#32 then lo32 ||| (1#32 <<< (bitIdx &&& 31#32)) else lo32
+def bloomTriLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "tri" "BloomTri64" "tri" [
+    ("tri_id", .u32, 1), ("matter_id", .u16, 1), ("shell_q12", .u16, 1),
+    ("v0_q16", .i32, 3), ("v1_q16", .i32, 3), ("v2_q16", .i32, 3), ("normal_q16", .i32, 3),
+    ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-def wave64SetHiBV (hi32 bitIdx : BitVec 32) : BitVec 32 :=
-  if !BitVec.ult bitIdx 32#32 && BitVec.ult bitIdx 64#32 then hi32 ||| (1#32 <<< (bitIdx &&& 31#32)) else hi32
+def bloomFieldJetLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "field_jet" "BloomFieldJet64" "field_jet" [
+    ("sdf_q16", .i32, 1), ("grad_q16", .i32, 3), ("hess_diag_q16", .i32, 3),
+    ("mean_curv_q16", .i32, 1), ("gauss_curv_q16", .i32, 1), ("prin_dir_q16", .i32, 3),
+    ("anisotropy_q16", .i32, 1), ("matter_id", .u32, 1), ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-/-- Exact C17/WGSL `u32x2` (`lo32`, `hi32`) Wave64 bit-test model matching `bloom_wave64_test_u32x2`. -/
-def wave64TestBV (lo32 hi32 bitIdx : BitVec 32) : Bool :=
-  let word  := if BitVec.ult bitIdx 32#32 then lo32 else hi32
-  let shift := bitIdx &&& 31#32
-  ((word >>> shift) &&& 1#32) != 0#32
+def bloomAudioVoiceLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "audio_voice" "BloomAudioVoice64" "audio_voice" [
+    ("active", .u16, 1), ("matter_id", .u16, 1), ("pan_l_q14", .i16, 1), ("pan_r_q14", .i16, 1),
+    ("cos_q14", .i16, 4), ("sin_q14", .i16, 4), ("decay_q15", .u16, 4), ("u_q24", .i32, 4), ("v_q24", .i32, 4)
+  ]
 
-/-- Setting any valid Wave64 lane `bitIdx < 64` tests `true` across all `2^96` (`lo32, hi32, bitIdx`) states. -/
-theorem wave64_set_test_exact_bv32 (lo32 hi32 bitIdx : BitVec 32)
-    (h : BitVec.ult bitIdx 64#32 = true) :
-    wave64TestBV (wave64SetLoBV lo32 bitIdx) (wave64SetHiBV hi32 bitIdx) bitIdx = true := by
-  unfold wave64SetLoBV wave64SetHiBV wave64TestBV
-  bv_decide
+def bloomAudioHeaderLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "audio_hdr" "BloomAudioHeader64" "audio_hdr" [
+    ("sample_rate_hz", .u32, 1), ("voice_cursor", .u32, 1), ("last_phys_epoch", .u32, 1), ("rng_state", .u32, 1),
+    ("last_subframe_sample", .u32, 1), ("total_impacts", .u32, 1), ("prev_sec_dist_q16", .i32, 1),
+    ("peak_abs_pcm", .i32, 1), ("reserved_hdr", .u32, 6), ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-/-- Setting Wave64 lane `i < 64` never mutates any distinct lane `j < 64` (`i != j`, zero cross-lane bleed). -/
-theorem wave64_set_frame_independence_bv32 (lo32 hi32 i j : BitVec 32)
-    (hi : BitVec.ult i 64#32 = true) (hj : BitVec.ult j 64#32 = true) (hne : i != j) :
-    wave64TestBV (wave64SetLoBV lo32 i) (wave64SetHiBV hi32 i) j = wave64TestBV lo32 hi32 j := by
-  unfold wave64SetLoBV wave64SetHiBV wave64TestBV
-  bv_decide
+def bloomGameplayStateLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "gameplay" "BloomGameplayState64" "gameplay" [
+    ("player_inst_id", .u32, 1), ("delta_hurt_q16", .i32, 1), ("delta_graze_q16", .i32, 1), ("delta_hit_q16", .i32, 1),
+    ("hyst_enter_q16", .i32, 1), ("hyst_exit_q16", .i32, 1), ("graze_latched", .u16, 1), ("hitstop_frames", .u16, 1),
+    ("input_buf_frames", .u16, 1), ("buffered_action", .u16, 1), ("graze_score", .u32, 1), ("lethal_hits", .u32, 1),
+    ("proper_time_q16", .i32, 1), ("audio_duck_q16", .i32, 1), ("buffered_dir_q16", .i32, 2),
+    ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-/-- Exact C17 `BLOOM_CSG_MASK_PACK` 32-bit bitfield codec has zero inter-field bit bleed. -/
-def csgMaskPackBV (prim1 prim2 op polar grade : BitVec 32) : BitVec 32 :=
-  ((prim1 &&& 0xF#32) <<< 0#32) |||
-  ((prim2 &&& 0xF#32) <<< 4#32) |||
-  ((op    &&& 0xF#32) <<< 8#32) |||
-  ((polar &&& 0x3F#32) <<< 12#32) |||
-  ((grade &&& 0xF#32) <<< 18#32)
+def bloomRewindCtrlLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "rewind_ctrl" "BloomRewindCtrl64" "rewind_ctrl" [
+    ("capacity", .u32, 1), ("head", .u32, 1), ("count", .u32, 1), ("cursor", .u32, 1),
+    ("branch_epoch", .u32, 1), ("total_rewinds", .u32, 1), ("reserved_rw", .u32, 8),
+    ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-theorem csg_mask_pack_roundtrip_bv32 (prim1 prim2 op polar grade : BitVec 32) :
-    let m := csgMaskPackBV prim1 prim2 op polar grade
-    ((m >>> 0#32)  &&& 0xF#32)  = (prim1 &&& 0xF#32) ∧
-    ((m >>> 4#32)  &&& 0xF#32)  = (prim2 &&& 0xF#32) ∧
-    ((m >>> 8#32)  &&& 0xF#32)  = (op    &&& 0xF#32) ∧
-    ((m >>> 12#32) &&& 0x3F#32) = (polar &&& 0x3F#32) ∧
-    ((m >>> 18#32) &&& 0xF#32)  = (grade &&& 0xF#32) := by
-  unfold csgMaskPackBV
-  bv_decide
+def bloomMetricScaleLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "metric_scale" "BloomMetricScale64" "metric_scale" [
+    ("proper_time_q16", .i32, 1), ("lorentz_beta_q16", .i32, 1), ("lorentz_gamma_q16", .i32, 1),
+    ("doppler_factor_q16", .i32, 1), ("metric_potential_q16", .i32, 1), ("grav_redshift_q16", .i32, 1),
+    ("flux_pressure_q16", .i32, 1), ("spatial_scale_q16", .i32, 1), ("rel_vel_dir_q16", .i32, 3),
+    ("center_pos_q16", .i32, 3), ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-/-- Signed 32-bit two's-complement Q16.16 TRC Strobe Clamp (`<= 3.0 Hz = 196608`) is overflow-free. -/
-def clampTrcStrobeBV32 (hzQ16 : BitVec 32) : BitVec 32 :=
-  let clampedHi := if BitVec.slt 196608#32 hzQ16 then 196608#32 else hzQ16
-  if BitVec.slt clampedHi 0#32 then 0#32 else clampedHi
+def bloomMoodboardLayout : Flow.Schema.CellLayout64 :=
+  Flow.Schema.CellLayout64.packed64 "moodboard" "BloomMoodboard64" "moodboard" [
+    ("dominant_rgb24", .u32, 1), ("accent_rgb24", .u32, 1), ("warmth_q16", .i32, 1), ("contrast_q16", .i32, 1),
+    ("edge_density_q16", .i32, 1), ("specular_hint_q16", .i32, 1), ("inferred_matter_id", .u32, 1),
+    ("inferred_prim_mask", .u32, 1), ("palette_luma_q16", .i32, 4), ("reserved_mb", .u32, 2),
+    ("mac_lo32", .u32, 1), ("mac_hi32", .u32, 1)
+  ]
 
-theorem trc_strobe_clamp_bv32 (hzQ16 : BitVec 32) :
-    let res := clampTrcStrobeBV32 hzQ16
-    BitVec.sle 0#32 res = true ∧ BitVec.sle res 196608#32 = true := by
-  unfold clampTrcStrobeBV32
-  bv_decide
+def bloomArenaSchema : Flow.Schema.ArenaSpec where
+  cPrefix         := "bloom_schema"
+  headerGuard     := "BLOOM_SCHEMA_ABI_H"
+  totalCells      := arenaCells
+  cCellUnionName  := "BloomCell64"
+  cArenaMapName   := "BloomEngineArenaMap"
+  cArenaUnionName := "BloomEngineArena"
+  regions := [
+    { name := "header",       baseSlot := 0,   count := 1,  cSlotMacro := "BLOOM_SLOT_HEADER",          mapDecl := "BloomFrameHeader64 frame_hdr;" },
+    { name := "camera",       baseSlot := 1,   count := 1,  cSlotMacro := "BLOOM_SLOT_CAMERA",          mapDecl := "BloomCamera64 camera;" },
+    { name := "regbank",      baseSlot := 2,   count := 1,  cSlotMacro := "BLOOM_SLOT_REGBANK",         mapDecl := "BloomRegBank64 reg_bank;" },
+    { name := "dom",          baseSlot := 3,   count := 1,  cSlotMacro := "BLOOM_SLOT_DOM",             mapDecl := "BloomDomState64 dom;" },
+    { name := "flex",         baseSlot := 4,   count := 1,  cSlotMacro := "BLOOM_SLOT_FLEX",            mapDecl := "BloomFlexContainer64 flex;" },
+    { name := "text_input",   baseSlot := 5,   count := 1,  cSlotMacro := "BLOOM_SLOT_TEXT_INPUT",      mapDecl := "BloomTextInput64 text_input;" },
+    { name := "ime",          baseSlot := 6,   count := 1,  cSlotMacro := "BLOOM_SLOT_IME",             mapDecl := "BloomIme64 ime;" },
+    { name := "window",       baseSlot := 7,   count := 1,  cSlotMacro := "BLOOM_SLOT_WINDOW",          mapDecl := "BloomWindow64 window;" },
+    { name := "matter",       baseSlot := 8,   count := 8,  cSlotMacro := "BLOOM_SLOT_MATTER_BASE",     cCountMacro := "BLOOM_MAX_MATTERS",     mapDecl := "BloomMatter64 matters[BLOOM_MAX_MATTERS];" },
+    { name := "style",        baseSlot := 16,  count := 8,  cSlotMacro := "BLOOM_SLOT_STYLE_BASE",      cCountMacro := "BLOOM_MAX_STYLES",      mapDecl := "BloomArtStyle64 styles[BLOOM_MAX_STYLES];" },
+    { name := "prefab",       baseSlot := 24,  count := 16, cSlotMacro := "BLOOM_SLOT_PREFAB_BASE",     cCountMacro := "BLOOM_MAX_PREFABS",     mapDecl := "BloomPrefabDesc64 prefabs[BLOOM_MAX_PREFABS];" },
+    { name := "inst",         baseSlot := 40,  count := 32, cSlotMacro := "BLOOM_SLOT_INST_BASE",       cCountMacro := "BLOOM_MAX_INSTANCES",   mapDecl := "BloomPrefabInst64 instances[BLOOM_MAX_INSTANCES];" },
+    { name := "csg",          baseSlot := 72,  count := 32, cSlotMacro := "BLOOM_SLOT_CSG_BASE",        cCountMacro := "BLOOM_MAX_CSG_OPS",     mapDecl := "BloomCsgOp64 csg_ops[BLOOM_MAX_CSG_OPS];" },
+    { name := "bvh",          baseSlot := 104, count := 32, cSlotMacro := "BLOOM_SLOT_BVH_BASE",        cCountMacro := "BLOOM_MAX_BVH_NODES",   mapDecl := "BloomBvhNode64 bvh_nodes[BLOOM_MAX_BVH_NODES];" },
+    { name := "joint",        baseSlot := 136, count := 8,  cSlotMacro := "BLOOM_SLOT_JOINT_BASE",      cCountMacro := "BLOOM_MAX_JOINTS",      mapDecl := "BloomJointDq64 joints[BLOOM_MAX_JOINTS];" },
+    { name := "brick",        baseSlot := 144, count := 8,  cSlotMacro := "BLOOM_SLOT_BRICK_BASE",      cCountMacro := "BLOOM_MAX_BRICKS",      mapDecl := "BloomSdfBrick64 bricks[BLOOM_MAX_BRICKS];" },
+    { name := "ui",           baseSlot := 152, count := 16, cSlotMacro := "BLOOM_SLOT_UI_BASE",         cCountMacro := "BLOOM_MAX_UI_NODES",    mapDecl := "BloomUiNode64 ui_nodes[BLOOM_MAX_UI_NODES];" },
+    { name := "glyph",        baseSlot := 168, count := 16, cSlotMacro := "BLOOM_SLOT_GLYPH_BASE",      cCountMacro := "BLOOM_MAX_GLYPHS",      mapDecl := "BloomGlyph64 glyphs[BLOOM_MAX_GLYPHS];" },
+    { name := "latex",        baseSlot := 184, count := 16, cSlotMacro := "BLOOM_SLOT_LATEX_BASE",      cCountMacro := "BLOOM_MAX_LATEX_BOXES", mapDecl := "BloomLatexBox64 latex_boxes[BLOOM_MAX_LATEX_BOXES];" },
+    { name := "flow_state",   baseSlot := 200, count := 32, cSlotMacro := "BLOOM_SLOT_FLOW_STATE_BASE", cCountMacro := "BLOOM_MAX_FLOW_STATES", mapDecl := "uint64_t flow_states[BLOOM_MAX_FLOW_STATES][8];" },
+    { name := "flow_chart",   baseSlot := 232, count := 16, cSlotMacro := "BLOOM_SLOT_FLOW_CHART_BASE", cCountMacro := "BLOOM_MAX_FLOW_CHARTS", mapDecl := "uint64_t flow_charts[BLOOM_MAX_FLOW_CHARTS][8];" },
+    { name := "raycast_hit",  baseSlot := 248, count := 1,  cSlotMacro := "BLOOM_SLOT_RAYCAST_HIT",     mapDecl := "BloomRaycastHit64 ray_hit;" },
+    { name := "image_hdr",    baseSlot := 249, count := 1,  cSlotMacro := "BLOOM_SLOT_IMAGE_HDR",       mapDecl := "BloomImageHeader64 img_hdr;" },
+    { name := "ui_label",     baseSlot := 250, count := 4,  cSlotMacro := "BLOOM_SLOT_UI_LABEL_BASE",   mapDecl := "char ui_labels[BLOOM_MAX_UI_NODES][16];" },
+    { name := "section_spec", baseSlot := 254, count := 1,  cSlotMacro := "BLOOM_SLOT_SECTION_SPEC",    mapDecl := "BloomSectionSpec64 section_spec;" },
+    { name := "phys_summary", baseSlot := 255, count := 1,  cSlotMacro := "BLOOM_SLOT_PHYS_SUMMARY",    mapDecl := "BloomPhysicsSummary64 phys_summary;" }
+  ]
+  layouts := [
+    bloomFrameHeaderLayout, bloomCameraLayout, bloomRegBankLayout, bloomDomStateLayout,
+    bloomFlexLayout, bloomTextInputLayout, bloomImeLayout, bloomWindowLayout,
+    bloomMatterLayout, bloomArtStyleLayout, bloomPrefabDescLayout, bloomPrefabInstLayout,
+    bloomCsgOpLayout, bloomBvhNodeLayout, bloomJointDqLayout, bloomSdfBrickLayout,
+    bloomUiNodeLayout, bloomGlyphLayout, bloomLatexBoxLayout, bloomIntentLayout,
+    bloomRaycastHitLayout, bloomImageHeaderLayout, bloomSectionSpecLayout, bloomPhysicsSummaryLayout,
+    bloomTriLayout, bloomFieldJetLayout, bloomAudioVoiceLayout, bloomAudioHeaderLayout,
+    bloomGameplayStateLayout, bloomRewindCtrlLayout, bloomMetricScaleLayout, bloomMoodboardLayout
+  ]
 
-/-- Signed 32-bit two's-complement Beer-Lambert Transmittance Clamp (`[4096, 65536]`) is overflow-free. -/
-def clampGlassTransBV32 (rawQ16 : BitVec 32) : BitVec 32 :=
-  if BitVec.slt rawQ16 4096#32 then 4096#32
-  else if BitVec.slt 65536#32 rawQ16 then 65536#32
-  else rawQ16
-
-theorem beer_lambert_clamp_bv32 (rawQ16 : BitVec 32) :
-    let res := clampGlassTransBV32 rawQ16
-    BitVec.sle 4096#32 res = true ∧ BitVec.sle res 65536#32 = true := by
-  unfold clampGlassTransBV32
-  bv_decide
-
-/-- Exact 16-bit Kan-Lock `@swap` mode projection (`(req & ~lock) | (cur & lock)`) preserves locked invariants. -/
-theorem kan_lock_mode_preserve_bv16 (modeReq curMode kanLock : BitVec 16) :
-    let nextMode := (modeReq &&& ~~~kanLock) ||| (curMode &&& kanLock)
-    (nextMode &&& kanLock) = (curMode &&& kanLock) ∧
-    (nextMode &&& ~~~kanLock) = (modeReq &&& ~~~kanLock) := by
-  bv_decide
-
-/-- Exact 16-bit Prefab `BLOOM_INST_FLAG_OVERRIDDEN` (`0x0004`) set/revert bit algebra. -/
-theorem prefab_override_revert_flags_bv16 (flags : BitVec 16) (hClean : (flags &&& 4#16) = 0#16) :
-    let ovr := flags ||| 4#16
-    let rev := ovr &&& ~~~4#16
-    (ovr &&& 4#16) = 4#16 ∧ rev = flags ∧ (rev &&& 4#16) = 0#16 := by
-  bv_decide
-
-/-- Exact C17/WGSL inline UI label table (`BLOOM_SLOT_UI_LABEL_BASE = 250`, 4 × 16B labels per 64B cell)
-    maps any masked UI node index `idx & 15` strictly into Arena Slots `[250 .. 253]` (`< 254`). -/
-theorem ui_label_slot_inbounds_bv32 (idx : BitVec 32) :
-    let slot := 250#32 + ((idx &&& 15#32) >>> 2#32)
-    BitVec.ule 250#32 slot = true ∧ BitVec.ult slot 254#32 = true := by
-  bv_decide
-
-/-- Exact 64-bit `searu_heal_and_swap` phase-gate predicate (`FLOW v7.0.1`):
-    SEARU wakes ONLY at `!CONVERGED && dt == 0` barriers, guaranteeing zero-chaos silence
-    whenever `FLOW_STATUS_CONVERGED` (`bit 0`) is asserted or `dt != 0` (active 2-Jet descent). -/
-def searuHealGateBV64 (status64 dt64 : BitVec 64) : Bool :=
-  ((status64 &&& 1#64) == 0#64) && (dt64 == 0#64)
-
-theorem searu_phase_gate_silence_bv64 (status64 dt64 : BitVec 64)
-    (hSmooth : (status64 &&& 1#64) != 0#64 ∨ dt64 != 0#64) :
-    searuHealGateBV64 status64 dt64 = false := by
-  unfold searuHealGateBV64
-  bv_decide
-
-/-- Exact 64-bit `SEARU_SOLVE_INLINE` / `searu_ring0_step_1bit` Kan-pinned Sparse-`k` XOR mutation
-    `cur ^^^ (flip &&& ~~~kanPin)` strictly preserves all hardware-pinned bits across `2^192` states. -/
-theorem searu_kan_pin_flip_invariant_bv64 (cur flip kanPin : BitVec 64) :
-    let next := cur ^^^ (flip &&& ~~~kanPin)
-    (next &&& kanPin) = (cur &&& kanPin) := by
-  bv_decide
+def emitSchemaOnly : IO Bool := do
+  let ok1 ← bloomArenaSchema.emitC17HeaderChecked "build/bloom_schema_abi.h"
+  let ok2 ← bloomArenaSchema.emitWgslModuleChecked "build/bloom_schema.wgsl"
+  return ok1 && ok2
 
 /-! ## Part 2: Declarative Three.js + React Native + Prefab SSOT JSI Host API -/
 
@@ -328,13 +372,34 @@ namespace UiAction
   def focusInput   : UInt32 := 6
 end UiAction
 
+namespace SectionMode
+  def off    : UInt32 := 0
+  def plane  : UInt32 := 1
+  def slab   : UInt32 := 2
+  def corner : UInt32 := 3
+end SectionMode
+
+namespace InspectFlag
+  def isolines     : UInt32 := 1
+  def wallDfm      : UInt32 := 2
+  def interference : UInt32 := 4
+  def triplanar    : UInt32 := 8
+  def meshSolid    : UInt32 := 16
+end InspectFlag
+
 /-! ### Frame Header Bitflags (`BloomFrameHeader64.flags`) -/
 namespace FrameFlag
-  def idleSleep      : UInt32 := 1
-  def xrayEnabled    : UInt32 := 2
-  def trcSafe        : UInt32 := 4
-  def colorblindGeom : UInt32 := 8
-  def studioGi       : UInt32 := 16
+  def idleSleep        : UInt32 := 1
+  def xrayEnabled      : UInt32 := 2
+  def trcSafe          : UInt32 := 4
+  def colorblindGeom   : UInt32 := 8
+  def studioGi         : UInt32 := 16
+  def radianceCascades : UInt32 := 32
+  def diffField        : UInt32 := 64
+  def subframeLock     : UInt32 := 128
+  def cineOptics       : UInt32 := 256
+  def metricField      : UInt32 := 512
+  def gameplayShells   : UInt32 := 1024
 end FrameFlag
 
 /-! ### FLOW v7.0.1 Canonical Manifold Chart Indices (`Slots 232..247`) -/
@@ -475,6 +540,13 @@ opaque exportPpm (eng : @& Engine) (ppmPath : @& String) : IO UInt32
 
 @[extern "bloom_jsi_frame_hash"]
 opaque frameHash (eng : @& Engine) : IO UInt64
+
+@[extern "bloom_jsi_set_section_spec"]
+opaque setSectionSpec (eng : @& Engine) (mode : UInt32) (nxQ16 nyQ16 nzQ16 distQ16 : Int32)
+    (inspectFlags : UInt32) : IO Unit
+
+@[extern "bloom_jsi_step_physics"]
+opaque stepPhysics (eng : @& Engine) (dtQ16 : UInt32) : IO UInt32
 
 @[extern "bloom_jsi_run_window"]
 opaque runNativeWindow (eng : @& Engine) (onFrame : Unit → IO Unit) : IO UInt32
@@ -947,13 +1019,15 @@ def mountBlueprint (eng : Engine) (bp : StudioBlueprint) : IO (UInt32 × UInt32 
   syncCameraOrbitNow eng
     (q16Milli bp.orbitYawMilli) (q16Milli bp.orbitPitchMilli) (q16Milli bp.orbitDistMilli)
   if bp.enableStudioGi then
-    setFrameFlags eng FrameFlag.studioGi 0
+    setFrameFlags eng (FrameFlag.studioGi ||| FrameFlag.radianceCascades ||| FrameFlag.diffField ||| FrameFlag.subframeLock) 0
   else
-    setFrameFlags eng 0 FrameFlag.studioGi
+    setFrameFlags eng 0 (FrameFlag.studioGi ||| FrameFlag.radianceCascades ||| FrameFlag.diffField ||| FrameFlag.subframeLock)
   let mut ids : List UInt32 := []
   for item in bp.sceneNodes do
     let iid ← spawnPrefab eng item.prefabId
       (q16Milli item.xMilli) (q16Milli item.yMilli) (q16Milli item.zMilli) (q16Milli item.scaleMil)
+    if bp.enableStudioGi && item.prefabId == Prefab.thermalReactor then
+      setInstKelvin eng iid 740
     ids := ids ++ [iid]
   pure (uiCnt, lxCnt, ids)
 
@@ -991,7 +1065,7 @@ def reduceStudioAction (eng : Engine) (st : StudioState) (action : UInt32) : IO 
   else
     pure st
 
-/-- Canonical v7.0.1 Studio Blueprint authored via React-Native nested `<View>` Flexbox DSL
+/-- Canonical v9.0.0 Studio Blueprint authored via React-Native nested `<View>` Flexbox DSL
     (`1280 x 720` reference viewport, scaled cleanly to any resolution). -/
 def defaultStudioBlueprint : StudioBlueprint := {
   refWidthPx      := 1280
@@ -1004,7 +1078,7 @@ def defaultStudioBlueprint : StudioBlueprint := {
     .view .column .spaceBetween .stretch { padPx := 20 } [
       -- 1. Top Header Row: Brand Pill + Live Command TextInput + Auto-Fitted Optical LaTeX Card
       .view .row .spaceBetween .center { hPx := 64, gapPx := 16 } [
-        .button "BLOOM 7.0" UiAction.none 65536
+        .button "BLOOM 9.0" UiAction.none 65536
           { wPx := 196, hPx := 52, radiusPx := 26, rgb24 := 0x28EAFF, glass := GlassMode.crystal },
         .textInput "CMD" "JADE / 860K" UiAction.focusInput
           { flexGrow := 1, hPx := 52, radiusPx := 14, rgb24 := 0x18B8E8, glass := GlassMode.beerLambert },
@@ -1078,8 +1152,11 @@ private def requireContract (label : String) (cond : Bool) : IO Unit := do
   if !cond then
     throw (IO.userError s!"[BLOOM Compile-Time Boundary Violation] {label}")
 
-private def compileTimeBoundaryGate : IO Unit := do
-  -- 0. Pure-CPU `libbloom.a` Public API + FLOW v7.0.1 Symbiotic SEARU x 2-Jet Gate
+def compileTimeBoundaryGate : IO Unit := do
+  -- 0. Emit Checked Full-512b C17/C++20 & WGSL Arena Schema + Pure-CPU FLOW SEARU Gate
+  let schemaOk ← emitSchemaOnly
+  requireContract "FLOW v8.0.0 Full-512b ArenaSpec C17+WGSL Schema emission" schemaOk
+
   let searuOk ← verifySearuCore 0xB100A60020265EA4
   requireContract "FLOW v7.0.1 SEARU (heal_and_swap + SOLVE_INLINE) + BVH==CSG 0-ULP + UTF-8/IME" searuOk
 
@@ -1119,6 +1196,9 @@ private def compileTimeBoundaryGate : IO Unit := do
   let _ ← getFlowChart engEdge 0xFFFFFFFF
   let _ ← getCapturedNode engEdge
   let _ ← getXRayPlaneQ16 engEdge
+  let _ ← stepPhysics engEdge 65536
+  setSectionSpec engEdge SectionMode.plane 46341 46341 0 0 (InspectFlag.isolines ||| InspectFlag.wallDfm ||| InspectFlag.interference ||| InspectFlag.triplanar)
+  setSectionSpec engEdge SectionMode.off 65536 0 0 0 (InspectFlag.isolines ||| InspectFlag.wallDfm ||| InspectFlag.interference ||| InspectFlag.triplanar)
   let _ ← stepAndRender engEdge 0xFFFF true
   let edgeSealed ← sealAndVerifyArena engEdge
   requireContract "Adversarial boundary Arena Merkle seal intact" edgeSealed
@@ -1247,7 +1327,5 @@ private def compileTimeBoundaryGate : IO Unit := do
   requireContract "AOT build/studio.bloom Merkle seal & write succeeded" savedOk
   let imgBytes ← IO.FS.readBinFile defaultStudioImagePath
   requireContract "AOT build/studio.bloom is exact 16,384-byte VM page" (imgBytes.size == arenaBytes)
-
-#eval compileTimeBoundaryGate
 
 end Bloom

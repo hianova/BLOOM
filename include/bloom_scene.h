@@ -48,7 +48,7 @@ int32_t bloom_cos_q16(int32_t angle_q16);
 int64_t bloom_smin_q16(int64_t a_q16, int64_t b_q16, int64_t k_q16);
 int64_t bloom_smax_q16(int64_t a_q16, int64_t b_q16, int64_t k_q16);
 
-/* 1. CSG Primitive & Binary glTF (.glb) Ingestion */
+/* 1. CSG Primitive, CAD Mesh (.stl/.glb) Ingestion & Cross-Section Plane */
 void bloom_csg_op_init64(BloomCsgOp64 *out_op,
                          uint32_t op_id,
                          uint32_t prim_type,
@@ -58,6 +58,68 @@ void bloom_csg_op_init64(BloomCsgOp64 *out_op,
                          const int32_t extents_q16[3],
                          int32_t smooth_k_q16,
                          int32_t bevel_r_q16);
+
+void bloom_rot_inv_euler_q16(const int32_t in_pt_q16[3],
+                             const int32_t rot_euler_q16[3],
+                             int32_t out_pt_q16[3]);
+
+void bloom_section_init64(BloomSectionSpec64 *sec,
+                          uint32_t mode,
+                          const int32_t norm_q16[3],
+                          int32_t dist_q16,
+                          int32_t slab_half_q16,
+                          int32_t min_wall_q16,
+                          int32_t iso_pitch_q16,
+                          uint32_t inspect_flags);
+
+int64_t bloom_section_eval_clip_q16(int64_t raw_d_q16,
+                                    int64_t px_q16,
+                                    int64_t py_q16,
+                                    int64_t pz_q16,
+                                    const BloomFrameHeader64 *hdr,
+                                    const BloomSectionSpec64 *sec,
+                                    bool *out_is_cut);
+
+bool bloom_tri64_init(BloomTri64 *out_tri,
+                      uint32_t tri_id,
+                      uint16_t matter_id,
+                      uint16_t shell_q12,
+                      const int32_t v0_q16[3],
+                      const int32_t v1_q16[3],
+                      const int32_t v2_q16[3]);
+
+int64_t bloom_tri64_eval_ud_q16(const BloomTri64 *tri,
+                                int64_t px_q16,
+                                int64_t py_q16,
+                                int64_t pz_q16);
+
+size_t bloom_bvh_build_from_tris64(const BloomTri64 *tris,
+                                   size_t tri_count,
+                                   BloomBvhNode64 *out_nodes,
+                                   size_t max_nodes);
+
+int64_t bloom_mesh_eval_sdf_q16(const BloomMeshArena *mesh,
+                                uint32_t tri_count,
+                                uint32_t bvh_count,
+                                bool solid_parity,
+                                int64_t px_q16,
+                                int64_t py_q16,
+                                int64_t pz_q16,
+                                uint32_t *out_visited);
+
+bool bloom_stl_parse_to_mesh64(const uint8_t *stl_bytes,
+                               size_t stl_len,
+                               uint16_t matter_id,
+                               bool normalize_unit_bounds,
+                               BloomMeshArena *out_mesh,
+                               uint32_t *out_tri_count);
+
+bool bloom_glb_parse_to_mesh64(const uint8_t *glb_bytes,
+                               size_t glb_len,
+                               uint16_t matter_id,
+                               bool normalize_unit_bounds,
+                               BloomMeshArena *out_mesh,
+                               uint32_t *out_tri_count);
 
 bool bloom_glb_parse_to_csg64(const uint8_t *glb_bytes,
                               size_t glb_len,
@@ -134,6 +196,11 @@ int64_t bloom_sdf_brick64_sample_q16(const BloomSdfBrick64 *brick,
                                      int64_t py_q16,
                                      int64_t pz_q16);
 
+int64_t bloom_sdf_brick64_eval_world_q16(const BloomSdfBrick64 *brick,
+                                         int64_t px_q16,
+                                         int64_t py_q16,
+                                         int64_t pz_q16);
+
 /* 5. Constitutive Physical Matter Optics & 128-Hex Wire Protocol */
 void bloom_matter_init_canonical(BloomMatter64 out_matters[BLOOM_MAX_MATTERS]);
 
@@ -177,6 +244,45 @@ bool bloom_scene_raycast64(BloomEngineArena *arena,
                            int32_t cursor_norm_x_q16,
                            int32_t cursor_norm_y_q16,
                            BloomRaycastHit64 *out_hit);
+
+bool bloom_scene_raycast_ex64(BloomEngineArena *arena,
+                              const BloomMeshArena *opt_mesh,
+                              int32_t cursor_norm_x_q16,
+                              int32_t cursor_norm_y_q16,
+                              BloomRaycastHit64 *out_hit);
+
+void bloom_scene_eval_jet2_q16(const BloomEngineArena *arena,
+                               const BloomMeshArena *opt_mesh,
+                               int64_t px_q16,
+                               int64_t py_q16,
+                               int64_t pz_q16,
+                               BloomFieldJet64 *out_jet);
+
+/* 7. Dimensionless Relativistic Metric, CineCamera Composer & Moodboard SSOT Compiler */
+void bloom_metric_eval_scale64(int32_t beta_q16,
+                               int32_t phi_q16,
+                               int32_t flux_q16,
+                               const int32_t vel_dir_q16[3],
+                               const int32_t center_q16[3],
+                               BloomMetricScale64 *out_metric);
+
+void bloom_camera_step_cine64(BloomCamera64 *cam,
+                              BloomRegBank64 *opt_regs,
+                              const int32_t subject_pos_q16[3],
+                              int32_t deadzone_q16,
+                              int32_t trauma_impulse_q16);
+
+bool bloom_moodboard_extract_rgb24(const uint8_t *rgb,
+                                   uint32_t width,
+                                   uint32_t height,
+                                   uint32_t stride_bytes,
+                                   BloomMoodboard64 *out_mood);
+
+void bloom_moodboard_compile_to_ssot64(const BloomMoodboard64 *mood,
+                                       uint32_t style_id,
+                                       uint32_t prefab_id,
+                                       BloomArtStyle64 *out_style,
+                                       BloomPrefabDesc64 *out_prefab);
 
 #ifdef __cplusplus
 }

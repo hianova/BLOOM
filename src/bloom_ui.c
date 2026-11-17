@@ -749,9 +749,16 @@ uint32_t bloom_ui_step_pointer_arena(BloomEngineArena *arena,
                     bloom_reg_bank_set_q16(bank, nodes[i].bind_channel, next_v);
                 }
                 if ((nodes[i].action_opcode & 0xFFFFU) == BLOOM_ACTION_SCRUB_XRAY) {
-                    /* Map [0..65536] -> [-2.0 .. +2.0] world X-Ray cutaway plane */
-                    hdr->xray_plane_q16 = (next_v - 32768) * 4;
+                    /* Map [0..65536] -> [-2.0 .. +2.0] world X-Ray / Section plane */
+                    int32_t plane_q16 = (next_v - 32768) * 4;
+                    hdr->xray_plane_q16 = plane_q16;
                     hdr->flags |= BLOOM_FLAG_XRAY_ENABLED;
+                    arena->map.section_spec.plane_dist_q16 = plane_q16;
+                    if (arena->map.section_spec.section_mode != BLOOM_SEC_MODE_OFF) {
+                        ui_stamp_mac(&arena->map.section_spec, 0x5EC70064ULL,
+                                     &arena->map.section_spec.mac_lo32,
+                                     &arena->map.section_spec.mac_hi32);
+                    }
                 }
                 fired_action = nodes[i].action_opcode & 0xFFFFU;
                 dom->last_action_opcode = fired_action;

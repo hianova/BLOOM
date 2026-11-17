@@ -1,7 +1,9 @@
 // ============================================================================
-// BLOOM v7.0.1 — Unified Single-Source Cross-Platform Compute Shader (.wgsl)
+// BLOOM v9.0.0 — Unified Single-Source Cross-Platform Compute Shader (.wgsl)
 // ============================================================================
-// Single source of truth over the 16,384-byte (256 x 64B) BloomEngineArena.
+// Single source of truth over the 16,384B (256 x 64B) BloomEngineArena +
+// 32,768B (512 x 64B) BloomMeshArena + 3-Pass Radiance Cascades Field Buffer +
+// Relativistic Metric Geodesic Raymarching + Concentric Shells + CineCamera.
 // Compiled at build time via W3C Naga into both:
 //   - build/bloom_core.metal (MSL 2.4 for Apple Metal via SDL3 GPU)
 //   - build/bloom_core.spv   (SPIR-V for Vulkan / Lavapipe via SDL3 GPU)
@@ -16,7 +18,9 @@ struct Cell64 {
 };
 
 @group(0) @binding(0) var<storage, read> arena : array<Cell64, 256>;
+@group(0) @binding(1) var<storage, read> mesh_buf : array<Cell64, 512>;
 @group(1) @binding(0) var out_tex : texture_storage_2d<rgba8unorm, write>;
+@group(1) @binding(1) var<storage, read_write> rc_buf : array<vec4<f32>, 32768>;
 
 // ----------------------------------------------------------------------------
 // 0. Fixed-Point, Bitfield & Vector Algebra Helpers
@@ -120,13 +124,30 @@ fn aces_tonemap(x : vec3<f32>) -> vec3<f32> {
 }
 
 // ----------------------------------------------------------------------------
-// 1. 3D CSG & Prefab SDF Kernel (Exact Parity with bloom_prefab_eval_sdf_q16)
+// 1. 3D CSG, BVH, DQ-Skeleton, 4-Bit SDF Bricks & Triangle Mesh Kernel
 // ----------------------------------------------------------------------------
 
 fn smin_poly(a : f32, b : f32, k : f32) -> f32 {
-    let kk = max(k, 1e-4);
-    let h = clamp(0.5 + 0.5 * (b - a) / kk, 0.0, 1.0);
-    return mix(b, a, h) - kk * h * (1.0 - h);
+    if (k <= 1e-4) { return min(a, b); }
+    let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+fn rot_inv_euler(v : vec3<f32>, rot : vec3<f32>) -> vec3<f32> {
+    if (abs(rot.x) + abs(rot.y) + abs(rot.z) < 1e-5) {
+        return v;
+    }
+    let sx = sin(rot.x); let cx = cos(rot.x);
+    let sy = sin(rot.y); let cy = cos(rot.y);
+    let sz = sin(rot.z); let cz = cos(rot.z);
+
+    let x1 = v.x * cy - v.z * sy;
+    let z1 = v.x * sy + v.z * cy;
+    let y2 = v.y * cx + z1 * sx;
+    let z2 = -v.y * sx + z1 * cx;
+    let x3 = x1 * cz + y2 * sz;
+    let y3 = -x1 * sz + y2 * cz;
+    return vec3<f32>(x3, y3, z2);
 }
 
 fn sd_prim(prim_type : u32, p : vec3<f32>, ext : vec3<f32>, bevel : f32) -> f32 {
@@ -153,7 +174,299 @@ fn sd_prim(prim_type : u32, p : vec3<f32>, ext : vec3<f32>, bevel : f32) -> f32 
     return 1e5;
 }
 
+fn eval_csg_single(op : Cell64, p : vec3<f32>) -> f32 {
+    let prim_t = op.q0.y;
+    if (prim_t == 0u) { return 1e5; }
+    let pos = vec3<f32>(q16_to_f32(op.q1.x), q16_to_f32(op.q1.y), q16_to_f32(op.q1.z));
+    let ext = vec3<f32>(q16_to_f32(op.q1.w), q16_to_f32(op.q2.x), q16_to_f32(op.q2.y));
+    let bev = max(q16_to_f32(op.q2.w), 0.0);
+    return sd_prim(prim_t, p - pos, ext, bev);
+}
+
+fn eval_csg_program(start_idx : u32, cnt : u32, p : vec3<f32>) -> vec2<f32> {
+    var d_acc : f32 = 1e5;
+    var mat : u32 = 0u;
+    let lim = min(cnt, 32u - min(start_idx, 32u));
+    for (var i : u32 = 0u; i < lim; i = i + 1u) {
+        let op = arena[72u + start_idx + i];
+        let d = eval_csg_single(op, p);
+        if (i == 0u) {
+            d_acc = d;
+            mat = op.q0.w;
+            continue;
+        }
+        let bop = op.q0.z;
+        if (bop == 0u) {
+            if (d < d_acc) {
+                d_acc = d;
+                mat = op.q0.w;
+            }
+        } else if (bop == 1u) {
+            d_acc = max(d_acc, -d);
+        } else if (bop == 2u) {
+            if (d > d_acc) {
+                d_acc = d;
+                mat = op.q0.w;
+            }
+        } else if (bop == 3u) {
+            let sm = smin_poly(d_acc, d, max(q16_to_f32(op.q2.z), 0.0));
+            if (d < d_acc) { mat = op.q0.w; }
+            d_acc = sm;
+        }
+    }
+    return vec2<f32>(d_acc, f32(mat));
+}
+
+fn dq_transform(j : Cell64, pt : vec3<f32>) -> vec3<f32> {
+    let u  = vec3<f32>(q16_to_f32(j.q0.w), q16_to_f32(j.q1.x), q16_to_f32(j.q1.y));
+    let qw = q16_to_f32(j.q0.z);
+    let dw = q16_to_f32(j.q1.z);
+    let dv = vec3<f32>(q16_to_f32(j.q1.w), q16_to_f32(j.q2.x), q16_to_f32(j.q2.y));
+    let p_rot = pt + 2.0 * cross(u, cross(u, pt) + qw * pt);
+    let trans = 2.0 * (-dw * u + qw * dv - cross(dv, u));
+    return p_rot + trans;
+}
+
+fn eval_skeleton_sdf(p : vec3<f32>, joint_cnt : u32) -> vec2<f32> {
+    let n = min(joint_cnt, 8u);
+    var d_acc : f32 = 1e5;
+    var best_mat : u32 = 0u;
+    for (var i : u32 = 0u; i < n; i = i + 1u) {
+        let j = arena[136u + i];
+        let blen = clamp(q16_to_f32(j.q2.z), -1024.0, 1024.0);
+        let a = dq_transform(j, vec3<f32>(0.0));
+        let b = dq_transform(j, vec3<f32>(0.0, blen, 0.0));
+        let pa = p - a;
+        let ba = b - a;
+        let baba = dot(ba, ba);
+        let h = select(0.0, clamp(dot(pa, ba) / max(baba, 1e-8), 0.0, 1.0), baba > 1e-8);
+        let d_cap = length(pa - ba * h) - q16_to_f32(j.q2.w);
+        if (i == 0u) {
+            d_acc = d_cap;
+            best_mat = j.q3.y;
+        } else {
+            let sm = smin_poly(d_acc, d_cap, max(q16_to_f32(j.q3.x), 0.0));
+            if (d_cap < d_acc) { best_mat = j.q3.y; }
+            d_acc = sm;
+        }
+    }
+    return vec2<f32>(d_acc, f32(best_mat));
+}
+
+fn brick_voxel(b : Cell64, x : u32, y : u32, z : u32, step_f : f32) -> f32 {
+    let idx16 = y * 4u + x;
+    let wi = z * 2u + (idx16 >> 3u);
+    var word : u32 = 0u;
+    switch (wi) {
+        case 0u: { word = b.q1.z; }
+        case 1u: { word = b.q1.w; }
+        case 2u: { word = b.q2.x; }
+        case 3u: { word = b.q2.y; }
+        case 4u: { word = b.q2.z; }
+        case 5u: { word = b.q2.w; }
+        case 6u: { word = b.q3.x; }
+        default: { word = b.q3.y; }
+    }
+    let nib = i32((word >> ((idx16 & 7u) * 4u)) & 0xFu) - 8;
+    return (f32(nib) * step_f) * 0.25;
+}
+
+fn sample_brick_sdf(b : Cell64, p : vec3<f32>) -> f32 {
+    let step_f = q16_to_f32(b.q1.y);
+    if (step_f <= 0.00390625) { return 1e5; }
+    let orig = vec3<f32>(q16_to_f32(b.q0.z), q16_to_f32(b.q0.w), q16_to_f32(b.q1.x));
+    let span = 3.0 * step_f;
+    let q = clamp(p, orig, orig + vec3<f32>(span));
+    let out_d = length(p - q);
+    let u = clamp((q - orig) / step_f, vec3<f32>(0.0), vec3<f32>(2.9999));
+    let i0 = vec3<u32>(u32(floor(u.x)), u32(floor(u.y)), u32(floor(u.z)));
+    let f = u - vec3<f32>(f32(i0.x), f32(i0.y), f32(i0.z));
+
+    let c000 = brick_voxel(b, i0.x,      i0.y,      i0.z,      step_f);
+    let c100 = brick_voxel(b, i0.x + 1u, i0.y,      i0.z,      step_f);
+    let c010 = brick_voxel(b, i0.x,      i0.y + 1u, i0.z,      step_f);
+    let c110 = brick_voxel(b, i0.x + 1u, i0.y + 1u, i0.z,      step_f);
+    let c001 = brick_voxel(b, i0.x,      i0.y,      i0.z + 1u, step_f);
+    let c101 = brick_voxel(b, i0.x + 1u, i0.y,      i0.z + 1u, step_f);
+    let c011 = brick_voxel(b, i0.x,      i0.y + 1u, i0.z + 1u, step_f);
+    let c111 = brick_voxel(b, i0.x + 1u, i0.y + 1u, i0.z + 1u, step_f);
+
+    let c00 = mix(c000, c100, f.x);
+    let c10 = mix(c010, c110, f.x);
+    let c01 = mix(c001, c101, f.x);
+    let c11 = mix(c011, c111, f.x);
+    let c0  = mix(c00, c10, f.y);
+    let c1  = mix(c01, c11, f.y);
+    return mix(c0, c1, f.z) + out_d;
+}
+
+fn eval_bricks_sdf(p : vec3<f32>, brick_cnt : u32) -> vec2<f32> {
+    let n = min(brick_cnt, 8u);
+    var best : f32 = 1e5;
+    var mat : u32 = 0u;
+    for (var i : u32 = 0u; i < n; i = i + 1u) {
+        let b = arena[144u + i];
+        let d = sample_brick_sdf(b, p);
+        if (d < best) {
+            best = d;
+            mat = b.q0.y;
+        }
+    }
+    return vec2<f32>(best, f32(mat));
+}
+
+fn ud_triangle(p : vec3<f32>, a : vec3<f32>, b : vec3<f32>, c : vec3<f32>) -> f32 {
+    let ba = b - a; let pa = p - a;
+    let cb = c - b; let pb = p - b;
+    let ac = a - c; let pc = p - c;
+    let nor = cross(ba, ac);
+
+    let sign_sum = sign(dot(cross(ba, nor), pa)) +
+                   sign(dot(cross(cb, nor), pb)) +
+                   sign(dot(cross(ac, nor), pc));
+    if (sign_sum < 2.0) {
+        let d0 = ba * clamp(dot(ba, pa) / max(dot(ba, ba), 1e-10), 0.0, 1.0) - pa;
+        let d1 = cb * clamp(dot(cb, pb) / max(dot(cb, cb), 1e-10), 0.0, 1.0) - pb;
+        let d2 = ac * clamp(dot(ac, pc) / max(dot(ac, ac), 1e-10), 0.0, 1.0) - pc;
+        return sqrt(min(dot(d0, d0), min(dot(d1, d1), dot(d2, d2))));
+    }
+    let ndot = dot(nor, pa);
+    return abs(ndot) / max(length(nor), 1e-6);
+}
+
+fn aabb_lb(nd : Cell64, p : vec3<f32>) -> f32 {
+    let mn = vec3<f32>(q16_to_f32(nd.q1.x), q16_to_f32(nd.q1.y), q16_to_f32(nd.q1.z));
+    let mx = vec3<f32>(q16_to_f32(nd.q1.w), q16_to_f32(nd.q2.x), q16_to_f32(nd.q2.y));
+    let q = max(mn - p, p - mx);
+    let out_d = length(max(q, vec3<f32>(0.0)));
+    let in_d = min(max(q.x, max(q.y, q.z)), 0.0);
+    return out_d + in_d - 0.002;
+}
+
+fn ray_pos_x_tri(tr : Cell64, px : f32, ry : f32, rz : f32) -> bool {
+    let v0 = vec3<f32>(q16_to_f32(tr.q0.z), q16_to_f32(tr.q0.w), q16_to_f32(tr.q1.x));
+    let v1 = vec3<f32>(q16_to_f32(tr.q1.y), q16_to_f32(tr.q1.z), q16_to_f32(tr.q1.w));
+    let v2 = vec3<f32>(q16_to_f32(tr.q2.x), q16_to_f32(tr.q2.y), q16_to_f32(tr.q2.z));
+    let e1 = v1 - v0;
+    let e2 = v2 - v0;
+    let ty = ry - v0.y;
+    let tz = rz - v0.z;
+    let det = -e1.y * e2.z + e1.z * e2.y;
+    if (abs(det) < 1e-9) { return false; }
+    let inv_det = 1.0 / det;
+    let u = (-ty * e2.z + tz * e2.y) * inv_det;
+    let v = ( ty * e1.z - tz * e1.y) * inv_det;
+    if (u < 0.0 || v < 0.0 || (u + v) > 1.0) { return false; }
+    let x_hit = v0.x + u * e1.x + v * e2.x;
+    return x_hit > px;
+}
+
+fn eval_mesh_bvh_sdf(p : vec3<f32>, tri_cnt : u32, bvh_cnt : u32, solid_mode : bool) -> f32 {
+    if (tri_cnt == 0u || bvh_cnt == 0u) { return 1e5; }
+    let tcnt = min(tri_cnt, 256u);
+    let ncnt = min(bvh_cnt, 256u);
+
+    var stack : array<u32, 48>;
+    var sp : u32 = 0u;
+    stack[0] = 0u;
+    sp = 1u;
+    var best_ud : f32 = 1e5;
+    var shell : f32 = 0.0;
+    var visited : u32 = 0u;
+
+    for (var it : u32 = 0u; it < 280u; it = it + 1u) {
+        if (sp == 0u || visited >= (ncnt * 2u)) { break; }
+        sp = sp - 1u;
+        let nid = stack[sp];
+        if (nid >= ncnt) { continue; }
+        visited = visited + 1u;
+        let nd = mesh_buf[256u + nid];
+        if (aabb_lb(nd, p) >= best_ud) { continue; }
+        if (nd.q0.w != 0u) {
+            let first = nd.q0.y;
+            let cnt = nd.q0.z;
+            for (var k : u32 = 0u; k < cnt; k = k + 1u) {
+                let ti = first + k;
+                if (ti >= tcnt) { break; }
+                let tr = mesh_buf[ti];
+                let v0 = vec3<f32>(q16_to_f32(tr.q0.z), q16_to_f32(tr.q0.w), q16_to_f32(tr.q1.x));
+                let v1 = vec3<f32>(q16_to_f32(tr.q1.y), q16_to_f32(tr.q1.z), q16_to_f32(tr.q1.w));
+                let v2 = vec3<f32>(q16_to_f32(tr.q2.x), q16_to_f32(tr.q2.y), q16_to_f32(tr.q2.z));
+                let ud = ud_triangle(p, v0, v1, v2);
+                if (ud < best_ud) {
+                    best_ud = ud;
+                    shell = f32((tr.q0.y >> 16u) & 0xFFFFu) * (1.0 / 4096.0);
+                }
+            }
+        } else {
+            let l = nd.q0.y;
+            let r = nd.q0.z;
+            let dl = select(best_ud, aabb_lb(mesh_buf[256u + l], p), l > nid && l < ncnt);
+            let dr = select(best_ud, aabb_lb(mesh_buf[256u + r], p), r > nid && r < ncnt);
+            if (dl < dr) {
+                if (dr < best_ud && sp < 48u) { stack[sp] = r; sp = sp + 1u; }
+                if (dl < best_ud && sp < 48u) { stack[sp] = l; sp = sp + 1u; }
+            } else {
+                if (dl < best_ud && sp < 48u) { stack[sp] = l; sp = sp + 1u; }
+                if (dr < best_ud && sp < 48u) { stack[sp] = r; sp = sp + 1u; }
+            }
+        }
+    }
+
+    var res = best_ud;
+    let root = mesh_buf[256u];
+    let rmn = vec3<f32>(q16_to_f32(root.q1.x), q16_to_f32(root.q1.y), q16_to_f32(root.q1.z));
+    let rmx = vec3<f32>(q16_to_f32(root.q1.w), q16_to_f32(root.q2.x), q16_to_f32(root.q2.y));
+    if (solid_mode && p.x >= rmn.x && p.x <= rmx.x && p.y >= rmn.y && p.y <= rmx.y && p.z >= rmn.z && p.z <= rmx.z) {
+        let ry = p.y + (3.0 / 65536.0);
+        let rz = p.z + (5.0 / 65536.0);
+        var parity : u32 = 0u;
+        var rstack : array<u32, 48>;
+        var rsp : u32 = 1u;
+        rstack[0] = 0u;
+        var rvis : u32 = 0u;
+        for (var it : u32 = 0u; it < 280u; it = it + 1u) {
+            if (rsp == 0u || rvis >= (ncnt * 2u)) { break; }
+            rsp = rsp - 1u;
+            let nid = rstack[rsp];
+            if (nid >= ncnt) { continue; }
+            rvis = rvis + 1u;
+            let nd = mesh_buf[256u + nid];
+            let mn = vec3<f32>(q16_to_f32(nd.q1.x), q16_to_f32(nd.q1.y), q16_to_f32(nd.q1.z));
+            let mx = vec3<f32>(q16_to_f32(nd.q1.w), q16_to_f32(nd.q2.x), q16_to_f32(nd.q2.y));
+            if (p.x > mx.x || ry < mn.y || ry > mx.y || rz < mn.z || rz > mx.z) { continue; }
+            if (nd.q0.w != 0u) {
+                let first = nd.q0.y;
+                let cnt = nd.q0.z;
+                for (var k : u32 = 0u; k < cnt; k = k + 1u) {
+                    let ti = first + k;
+                    if (ti >= tcnt) { break; }
+                    if (ray_pos_x_tri(mesh_buf[ti], p.x, ry, rz)) {
+                        parity = parity ^ 1u;
+                    }
+                }
+            } else {
+                let l = nd.q0.y;
+                let r = nd.q0.z;
+                if (r > nid && r < ncnt && rsp < 48u) { rstack[rsp] = r; rsp = rsp + 1u; }
+                if (l > nid && l < ncnt && rsp < 48u) { rstack[rsp] = l; rsp = rsp + 1u; }
+            }
+        }
+        if (parity != 0u) {
+            res = -best_ud;
+        }
+    }
+    return res - shell;
+}
+
 fn eval_prefab_sdf(pf : Cell64, lp : vec3<f32>, param_delta : f32) -> f32 {
+    let csg_cnt = pf.q3.x;
+    if (csg_cnt > 0u) {
+        let csg_start = pf.q2.w;
+        if (csg_start + csg_cnt <= 32u) {
+            return eval_csg_program(csg_start, csg_cnt, lp).x;
+        }
+    }
     let mask = pf.q0.w;
     let prim1 = mask & 0xFu;
     let prim2 = (mask >> 4u) & 0xFu;
@@ -180,49 +493,103 @@ fn eval_prefab_sdf(pf : Cell64, lp : vec3<f32>, param_delta : f32) -> f32 {
     return min(d1, d2);
 }
 
+fn get_sec_normal() -> vec3<f32> {
+    let sec = arena[254];
+    let n = vec3<f32>(q16_to_f32(sec.q1.x), q16_to_f32(sec.q1.y), q16_to_f32(sec.q1.z));
+    return safe_norm3(n, vec3<f32>(1.0, 0.0, 0.0));
+}
+
+fn eval_section_clip_val(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> f32 {
+    let sec = arena[254];
+    let smode = sec.q0.x;
+    if (smode != 0u) {
+        let sn = get_sec_normal();
+        let sdist = q16_to_f32(sec.q1.w);
+        let ndotp = dot(sn, p);
+        if (smode == 2u) {
+            let slab_h = max(q16_to_f32(sec.q2.x), 0.015625);
+            return abs(ndotp - sdist) - slab_h;
+        }
+        if (smode == 3u) {
+            let wedge = max(ndotp - sdist, p.z);
+            return -wedge;
+        }
+        return sdist - ndotp;
+    }
+    if (xray_on) {
+        return xray_plane - p.x;
+    }
+    return -1e5;
+}
+
 struct SceneHit {
-    dist      : f32,
-    inst_id   : u32,
-    inst_slot : u32,
-    mat_id    : u32,
-    style_id  : u32,
-    is_cut    : bool,
-    raw_d     : f32,
+    dist         : f32,
+    inst_id      : u32,
+    inst_slot    : u32,
+    mat_id       : u32,
+    style_id     : u32,
+    is_cut       : bool,
+    raw_d        : f32,
+    second_raw_d : f32,
+    local_p      : vec3<f32>,
 };
 
-fn map_scene_dist(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> f32 {
+fn map_scene_raw_best(p : vec3<f32>) -> f32 {
     let inst_cnt = min(arena[0].q1.z, 32u);
+    let sec = arena[254];
     var best_d : f32 = 1e5;
+
     for (var i : u32 = 0u; i < inst_cnt; i = i + 1u) {
         let inst = arena[40u + i];
         let flags = (inst.q3.x >> 16u) & 0xFFFFu;
         if ((flags & 1u) == 0u) { continue; }
         let pid = inst.q0.y;
         if (pid == 0u || pid > 16u) { continue; }
-
         let pos = vec3<f32>(q16_to_f32(inst.q1.x), q16_to_f32(inst.q1.y), q16_to_f32(inst.q1.z));
+        let rot = vec3<f32>(q16_to_f32(inst.q1.w), q16_to_f32(inst.q2.x), q16_to_f32(inst.q2.y));
         let raw_sc = q16_to_f32(inst.q2.z);
         let sc = select(1.0, clamp(raw_sc, 0.0625, 256.0), raw_sc > 0.0625);
         let p_ovr = q16_to_f32(inst.q3.z);
-
         let pf = arena[24u + (pid - 1u)];
         let bound_r = q16_to_f32(pf.q1.x) * sc + 0.5;
         let rel = p - pos;
-        if (length(rel) - bound_r >= best_d) { continue; }
+        if (bound_r > 0.51 && length(rel) - bound_r >= best_d) { continue; }
+        let lp = rot_inv_euler(rel, rot) / sc;
+        let d = eval_prefab_sdf(pf, lp, p_ovr) * sc;
+        if (d < best_d) { best_d = d; }
+    }
 
-        var d = eval_prefab_sdf(pf, rel / sc, p_ovr) * sc;
-        if (xray_on) {
-            d = max(d, xray_plane - p.x);
+    let gcsg_cnt = (sec.q3.x >> 16u) & 0xFFFFu;
+    if (gcsg_cnt > 0u) {
+        let gcsg_start = sec.q3.x & 0xFFFFu;
+        if (gcsg_start + gcsg_cnt <= 32u) {
+            best_d = min(best_d, eval_csg_program(gcsg_start, gcsg_cnt, p).x);
         }
-        if (d < best_d) {
-            best_d = d;
-        }
+    }
+    let jcnt = sec.q0.z & 0xFFFFu;
+    if (jcnt > 0u) { best_d = min(best_d, eval_skeleton_sdf(p, jcnt).x); }
+    let bcnt = (sec.q0.z >> 16u) & 0xFFFFu;
+    if (bcnt > 0u) { best_d = min(best_d, eval_bricks_sdf(p, bcnt).x); }
+    let tri_cnt = sec.q0.w & 0xFFFFu;
+    let mbvh_cnt = (sec.q0.w >> 16u) & 0xFFFFu;
+    if (tri_cnt > 0u && mbvh_cnt > 0u) {
+        let solid_m = (sec.q0.y & 16u) != 0u;
+        best_d = min(best_d, eval_mesh_bvh_sdf(p, tri_cnt, mbvh_cnt, solid_m));
     }
     return best_d;
 }
 
+fn map_scene_dist(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> f32 {
+    let raw_d = map_scene_raw_best(p);
+    let clip_v = eval_section_clip_val(p, xray_on, xray_plane);
+    return max(raw_d, clip_v);
+}
+
 fn map_scene_full(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> SceneHit {
     let inst_cnt = min(arena[0].q1.z, 32u);
+    let sec = arena[254];
+    let clip_v = eval_section_clip_val(p, xray_on, xray_plane);
+
     var out : SceneHit;
     out.dist = 1e5;
     out.inst_id = 0u;
@@ -231,6 +598,11 @@ fn map_scene_full(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> SceneHit {
     out.style_id = 1u;
     out.is_cut = false;
     out.raw_d = 1e5;
+    out.second_raw_d = 1e5;
+    out.local_p = p;
+
+    var best_raw : f32 = 1e5;
+    var sec_raw  : f32 = 1e5;
 
     for (var i : u32 = 0u; i < inst_cnt; i = i + 1u) {
         let inst = arena[40u + i];
@@ -240,6 +612,7 @@ fn map_scene_full(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> SceneHit {
         if (pid == 0u || pid > 16u) { continue; }
 
         let pos = vec3<f32>(q16_to_f32(inst.q1.x), q16_to_f32(inst.q1.y), q16_to_f32(inst.q1.z));
+        let rot = vec3<f32>(q16_to_f32(inst.q1.w), q16_to_f32(inst.q2.x), q16_to_f32(inst.q2.y));
         let raw_sc = q16_to_f32(inst.q2.z);
         let sc = select(1.0, clamp(raw_sc, 0.0625, 256.0), raw_sc > 0.0625);
         let p_ovr = q16_to_f32(inst.q3.z);
@@ -247,18 +620,19 @@ fn map_scene_full(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> SceneHit {
         let pf = arena[24u + (pid - 1u)];
         let bound_r = q16_to_f32(pf.q1.x) * sc + 0.5;
         let rel = p - pos;
-        if (length(rel) - bound_r >= out.dist) { continue; }
+        if (bound_r > 0.51 && length(rel) - bound_r >= out.dist && sec_raw < 10.0) { continue; }
 
-        let raw_d = eval_prefab_sdf(pf, rel / sc, p_ovr) * sc;
-        var d = raw_d;
-        var cut_face = false;
-        if (xray_on) {
-            let clip_d = xray_plane - p.x;
-            if (clip_d > d) {
-                d = clip_d;
-                cut_face = true;
-            }
+        let lp = rot_inv_euler(rel, rot) / sc;
+        let raw_d = eval_prefab_sdf(pf, lp, p_ovr) * sc;
+        if (raw_d < best_raw) {
+            sec_raw = best_raw;
+            best_raw = raw_d;
+        } else if (raw_d < sec_raw) {
+            sec_raw = raw_d;
         }
+
+        let cut_face = clip_v > raw_d;
+        let d = max(raw_d, clip_v);
         if (d < out.dist) {
             out.dist = d;
             out.inst_id = select(i + 1u, inst.q0.x, inst.q0.x != 0u);
@@ -271,8 +645,89 @@ fn map_scene_full(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> SceneHit {
             out.style_id = select(pf_sty, sty_ovr, is_ovr && sty_ovr >= 1u && sty_ovr <= 8u);
             out.is_cut = cut_face;
             out.raw_d = raw_d;
+            out.local_p = lp;
         }
     }
+
+    let gcsg_cnt = (sec.q3.x >> 16u) & 0xFFFFu;
+    if (gcsg_cnt > 0u) {
+        let gcsg_start = sec.q3.x & 0xFFFFu;
+        if (gcsg_start + gcsg_cnt <= 32u) {
+            let res = eval_csg_program(gcsg_start, gcsg_cnt, p);
+            let raw_d = res.x;
+            if (raw_d < best_raw) { sec_raw = best_raw; best_raw = raw_d; }
+            else if (raw_d < sec_raw) { sec_raw = raw_d; }
+            let d = max(raw_d, clip_v);
+            if (d < out.dist) {
+                out.dist = d;
+                out.inst_id = 99u;
+                out.mat_id = u32(res.y) & 7u;
+                out.style_id = clamp(out.mat_id + 1u, 1u, 8u);
+                out.is_cut = clip_v > raw_d;
+                out.raw_d = raw_d;
+                out.local_p = p;
+            }
+        }
+    }
+
+    let jcnt = sec.q0.z & 0xFFFFu;
+    if (jcnt > 0u) {
+        let res = eval_skeleton_sdf(p, jcnt);
+        let raw_d = res.x;
+        if (raw_d < best_raw) { sec_raw = best_raw; best_raw = raw_d; }
+        else if (raw_d < sec_raw) { sec_raw = raw_d; }
+        let d = max(raw_d, clip_v);
+        if (d < out.dist) {
+            out.dist = d;
+            out.inst_id = 100u;
+            out.mat_id = u32(res.y) & 7u;
+            out.style_id = clamp(out.mat_id + 1u, 1u, 8u);
+            out.is_cut = clip_v > raw_d;
+            out.raw_d = raw_d;
+            out.local_p = p;
+        }
+    }
+
+    let bcnt = (sec.q0.z >> 16u) & 0xFFFFu;
+    if (bcnt > 0u) {
+        let res = eval_bricks_sdf(p, bcnt);
+        let raw_d = res.x;
+        if (raw_d < best_raw) { sec_raw = best_raw; best_raw = raw_d; }
+        else if (raw_d < sec_raw) { sec_raw = raw_d; }
+        let d = max(raw_d, clip_v);
+        if (d < out.dist) {
+            out.dist = d;
+            out.inst_id = 101u;
+            out.mat_id = u32(res.y) & 7u;
+            out.style_id = clamp(out.mat_id + 1u, 1u, 8u);
+            out.is_cut = clip_v > raw_d;
+            out.raw_d = raw_d;
+            out.local_p = p;
+        }
+    }
+
+    let tri_cnt = sec.q0.w & 0xFFFFu;
+    let mbvh_cnt = (sec.q0.w >> 16u) & 0xFFFFu;
+    if (tri_cnt > 0u && mbvh_cnt > 0u) {
+        let solid_m = (sec.q0.y & 16u) != 0u;
+        let raw_d = eval_mesh_bvh_sdf(p, tri_cnt, mbvh_cnt, solid_m);
+        if (raw_d < best_raw) { sec_raw = best_raw; best_raw = raw_d; }
+        else if (raw_d < sec_raw) { sec_raw = raw_d; }
+        let d = max(raw_d, clip_v);
+        if (d < out.dist) {
+            out.dist = d;
+            out.inst_id = 102u;
+            let mms = sec.q3.y;
+            out.mat_id = mms & 7u;
+            let st_m = (mms >> 16u) & 0xFFu;
+            out.style_id = select(clamp(out.mat_id + 1u, 1u, 8u), clamp(st_m, 1u, 8u), st_m >= 1u && st_m <= 8u);
+            out.is_cut = clip_v > raw_d;
+            out.raw_d = raw_d;
+            out.local_p = p;
+        }
+    }
+
+    out.second_raw_d = sec_raw;
     return out;
 }
 
@@ -436,6 +891,404 @@ fn shade_direct_hit(
     return col;
 }
 
+fn eval_triplanar_grain(lp : vec3<f32>, ln : vec3<f32>, freq : f32, metallic : f32, wire_w : f32) -> vec3<f32> {
+    let w = abs(ln) / max(abs(ln.x) + abs(ln.y) + abs(ln.z), 1e-4);
+    let f = clamp(freq, 2.0, 28.0);
+    // Anisotropic brushed metal / micro-ceramic directional grain + 3D TPMS gyroid lattice
+    let brush_x = sin(lp.y * 42.0 * f + sin(lp.z * 7.0) * 1.5);
+    let brush_y = sin(lp.x * 42.0 * f + sin(lp.z * 7.0) * 1.5);
+    let brush_z = sin(lp.x * 42.0 * f + sin(lp.y * 7.0) * 1.5);
+    let tri_brush = w.x * brush_x + w.y * brush_y + w.z * brush_z;
+
+    let gxy = sin(lp.x * 9.0 + lp.y * 9.0) * sin(lp.x * 9.0 - lp.y * 9.0);
+    let gyroid = sin(lp.x * 16.0) * cos(lp.y * 16.0) +
+                 sin(lp.y * 16.0) * cos(lp.z * 16.0) +
+                 sin(lp.z * 16.0) * cos(lp.x * 16.0);
+    let lattice = (1.0 - smoothstep(0.0, 0.22, abs(gyroid))) * wire_w;
+    let rough_mod = mix(gxy * 0.04, tri_brush * 0.06, metallic);
+    return vec3<f32>(rough_mod, tri_brush, lattice);
+}
+
+fn eval_raw_grad(p : vec3<f32>) -> vec3<f32> {
+    let e = 0.004;
+    let gx = map_scene_raw_best(p + vec3<f32>(e, 0.0, 0.0)) - map_scene_raw_best(p - vec3<f32>(e, 0.0, 0.0));
+    let gy = map_scene_raw_best(p + vec3<f32>(0.0, e, 0.0)) - map_scene_raw_best(p - vec3<f32>(0.0, e, 0.0));
+    let gz = map_scene_raw_best(p + vec3<f32>(0.0, 0.0, e)) - map_scene_raw_best(p - vec3<f32>(0.0, 0.0, e));
+    return safe_norm3(vec3<f32>(gx, gy, gz), vec3<f32>(0.0, 1.0, 0.0));
+}
+
+struct DiffJet2 {
+    H     : f32,
+    K     : f32,
+    aniso : f32,
+    e1    : vec3<f32>,
+};
+
+fn eval_diff_jet2(p : vec3<f32>, n : vec3<f32>) -> DiffJet2 {
+    let e = 0.04;
+    let inv_e2 = 625.0;
+    let inv_4e2 = 156.25;
+
+    let f0   = map_scene_raw_best(p);
+    let f_px = map_scene_raw_best(p + vec3<f32>( e, 0.0, 0.0));
+    let f_mx = map_scene_raw_best(p + vec3<f32>(-e, 0.0, 0.0));
+    let f_py = map_scene_raw_best(p + vec3<f32>(0.0,  e, 0.0));
+    let f_my = map_scene_raw_best(p + vec3<f32>(0.0, -e, 0.0));
+    let f_pz = map_scene_raw_best(p + vec3<f32>(0.0, 0.0,  e));
+    let f_mz = map_scene_raw_best(p + vec3<f32>(0.0, 0.0, -e));
+
+    let f_pp0 = map_scene_raw_best(p + vec3<f32>( e,  e, 0.0));
+    let f_pm0 = map_scene_raw_best(p + vec3<f32>( e, -e, 0.0));
+    let f_mp0 = map_scene_raw_best(p + vec3<f32>(-e,  e, 0.0));
+    let f_mm0 = map_scene_raw_best(p + vec3<f32>(-e, -e, 0.0));
+
+    let f_0pp = map_scene_raw_best(p + vec3<f32>(0.0,  e,  e));
+    let f_0pm = map_scene_raw_best(p + vec3<f32>(0.0,  e, -e));
+    let f_0mp = map_scene_raw_best(p + vec3<f32>(0.0, -e,  e));
+    let f_0mm = map_scene_raw_best(p + vec3<f32>(0.0, -e, -e));
+
+    let f_p0p = map_scene_raw_best(p + vec3<f32>( e, 0.0,  e));
+    let f_p0m = map_scene_raw_best(p + vec3<f32>( e, 0.0, -e));
+    let f_m0p = map_scene_raw_best(p + vec3<f32>(-e, 0.0,  e));
+    let f_m0m = map_scene_raw_best(p + vec3<f32>(-e, 0.0, -e));
+
+    let hxx = clamp((f_px - 2.0 * f0 + f_mx) * inv_e2, -64.0, 64.0);
+    let hyy = clamp((f_py - 2.0 * f0 + f_my) * inv_e2, -64.0, 64.0);
+    let hzz = clamp((f_pz - 2.0 * f0 + f_mz) * inv_e2, -64.0, 64.0);
+    let hxy = clamp(((f_pp0 - f_pm0) - (f_mp0 - f_mm0)) * inv_4e2, -64.0, 64.0);
+    let hyz = clamp(((f_0pp - f_0pm) - (f_0mp - f_0mm)) * inv_4e2, -64.0, 64.0);
+    let hxz = clamp(((f_p0p - f_p0m) - (f_m0p - f_m0m)) * inv_4e2, -64.0, 64.0);
+
+    let r0 = vec3<f32>(hxx, hxy, hxz);
+    let r1 = vec3<f32>(hxy, hyy, hyz);
+    let r2 = vec3<f32>(hxz, hyz, hzz);
+
+    let up_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.80);
+    let t1 = safe_norm3(cross(up_ref, n), vec3<f32>(1.0, 0.0, 0.0));
+    let t2 = safe_norm3(cross(n, t1), vec3<f32>(0.0, 0.0, 1.0));
+
+    let ht1 = vec3<f32>(dot(r0, t1), dot(r1, t1), dot(r2, t1));
+    let ht2 = vec3<f32>(dot(r0, t2), dot(r1, t2), dot(r2, t2));
+    let s11 = dot(t1, ht1);
+    let s22 = dot(t2, ht2);
+    let s12 = dot(t1, ht2);
+
+    let diff_s = s11 - s22;
+    let aniso = length(vec2<f32>(diff_s, 2.0 * s12));
+    var b = vec2<f32>(1.0, 0.0);
+    if (aniso > 1e-3) {
+        if (diff_s >= 0.0) {
+            b = vec2<f32>(diff_s + aniso, 2.0 * s12);
+        } else {
+            b = vec2<f32>(2.0 * s12, aniso - diff_s);
+        }
+    }
+    let e1 = safe_norm3(t1 * b.x + t2 * b.y, t1);
+    return DiffJet2(0.5 * (s11 + s22), s11 * s22 - s12 * s12, aniso, e1);
+}
+
+// ----------------------------------------------------------------------------
+// 2b. Zero-Noise 3-Pass 3D Radiance Cascades Global Illumination
+//     C2 [0..4095]:     8x4x8 probes x 16 oct dirs  -> [1.15m, 4.80m]
+//     C1 [4096..20479]: 16x8x16 probes x 8 oct dirs -> [0.28m, 1.15m] + C2
+//     C0 [20480..32767]:16x8x16 probes x 6 lobes    -> [0.04m, 0.28m] + C1
+// ----------------------------------------------------------------------------
+
+fn rc_half_ext() -> vec3<f32> {
+    return vec3<f32>(4.0, 2.5, 4.0);
+}
+
+fn rc_cage_center() -> vec3<f32> {
+    let cam = arena[1];
+    return vec3<f32>(q16_to_f32(cam.q0.w), q16_to_f32(cam.q1.x), q16_to_f32(cam.q1.y));
+}
+
+fn oct_decode(uv : vec2<f32>) -> vec3<f32> {
+    var n = vec3<f32>(uv.x, uv.y, 1.0 - abs(uv.x) - abs(uv.y));
+    if (n.z < 0.0) {
+        let sx = select(-1.0, 1.0, uv.x >= 0.0);
+        let sy = select(-1.0, 1.0, uv.y >= 0.0);
+        n.x = (1.0 - abs(uv.y)) * sx;
+        n.y = (1.0 - abs(uv.x)) * sy;
+    }
+    return safe_norm3(n, vec3<f32>(0.0, 1.0, 0.0));
+}
+
+fn oct_encode(n : vec3<f32>) -> vec2<f32> {
+    let l1 = abs(n.x) + abs(n.y) + abs(n.z);
+    var p = n.xy / max(l1, 1e-6);
+    if (n.z < 0.0) {
+        let sx = select(-1.0, 1.0, p.x >= 0.0);
+        let sy = select(-1.0, 1.0, p.y >= 0.0);
+        p = vec2<f32>((1.0 - abs(p.y)) * sx, (1.0 - abs(p.x)) * sy);
+    }
+    return clamp(p * 0.5 + vec2<f32>(0.5), vec2<f32>(0.0), vec2<f32>(0.9999));
+}
+
+fn rc_probe_pos(px : u32, py : u32, pz : u32, dims : vec3<f32>) -> vec3<f32> {
+    let uvw = ((vec3<f32>(f32(px), f32(py), f32(pz)) + 0.5) / dims) * 2.0 - vec3<f32>(1.0);
+    return rc_cage_center() + uvw * rc_half_ext();
+}
+
+fn eval_rc_hit_radiance(
+    p : vec3<f32>,
+    xray_on : bool,
+    xray_plane : f32,
+    time_s : f32
+) -> vec4<f32> {
+    let hit = map_scene_full(p, xray_on, xray_plane);
+    let n = calc_normal(p, xray_on, xray_plane);
+    let m_cell = arena[8u + (hit.mat_id & 7u)];
+    let s_cell = arena[16u + (clamp(hit.style_id, 1u, 8u) - 1u)];
+    let inst_k = arena[40u + (hit.inst_slot & 31u)].q2.w;
+
+    let eta    = clamp(q16_to_f32(m_cell.q0.y), 1.0, 4.0);
+    let kappa  = clamp(q16_to_f32(m_cell.q0.z), 0.0, 8.0);
+    let kelvin = max(m_cell.q3.x, inst_k);
+    let base_tint = unpack_rgb24(s_cell.q0.y);
+    let metallic  = clamp(max(q16_to_f32(s_cell.q1.x), clamp((kappa - 0.35) * 0.5, 0.0, 1.0)), 0.0, 1.0);
+
+    let key_dir = vec3<f32>(-0.5145, 0.7503, -0.4150);
+    let ndl = clamp(dot(n, key_dir), 0.0, 1.0);
+    let sh = calc_soft_shadow(p + n * 0.025, key_dir, 8.0, xray_on, xray_plane);
+    var rad = base_tint * (0.04 + 0.52 * ndl * sh) * (1.0 - 0.55 * metallic);
+
+    if (kelvin > 650u) {
+        let ex = clamp(f32(kelvin - 650u) * 0.001, 0.0, 2.5);
+        let pulse = select(1.0, 0.90 + 0.10 * cos(time_s * 6.0), time_s > 0.0);
+        rad = rad + vec3<f32>(ex * 5.2, ex * ex * 2.4, max(0.0, ex - 0.42) * 1.4) * pulse;
+    }
+    let is_trans = (eta > 1.02) && (kappa < 0.05) && (metallic < 0.35) && (hit.mat_id != 6u) && (kelvin <= 650u);
+    let beta = select(0.0, 0.28, is_trans);
+    return vec4<f32>(rad, beta);
+}
+
+fn trace_rc_interval(
+    ro : vec3<f32>,
+    rd : vec3<f32>,
+    t0 : f32,
+    t1 : f32,
+    steps : u32,
+    xray_on : bool,
+    xray_plane : f32,
+    time_s : f32
+) -> vec4<f32> {
+    if (map_scene_dist(ro, xray_on, xray_plane) < -0.02) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    let min_step = max((t1 - t0) / f32(steps), 0.02);
+    var t = t0;
+    for (var i : u32 = 0u; i < steps; i = i + 1u) {
+        if (t > t1) { break; }
+        let p = ro + rd * t;
+        let d = map_scene_dist(p, xray_on, xray_plane);
+        if (d < 0.02) {
+            return eval_rc_hit_radiance(p, xray_on, xray_plane, time_s);
+        }
+        t = t + max(d, min_step);
+    }
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+}
+
+fn sample_rc2_trilinear(pos : vec3<f32>, dir : vec3<f32>) -> vec4<f32> {
+    let dims = vec3<f32>(8.0, 4.0, 8.0);
+    let uvw = clamp(((pos - rc_cage_center()) / rc_half_ext()) * 0.5 + 0.5, vec3<f32>(0.0), vec3<f32>(0.9999));
+    let gc = clamp(uvw * dims - 0.5, vec3<f32>(0.0), dims - vec3<f32>(1.0001));
+    let i0 = vec3<u32>(u32(floor(gc.x)), u32(floor(gc.y)), u32(floor(gc.z)));
+    let i1 = min(i0 + vec3<u32>(1u), vec3<u32>(7u, 3u, 7u));
+    let f = fract(gc);
+
+    let ouv = oct_encode(dir);
+    let du = clamp(ouv.x * 4.0 - 0.5, 0.0, 2.9999);
+    let dv = clamp(ouv.y * 4.0 - 0.5, 0.0, 2.9999);
+    let ou0 = u32(floor(du)); let ou1 = min(ou0 + 1u, 3u); let fu = fract(du);
+    let ov0 = u32(floor(dv)); let ov1 = min(ov0 + 1u, 3u); let fv = fract(dv);
+
+    let d00 = ov0 * 4u + ou0;
+    let d10 = ov0 * 4u + ou1;
+    let d01 = ov1 * 4u + ou0;
+    let d11 = ov1 * 4u + ou1;
+
+    var acc = vec4<f32>(0.0);
+    for (var c : u32 = 0u; c < 8u; c = c + 1u) {
+        let px = select(i0.x, i1.x, (c & 1u) != 0u);
+        let py = select(i0.y, i1.y, (c & 2u) != 0u);
+        let pz = select(i0.z, i1.z, (c & 4u) != 0u);
+        let wx = select(1.0 - f.x, f.x, (c & 1u) != 0u);
+        let wy = select(1.0 - f.y, f.y, (c & 2u) != 0u);
+        let wz = select(1.0 - f.z, f.z, (c & 4u) != 0u);
+        let base = ((pz * 4u + py) * 8u + px) * 16u;
+        let a00 = rc_buf[base + d00];
+        let a10 = rc_buf[base + d10];
+        let a01 = rc_buf[base + d01];
+        let a11 = rc_buf[base + d11];
+        let dir_v = mix(mix(a00, a10, fu), mix(a01, a11, fu), fv);
+        acc = acc + dir_v * (wx * wy * wz);
+    }
+    return acc;
+}
+
+fn sample_rc1_trilinear(pos : vec3<f32>, dir : vec3<f32>) -> vec4<f32> {
+    let dims = vec3<f32>(16.0, 8.0, 16.0);
+    let uvw = clamp(((pos - rc_cage_center()) / rc_half_ext()) * 0.5 + 0.5, vec3<f32>(0.0), vec3<f32>(0.9999));
+    let gc = clamp(uvw * dims - 0.5, vec3<f32>(0.0), dims - vec3<f32>(1.0001));
+    let i0 = vec3<u32>(u32(floor(gc.x)), u32(floor(gc.y)), u32(floor(gc.z)));
+    let i1 = min(i0 + vec3<u32>(1u), vec3<u32>(15u, 7u, 15u));
+    let f = fract(gc);
+
+    let ouv = oct_encode(dir);
+    let du = clamp(ouv.x * 4.0 - 0.5, 0.0, 2.9999);
+    let dv = clamp(ouv.y * 2.0 - 0.5, 0.0, 0.9999);
+    let ou0 = u32(floor(du)); let ou1 = min(ou0 + 1u, 3u); let fu = fract(du);
+    let ov0 = u32(floor(dv)); let ov1 = min(ov0 + 1u, 1u); let fv = fract(dv);
+
+    let d00 = ov0 * 4u + ou0;
+    let d10 = ov0 * 4u + ou1;
+    let d01 = ov1 * 4u + ou0;
+    let d11 = ov1 * 4u + ou1;
+
+    var acc = vec4<f32>(0.0);
+    for (var c : u32 = 0u; c < 8u; c = c + 1u) {
+        let px = select(i0.x, i1.x, (c & 1u) != 0u);
+        let py = select(i0.y, i1.y, (c & 2u) != 0u);
+        let pz = select(i0.z, i1.z, (c & 4u) != 0u);
+        let wx = select(1.0 - f.x, f.x, (c & 1u) != 0u);
+        let wy = select(1.0 - f.y, f.y, (c & 2u) != 0u);
+        let wz = select(1.0 - f.z, f.z, (c & 4u) != 0u);
+        let base = 4096u + ((pz * 8u + py) * 16u + px) * 8u;
+        let a00 = rc_buf[base + d00];
+        let a10 = rc_buf[base + d10];
+        let a01 = rc_buf[base + d01];
+        let a11 = rc_buf[base + d11];
+        let dir_v = mix(mix(a00, a10, fu), mix(a01, a11, fu), fv);
+        acc = acc + dir_v * (wx * wy * wz);
+    }
+    return acc;
+}
+
+fn sample_rc0_irradiance(p : vec3<f32>, n : vec3<f32>) -> vec3<f32> {
+    let q = p + n * 0.045;
+    let dims = vec3<f32>(16.0, 8.0, 16.0);
+    let uvw = clamp(((q - rc_cage_center()) / rc_half_ext()) * 0.5 + 0.5, vec3<f32>(0.0), vec3<f32>(0.9999));
+    let gc = clamp(uvw * dims - 0.5, vec3<f32>(0.0), dims - vec3<f32>(1.0001));
+    let i0 = vec3<u32>(u32(floor(gc.x)), u32(floor(gc.y)), u32(floor(gc.z)));
+    let i1 = min(i0 + vec3<u32>(1u), vec3<u32>(15u, 7u, 15u));
+    let f = fract(gc);
+
+    let n2 = n * n;
+    let ix_lobe = select(1u, 0u, n.x >= 0.0);
+    let iy_lobe = select(3u, 2u, n.y >= 0.0);
+    let iz_lobe = select(5u, 4u, n.z >= 0.0);
+
+    var irr = vec3<f32>(0.0);
+    var w_sum : f32 = 0.0;
+    for (var c : u32 = 0u; c < 8u; c = c + 1u) {
+        let px = select(i0.x, i1.x, (c & 1u) != 0u);
+        let py = select(i0.y, i1.y, (c & 2u) != 0u);
+        let pz = select(i0.z, i1.z, (c & 4u) != 0u);
+        let wx = select(1.0 - f.x, f.x, (c & 1u) != 0u);
+        let wy = select(1.0 - f.y, f.y, (c & 2u) != 0u);
+        let wz = select(1.0 - f.z, f.z, (c & 4u) != 0u);
+        let base = 20480u + ((pz * 8u + py) * 16u + px) * 6u;
+        let lx = rc_buf[base + ix_lobe];
+        let ly = rc_buf[base + iy_lobe];
+        let lz = rc_buf[base + iz_lobe];
+        let probe_irr = lx.rgb * n2.x + ly.rgb * n2.y + lz.rgb * n2.z;
+        let w = (wx * wy * wz) * mix(0.05, 1.0, lx.a);
+        irr = irr + probe_irr * w;
+        w_sum = w_sum + w;
+    }
+    return irr / max(w_sum, 1e-4);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn bloom_rc_cascade2(@builtin(global_invocation_id) gid : vec3<u32>) {
+    if (gid.x == 0xFFFFFFFFu) { textureStore(out_tex, vec2<i32>(0, 0), vec4<f32>(0.0)); }
+    let tid = gid.y * 512u + gid.x;
+    if (tid >= 4096u) { return; }
+
+    let probe_idx = tid >> 4u;
+    let dir_idx   = tid & 15u;
+    let px = probe_idx & 7u;
+    let py = (probe_idx >> 3u) & 3u;
+    let pz = (probe_idx >> 5u) & 7u;
+    let pos = rc_probe_pos(px, py, pz, vec3<f32>(8.0, 4.0, 8.0));
+
+    let du = ((f32(dir_idx & 3u) + 0.5) / 4.0) * 2.0 - 1.0;
+    let dv = ((f32(dir_idx >> 2u) + 0.5) / 4.0) * 2.0 - 1.0;
+    let dir = oct_decode(vec2<f32>(du, dv));
+
+    let hdr_flags = arena[0].q3.z;
+    let xray_on   = (hdr_flags & 2u) != 0u;
+    let xray_p    = q16_to_f32(arena[0].q3.x);
+    let time_s    = f32(arena[0].q1.y) * 0.0166667;
+
+    let res = trace_rc_interval(pos, dir, 1.15, 4.80, 7u, xray_on, xray_p, time_s);
+    let sky = eval_sky_dome(dir) * 0.55;
+    rc_buf[tid] = vec4<f32>(res.rgb + res.a * sky, res.a);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn bloom_rc_cascade1(@builtin(global_invocation_id) gid : vec3<u32>) {
+    if (gid.x == 0xFFFFFFFFu) { textureStore(out_tex, vec2<i32>(0, 0), vec4<f32>(0.0)); }
+    let tid = gid.y * 512u + gid.x;
+    if (tid >= 16384u) { return; }
+
+    let probe_idx = tid >> 3u;
+    let dir_idx   = tid & 7u;
+    let px = probe_idx & 15u;
+    let py = (probe_idx >> 4u) & 7u;
+    let pz = (probe_idx >> 7u) & 15u;
+    let pos = rc_probe_pos(px, py, pz, vec3<f32>(16.0, 8.0, 16.0));
+
+    let du = ((f32(dir_idx & 3u) + 0.5) / 4.0) * 2.0 - 1.0;
+    let dv = ((f32(dir_idx >> 2u) + 0.5) / 2.0) * 2.0 - 1.0;
+    let dir = oct_decode(vec2<f32>(du, dv));
+
+    let hdr_flags = arena[0].q3.z;
+    let xray_on   = (hdr_flags & 2u) != 0u;
+    let xray_p    = q16_to_f32(arena[0].q3.x);
+    let time_s    = f32(arena[0].q1.y) * 0.0166667;
+
+    let near_v = trace_rc_interval(pos, dir, 0.28, 1.15, 7u, xray_on, xray_p, time_s);
+    let far_v  = sample_rc2_trilinear(pos, dir);
+    rc_buf[4096u + tid] = vec4<f32>(near_v.rgb + near_v.a * far_v.rgb, near_v.a * far_v.a);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn bloom_rc_cascade0(@builtin(global_invocation_id) gid : vec3<u32>) {
+    if (gid.x == 0xFFFFFFFFu) { textureStore(out_tex, vec2<i32>(0, 0), vec4<f32>(0.0)); }
+    let probe_idx = gid.y * 256u + gid.x;
+    if (probe_idx >= 2048u) { return; }
+
+    let px = probe_idx & 15u;
+    let py = (probe_idx >> 4u) & 7u;
+    let pz = (probe_idx >> 7u) & 15u;
+    let pos = rc_probe_pos(px, py, pz, vec3<f32>(16.0, 8.0, 16.0));
+
+    let hdr_flags = arena[0].q3.z;
+    let xray_on   = (hdr_flags & 2u) != 0u;
+    let xray_p    = q16_to_f32(arena[0].q3.x);
+    let time_s    = f32(arena[0].q1.y) * 0.0166667;
+    let valid     = select(0.0, 1.0, map_scene_dist(pos, xray_on, xray_p) >= -0.04);
+
+    let axes = array<vec3<f32>, 6>(
+        vec3<f32>( 1.0,  0.0,  0.0),
+        vec3<f32>(-1.0,  0.0,  0.0),
+        vec3<f32>( 0.0,  1.0,  0.0),
+        vec3<f32>( 0.0, -1.0,  0.0),
+        vec3<f32>( 0.0,  0.0,  1.0),
+        vec3<f32>( 0.0,  0.0, -1.0)
+    );
+    let base = 20480u + probe_idx * 6u;
+    for (var k : u32 = 0u; k < 6u; k = k + 1u) {
+        let dir = axes[k];
+        let near_v = trace_rc_interval(pos, dir, 0.04, 0.28, 5u, xray_on, xray_p, time_s);
+        let far_v  = sample_rc1_trilinear(pos, dir);
+        rc_buf[base + k] = vec4<f32>(near_v.rgb + near_v.a * far_v.rgb, valid);
+    }
+}
+
 fn shade_full_hit(
     hit : SceneHit,
     p : vec3<f32>,
@@ -446,15 +1299,23 @@ fn shade_full_hit(
     xray_plane : f32,
     trc_safe : bool,
     cb_geom : bool,
+    studio_gi : bool,
+    rc_on : bool,
+    diff_field : bool,
+    subframe_lock : bool,
     selected_id : u32,
     time_s : f32
 ) -> vec3<f32> {
     let m_cell = arena[8u + (hit.mat_id & 7u)];
     let s_cell = arena[16u + (clamp(hit.style_id, 1u, 8u) - 1u)];
     let inst_k = arena[40u + (hit.inst_slot & 31u)].q2.w;
+    let sec    = arena[254];
+    let sec_mode = sec.q0.x;
+    let insp_flags = sec.q0.y;
 
     let eta    = clamp(q16_to_f32(m_cell.q0.y), 1.0, 4.0);
     let kappa  = clamp(q16_to_f32(m_cell.q0.z), 0.0, 8.0);
+    let relief = clamp(q16_to_f32(m_cell.q1.x), 0.0, 2.0);
     let rough  = clamp(q16_to_f32(m_cell.q1.y), 0.02, 1.0);
     let mie    = clamp(q16_to_f32(m_cell.q1.z), 0.0, 1.0);
     let mu_a   = vec3<f32>(q16_to_f32(m_cell.q1.w), q16_to_f32(m_cell.q2.x), q16_to_f32(m_cell.q2.y));
@@ -465,19 +1326,45 @@ fn shade_full_hit(
     let base_tint   = unpack_rgb24(s_cell.q0.y);
     let accent_tint = unpack_rgb24(s_cell.q0.z);
     let style_rough = clamp(q16_to_f32(s_cell.q0.w), 0.02, 1.0);
-    let eff_rough   = clamp(mix(rough, style_rough, 0.35), 0.025, 1.0);
     let metallic    = clamp(max(q16_to_f32(s_cell.q1.x), clamp((kappa - 0.35) * 0.5, 0.0, 1.0)), 0.0, 1.0);
+
+    var n_eff = n;
+    var tri_grain = vec3<f32>(0.0);
+    var ridge_polish : f32 = 0.0;
+    var crevice_patina : f32 = 0.0;
+    var field_aniso : f32 = 0.0;
+    if ((studio_gi || diff_field || (insp_flags & 8u) != 0u) && !hit.is_cut) {
+        let nf = clamp(q16_to_f32(s_cell.q1.z), 1.0, 16.0);
+        tri_grain = eval_triplanar_grain(hit.local_p, n, nf, metallic, wire_w);
+        var groove_w = tri_grain.y;
+        var t_ax = safe_norm3(cross(select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.85), n), vec3<f32>(1.0, 0.0, 0.0));
+        if (diff_field) {
+            let j2 = eval_diff_jet2(p, n);
+            ridge_polish = clamp(j2.H * 0.35, 0.0, 0.65);
+            crevice_patina = clamp(-j2.H * 0.45, 0.0, 0.72);
+            field_aniso = clamp(j2.aniso * 0.25, 0.0, 1.0);
+            let p_curv = dot(hit.local_p, j2.e1);
+            let p_orth = dot(hit.local_p, cross(n, j2.e1));
+            let curv_flow = sin(p_curv * 44.0 + sin(p_orth * 12.0) * 1.4);
+            groove_w = mix(tri_grain.y, curv_flow, 0.68);
+            t_ax = j2.e1;
+        }
+        let bump_amp = relief * (0.085 + 0.045 * field_aniso);
+        n_eff = safe_norm3(n + t_ax * (groove_w * bump_amp), n);
+    }
+
+    let eff_rough = clamp(mix(rough, style_rough, 0.35) + tri_grain.x - ridge_polish * 0.14 + crevice_patina * 0.12, 0.025, 1.0);
 
     let key_dir = vec3<f32>(-0.5145, 0.7503, -0.4150);
     let rim_dir = vec3<f32>( 0.7420, 0.3610,  0.5650);
 
-    let ao = calc_ao(p, n, xray_on, xray_plane);
-    let sh = calc_soft_shadow(p + n * 0.018, key_dir, 11.0, xray_on, xray_plane);
+    let ao = calc_ao(p, n_eff, xray_on, xray_plane);
+    let sh = calc_soft_shadow(p + n_eff * 0.018, key_dir, 11.0, xray_on, xray_plane);
 
-    let ndv = clamp(dot(n, -rd), 0.0, 1.0);
-    let ndl = clamp(dot(n, key_dir), 0.0, 1.0);
-    let ndr = clamp(dot(n, rim_dir), 0.0, 1.0);
-    let refl_d = reflect(rd, n);
+    let ndv = clamp(dot(n_eff, -rd), 0.0, 1.0);
+    let ndl = clamp(dot(n_eff, key_dir), 0.0, 1.0);
+    let ndr = clamp(dot(n_eff, rim_dir), 0.0, 1.0);
+    let refl_d = reflect(rd, n_eff);
 
     let f0_dielec = ((eta - 1.0) * (eta - 1.0) + kappa * kappa) /
                     max((eta + 1.0) * (eta + 1.0) + kappa * kappa, 1e-4);
@@ -492,12 +1379,15 @@ fn shade_full_hit(
     // Specular GGX-like highlight + 3-Light HDR Studio Environment
     let h_key = safe_norm3(key_dir - rd, vec3<f32>(0.0, 1.0, 0.0));
     let spec_pow = mix(140.0, 7.0, eff_rough);
-    let spec_key = pow(max(clamp(dot(n, h_key), 0.0, 1.0), 1e-6), spec_pow) * mix(1.45, 0.22, eff_rough) * sh;
+    let spec_key = pow(max(clamp(dot(n_eff, h_key), 0.0, 1.0), 1e-6), spec_pow) * mix(1.45, 0.22, eff_rough) * sh;
     let h_rim = safe_norm3(rim_dir - rd, vec3<f32>(0.0, 1.0, 0.0));
-    let spec_rim = pow(max(clamp(dot(n, h_rim), 0.0, 1.0), 1e-6), mix(72.0, 6.0, eff_rough)) * 0.55;
+    let spec_rim = pow(max(clamp(dot(n_eff, h_rim), 0.0, 1.0), 1e-6), mix(72.0, 6.0, eff_rough)) * 0.55;
 
-    let env_refl = eval_studio_env(refl_d, eff_rough) * (0.45 + 0.55 * ao);
-    let spec_total = env_refl * fres
+    let env_refl = select(eval_studio_env(refl_d, eff_rough),
+                        mix(eval_studio_env(refl_d, eff_rough), sample_rc1_trilinear(p + n_eff * 0.06, refl_d).rgb, clamp(1.0 - eff_rough * 0.55, 0.25, 0.85)),
+                        rc_on) * (0.45 + 0.55 * ao);
+    let rc_irr = select(vec3<f32>(0.0), sample_rc0_irradiance(p, n_eff), rc_on);
+    let spec_total = env_refl * fres * (1.0 + ridge_polish * 0.45)
                    + vec3<f32>(1.00, 0.94, 0.86) * spec_key * (vec3<f32>(0.35) + 0.65 * f0_rgb)
                    + vec3<f32>(0.35, 0.82, 1.15) * spec_rim * f0_rgb;
 
@@ -506,10 +1396,10 @@ fn shade_full_hit(
     if (eta > 1.02 && metallic < 0.5) {
         // True Snell Secondary Refraction + Internal Optical Thickness + Chromatic Dispersion
         let eta_inv = 1.0 / max(eta, 1.01);
-        let refr_raw = refract(rd, n, eta_inv);
+        let refr_raw = refract(rd, n_eff, eta_inv);
         let refr_d = safe_norm3(select(refr_raw, refl_d, dot(refr_raw, refr_raw) < 1e-5), rd);
 
-        let p_enter = p - n * 0.016;
+        let p_enter = p - n_eff * 0.016;
         var solid_dist : f32 = 0.0;
         var t_in : f32 = 0.0;
         var p_exit : vec3<f32> = p_enter;
@@ -558,25 +1448,29 @@ fn shade_full_hit(
         let beer = exp(-mu_a * opt_path) * exp(-kappa * 1.6);
 
         let back_lit = pow(clamp(dot(rd, -key_dir), 0.0, 1.0), 3.0);
-        let wrap_key = clamp(dot(n, key_dir) * 0.5 + 0.5, 0.0, 1.0) * (0.42 + 0.58 * sh);
+        let wrap_key = clamp(dot(n_eff, key_dir) * 0.5 + 0.5, 0.0, 1.0) * (0.42 + 0.58 * sh);
         let jewel_tint = mix(beer, base_tint, 0.52);
         let sss = jewel_tint * (mie * (back_lit * 0.98 + wrap_key * 0.65 + ao * 0.26) + (0.14 + 0.20 * wrap_key) * ao);
 
         let cavity_glow = select(0.0, 0.18, cavity_crossings >= 1.5) * (1.0 - ndv * 0.45);
         let lattice = sin(p.x * 26.0) * sin(p.y * 26.0) * sin(p.z * 26.0);
-        let wire_term = smoothstep(0.72, 0.96, abs(lattice)) * wire_w * 0.18;
+        let wire_term = (smoothstep(0.72, 0.96, abs(lattice)) * wire_w * 0.18) + tri_grain.z * 0.22;
 
         let transmitted = (refr_scene + int_env) * beer * (0.76 + 0.34 * wrap_key)
                         + sss
+                        + jewel_tint * rc_irr * (0.45 * (1.0 - metallic))
                         + accent_tint * (cavity_glow + wire_term) * beer;
         col = transmitted * (vec3<f32>(1.0) - fres) + spec_total;
     } else {
-        // Brushed Titanium / Aurum Gold / Conductor & Ceramic PBR
+        // Brushed Titanium / Aurum Gold / Conductor & Ceramic PBR + Radiance Cascades Indirect Diff/Spec + 2-Jet Patina
         let diff_wrap = clamp(ndl * 0.75 + 0.25, 0.0, 1.0) * (0.30 + 0.70 * sh);
-        let diff = metal_albedo * (1.0 - metallic * 0.85) * diff_wrap * ao * 0.55;
-        let aniso_band = pow(clamp(1.0 - abs(n.y - 0.15), 0.0, 1.0), 4.0) * metallic * 0.16;
-        let rim_metal = metal_albedo * pow(1.0 - ndv, 3.0) * (0.25 + 0.55 * ndr) * metallic * ao;
-        col = diff + spec_total + metal_albedo * aniso_band + rim_metal;
+        let diff_albedo = metal_albedo * (1.0 - crevice_patina * 0.42);
+        let diff = diff_albedo * (1.0 - metallic * 0.85) * diff_wrap * ao * 0.55;
+        let rc_bounce = diff_albedo * rc_irr * (0.85 - metallic * 0.35) * ao;
+        let brush_mod = 1.0 + tri_grain.y * 0.18 * metallic;
+        let aniso_band = pow(clamp(1.0 - abs(n_eff.y - 0.15), 0.0, 1.0), 4.0) * metallic * 0.16 * brush_mod;
+        let rim_metal = diff_albedo * pow(1.0 - ndv, 3.0) * (0.25 + 0.55 * ndr) * metallic * ao;
+        col = diff * brush_mod + rc_bounce + spec_total + metal_albedo * aniso_band + rim_metal;
     }
 
     // Colorblind Geometric Surface Contour Accessibility Mode
@@ -597,17 +1491,73 @@ fn shade_full_hit(
         col = col * mix(1.0, 0.45, clamp(ex * 0.5, 0.0, 0.6)) + planck * core_heat;
     }
 
-    // X-Ray Cutaway Cross-Section & Laser Perimeter Rim
-    if (xray_on) {
+    // Pixel-Exact 3D Cross-Section Tomography, Isolines, DFM Wall-Thickness & Boolean Interference (A ^ B)
+    let iso_pitch = max(q16_to_f32(sec.q2.z), 0.05);
+    let min_wall  = max(q16_to_f32(sec.q2.y), 0.02);
+    let has_inter = (hit.raw_d < -0.001) && (hit.second_raw_d < -0.001);
+    let inter_seam = ((insp_flags & 4u) != 0u) && !hit.is_cut && (hit.second_raw_d < 0.018);
+
+    if (xray_on || sec_mode != 0u) {
         if (hit.is_cut) {
-            let hatch = 0.5 + 0.5 * sin((p.y - p.z) * 52.0);
-            let wall_edge = 1.0 - smoothstep(0.0, 0.032, abs(hit.raw_d));
-            let cut_col = mix(vec3<f32>(0.02, 0.58, 0.62), vec3<f32>(0.08, 0.98, 0.86), 0.35 + 0.35 * hatch + 0.30 * ao);
-            col = mix(col * 0.55, cut_col, 0.62);
-            col = col + vec3<f32>(0.18, 1.15, 0.96) * wall_edge * 0.85;
+            let sn = select(vec3<f32>(1.0, 0.0, 0.0), get_sec_normal(), sec_mode != 0u);
+            let t1 = safe_norm3(cross(select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(sn.y) > 0.85), sn), vec3<f32>(0.0, 1.0, 0.0));
+            let t2 = cross(sn, t1);
+            let uv_cut = vec2<f32>(dot(p, t1), dot(p, t2));
+            let hatch = 0.5 + 0.5 * sin((uv_cut.x - uv_cut.y) * 56.0);
+            let wall_edge = 1.0 - smoothstep(0.0, 0.028, abs(hit.raw_d));
+
+            var cut_col = mix(vec3<f32>(0.02, 0.48, 0.56), vec3<f32>(0.08, 0.92, 0.84), 0.35 + 0.35 * hatch + 0.30 * ao);
+
+            // SDF Internal Isolines
+            if ((insp_flags & 1u) != 0u) {
+                let iso_phase = fract(abs(hit.raw_d) / iso_pitch);
+                let iso_d = min(iso_phase, 1.0 - iso_phase) * iso_pitch;
+                let iso_ring = 1.0 - smoothstep(0.0, 0.014, iso_d);
+                cut_col = mix(cut_col, vec3<f32>(0.32, 1.00, 0.98), iso_ring * 0.65);
+            }
+
+            // DFM Minimum Wall-Thickness Probe along -grad(raw_d)
+            if ((insp_flags & 2u) != 0u) {
+                let rg = eval_raw_grad(p);
+                let opp_d = map_scene_raw_best(p - rg * min_wall);
+                if (opp_d > -0.002) {
+                    let dfm_heat = clamp((opp_d + 0.025) / 0.06, 0.0, 1.0);
+                    let dfm_col = mix(vec3<f32>(1.00, 0.68, 0.12), vec3<f32>(1.00, 0.18, 0.24), dfm_heat);
+                    cut_col = mix(cut_col, dfm_col, 0.72);
+                }
+            }
+
+            // Multi-Instance Boolean Interference A ^ B
+            if ((insp_flags & 4u) != 0u && has_inter) {
+                let cross_h = 0.5 + 0.5 * sin((uv_cut.x + uv_cut.y) * 68.0) * sin((uv_cut.x - uv_cut.y) * 68.0);
+                let inter_col = mix(vec3<f32>(0.96, 0.14, 0.28), vec3<f32>(1.00, 0.82, 0.16), cross_h);
+                cut_col = mix(cut_col, inter_col, 0.86);
+            }
+
+            col = mix(col * 0.50, cut_col, 0.68);
+            col = col + vec3<f32>(0.18, 1.15, 0.96) * wall_edge * 0.82;
         } else {
-            let plane_rim = 1.0 - smoothstep(0.0, 0.020, abs(p.x - xray_plane));
-            col = col + vec3<f32>(0.10, 1.05, 0.90) * plane_rim * 0.90;
+            let clip_abs = abs(eval_section_clip_val(p, xray_on, xray_plane));
+            let plane_rim = 1.0 - smoothstep(0.0, 0.022, clip_abs);
+            col = col + vec3<f32>(0.10, 1.05, 0.90) * plane_rim * 0.88;
+        }
+    }
+    if (inter_seam) {
+        let seam_w = 1.0 - smoothstep(0.0, 0.018, max(hit.second_raw_d, 0.0));
+        col = mix(col, vec3<f32>(1.00, 0.34, 0.18), seam_w * 0.85);
+    }
+
+    // Sub-Frame Huygens Elastic Contact Shockwave Overlay (arena[255] Slot 255)
+    if (subframe_lock) {
+        let ps = arena[255];
+        let pflags = (ps.q0.w >> 16u) & 0xFFFFu;
+        if ((pflags & 4u) != 0u) {
+            let toi = clamp(q16_to_f32(ps.q1.y), 0.0, 1.0);
+            let cpos = vec3<f32>(q16_to_f32(ps.q2.x), q16_to_f32(ps.q2.y), q16_to_f32(ps.q2.z));
+            let r_wave = max(1.0 - toi, 0.05) * 0.85;
+            let d_ring = abs(length(p - cpos) - r_wave);
+            let wave = (1.0 - smoothstep(0.0, 0.045, d_ring)) * exp(-d_ring * 18.0) * (1.0 - 0.5 * toi);
+            col = col + vec3<f32>(0.25, 0.95, 1.25) * wave * 0.92;
         }
     }
 
@@ -1488,27 +2438,59 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
 
     let aspect = fw / fh;
     let uv_cam = vec2<f32>(norm_xy.x * aspect * 0.5, -norm_xy.y * 0.5);
-    let rd = safe_norm3(right * uv_cam.x + up_v * uv_cam.y + fwd * fov_z, vec3<f32>(0.0, 0.0, 1.0));
+    var rd = safe_norm3(right * uv_cam.x + up_v * uv_cam.y + fwd * fov_z, vec3<f32>(0.0, 0.0, 1.0));
     let px_ang = 1.0 / max(fh * fov_z, 1.0);
 
-    let hdr_flags   = arena[0].q3.z;
-    let xray_on     = (hdr_flags & 2u) != 0u;
-    let trc_safe    = (hdr_flags & 4u) != 0u;
-    let cb_geom     = (hdr_flags & 8u) != 0u;
-    let studio_gi   = (hdr_flags & 16u) != 0u;
-    let xray_plane  = q16_to_f32(arena[0].q3.x);
-    let selected_id = arena[0].q3.y;
-    let time_s      = f32(arena[0].q1.y) * 0.0166667;
+    let hdr_flags     = arena[0].q3.z;
+    let xray_on       = (hdr_flags & 2u) != 0u;
+    let trc_safe      = (hdr_flags & 4u) != 0u;
+    let cb_geom       = (hdr_flags & 8u) != 0u;
+    let studio_gi     = (hdr_flags & 16u) != 0u;
+    let rc_on         = (hdr_flags & 32u) != 0u;
+    let diff_field    = (hdr_flags & 64u) != 0u;
+    let subframe_lock = (hdr_flags & 128u) != 0u;
+    let cine_on       = (hdr_flags & 256u) != 0u;
+    let metric_on     = (hdr_flags & 512u) != 0u;
+    let shells_on     = (hdr_flags & 1024u) != 0u;
+    let xray_plane    = q16_to_f32(arena[0].q3.x);
+    let selected_id   = arena[0].q3.y;
+    let time_s        = f32(arena[0].q1.y) * 0.0166667;
+
+    let reg = arena[2];
+    let metric_phi   = clamp(q16_to_f32(reg.q1.x), -0.45, 0.48);
+    let lorentz_beta = clamp(q16_to_f32(reg.q1.y), -0.90, 0.90);
+    let hitstop_f    = bitcast<i32>(reg.q1.w);
+    let graze_w      = clamp(q16_to_f32(reg.q2.x), 0.04, 0.80);
+
+    var lens_center = tgt;
+    let inst_cnt_m = min(arena[0].q1.z, 32u);
+    if (selected_id >= 1u && selected_id <= inst_cnt_m) {
+        let sel_i = arena[40u + (selected_id - 1u)];
+        lens_center = vec3<f32>(q16_to_f32(sel_i.q1.x), q16_to_f32(sel_i.q1.y), q16_to_f32(sel_i.q1.z));
+    }
+
+    if (metric_on && abs(lorentz_beta) > 1e-4) {
+        let rdx = dot(rd, fwd);
+        let denom_b = max(1.0 + lorentz_beta * rdx, 0.08);
+        let boost_x = (rdx + lorentz_beta) / denom_b;
+        let perp = rd - fwd * rdx;
+        let perp_sc = sqrt(max(1.0 - lorentz_beta * lorentz_beta, 0.05)) / denom_b;
+        rd = safe_norm3(fwd * boost_x + perp * perp_sc, rd);
+    }
 
     // Base background (exact parity when studio_gi == false for verifyGpuAlignment)
     let sky_col = eval_sky_dome(rd);
     var bg = eval_backdrop_ray(eye, rd, px_ang);
 
-    // 2. Primary 3D SDF Raymarch (Exact CPU Q16.16 parity when !studio_gi; 80-step AA in Studio)
+    // 2. Primary 3D SDF / Geodesic Metric Raymarch (Exact CPU Q16.16 parity when !studio_gi && !metric_on)
     var col = bg;
     var hit_found = false;
+    var trapped_horizon = false;
+    var einstein_glow : f32 = 0.0;
     var t : f32 = 0.125;
-    let max_steps : u32 = select(64u, 80u, studio_gi);
+    var cur_p  = eye + rd * t;
+    var cur_rd = rd;
+    let max_steps : u32 = select(64u, 80u, studio_gi || metric_on);
     let hit_eps   : f32 = select(0.0078125, 0.0020, studio_gi);
     let min_step  : f32 = select(0.0078125, 0.0030, studio_gi);
     let max_t     : f32 = select(32.0, 28.0, studio_gi);
@@ -1517,7 +2499,7 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
 
     for (var s : u32 = 0u; s < max_steps; s = s + 1u) {
         if (t >= max_t) { break; }
-        let p = eye + rd * t;
+        let p = cur_p;
         let d = map_scene_dist(p, xray_on, xray_plane);
         let cone_d = d / max(t, 0.25);
         if (cone_d < min_edge_d) {
@@ -1528,16 +2510,41 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
             let hit_info = map_scene_full(p, xray_on, xray_plane);
             let n = calc_normal(p, xray_on, xray_plane);
             col = shade_full_hit(
-                hit_info, p, n, rd, px_ang,
-                xray_on, xray_plane, trc_safe, cb_geom, selected_id, time_s
+                hit_info, p, n, cur_rd, px_ang,
+                xray_on, xray_plane, trc_safe, cb_geom, studio_gi,
+                rc_on, diff_field, subframe_lock, selected_id, time_s
             );
             hit_found = true;
             break;
         }
-        t = t + max(d, min_step);
+        let step_d = max(d, min_step);
+        if (metric_on) {
+            let r_vec = cur_p - lens_center;
+            let r_len = length(r_vec);
+            if (abs(metric_phi) > 1e-4) {
+                let rs_ring = 3.0 * abs(metric_phi);
+                let ring_prox = exp(-abs(r_len - rs_ring) * 14.0);
+                einstein_glow = einstein_glow + ring_prox * 0.032 * abs(metric_phi) * 4.0;
+                let deflect = (2.0 * metric_phi * step_d) / max(r_len * r_len * r_len, 0.08);
+                cur_rd = safe_norm3(cur_rd - r_vec * deflect, cur_rd);
+            }
+            if (metric_phi > 0.20 && r_len < 2.0 * metric_phi) {
+                trapped_horizon = true;
+                col = vec3<f32>(0.002, 0.004, 0.012);
+                break;
+            }
+            cur_p = cur_p + cur_rd * step_d;
+            t = t + step_d;
+        } else {
+            t = t + step_d;
+            cur_p = eye + rd * t;
+        }
+    }
+    if (!hit_found && !trapped_horizon && metric_on) {
+        col = eval_backdrop_ray(eye, cur_rd, px_ang);
     }
 
-    // Studio Floor GI: Contact AO + Soft Shadows + Glossy Planar Reflection + Selection Ring
+    // Studio Floor GI: Contact AO + Soft Shadows + Radiance Cascades Floor Bounce + Planar Reflection
     // Strictly gated by studio_gi so verifyGpuAlignment (studio_gi == false) keeps exact bg outside silhouettes!
     if (!hit_found && studio_gi && rd.y < -0.001) {
         let tf = (-1.25 - eye.y) / rd.y;
@@ -1552,6 +2559,10 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
             let prox2 = clamp(map_scene_dist(fp + vec3<f32>(0.0, 0.30, 0.0), xray_on, xray_plane) / 0.38, 0.0, 1.0);
             let ao_f = clamp(min(prox1, prox2), 0.16, 1.0);
             fcol = fcol * (0.36 + 0.64 * sh_f) * (0.38 + 0.62 * ao_f);
+            if (rc_on) {
+                let floor_gi = sample_rc0_irradiance(fp, vec3<f32>(0.0, 1.0, 0.0));
+                fcol = fcol + floor_gi * 0.22 * ao_f;
+            }
 
             // 24-Step Glossy Planar Reflection Ray
             let refl_rd = reflect(rd, vec3<f32>(0.0, 1.0, 0.0));
@@ -1614,8 +2625,60 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
         let ehit = map_scene_full(edge_p, xray_on, xray_plane);
         if (ehit.inst_id != 0u) {
             let en = calc_normal(edge_p, xray_on, xray_plane);
-            let elit = shade_direct_hit(ehit, edge_p, en, rd, trc_safe, time_s);
+            let elit = shade_direct_hit(ehit, edge_p, en, cur_rd, trc_safe, time_s);
             col = mix(col, elit, edge_cov * 0.72);
+        }
+    }
+
+    // Relativistic Photon Ring + Doppler Tint (when metric_on)
+    if (metric_on) {
+        let dop_shift = vec3<f32>(1.0 - lorentz_beta * 0.25, 1.0, 1.0 + lorentz_beta * 0.38);
+        col = col * dop_shift + vec3<f32>(0.42, 0.78, 1.25) * clamp(einstein_glow, 0.0, 1.2);
+    }
+
+    // Concentric SDF Graze Contour + Hitstop High-Contrast Punch (when shells_on)
+    if (shells_on) {
+        if (!hit_found && min_edge_d < graze_w * 0.38) {
+            let sh_a = 1.0 - smoothstep(0.0, 0.018, abs(min_edge_d - graze_w * 0.22));
+            col = col + vec3<f32>(0.18, 0.94, 1.00) * sh_a * 0.65;
+        }
+        if (hitstop_f > 0) {
+            let vig = clamp(length(norm_xy) - 0.55, 0.0, 0.75) * 0.65;
+            col = mix(col, vec3<f32>(0.01, 0.015, 0.025), vig) * 1.18;
+        }
+    }
+
+    // Thin-Lens CineCamera Optics: CoC Depth-of-Field, Blue Anamorphic Streak & 2.39:1 Letterbox
+    if (cine_on) {
+        let fstop = clamp(q16_to_f32(cam.q2.z), 1.4, 22.0);
+        let focus_d = max(q16_to_f32(cam.q2.w), 0.5);
+        let exposure = clamp(q16_to_f32(cam.q3.x), 0.25, 4.0);
+        let depth_s = select(18.0, t, hit_found);
+        let coc = clamp(abs(depth_s - focus_d) / max(depth_s, 0.5) * (focal_mm / (fstop * 28.0)), 0.0, 0.65);
+        col = mix(col, bg * 0.75 + col * 0.25, coc * 0.45) * exposure;
+
+        let inst_cnt_f = min(arena[0].q1.z, 32u);
+        for (var fi : u32 = 0u; fi < inst_cnt_f; fi = fi + 1u) {
+            let finst = arena[40u + fi];
+            let ffl = (finst.q3.x >> 16u) & 0xFFFFu;
+            if ((ffl & 1u) == 0u) { continue; }
+            if (finst.q2.w <= 800u) { continue; }
+            let ipos = vec3<f32>(q16_to_f32(finst.q1.x), q16_to_f32(finst.q1.y), q16_to_f32(finst.q1.z));
+            let rel_e = ipos - eye;
+            let zc = dot(rel_e, fwd);
+            if (zc > 0.25) {
+                let em_x = (dot(rel_e, right) * fov_z) / (zc * aspect * 0.5);
+                let em_y = -(dot(rel_e, up_v) * fov_z) / (zc * 0.5);
+                let sy_k = exp(-abs(norm_xy.y - em_y) * 40.0);
+                let sx_k = exp(-abs(norm_xy.x - em_x) * 2.0);
+                let f_gain = clamp(f32(finst.q2.w - 800u) * 0.0008, 0.15, 0.85);
+                col = col + vec3<f32>(0.10, 0.45, 1.00) * sy_k * sx_k * f_gain;
+            }
+        }
+
+        let scope_h = clamp(aspect / 2.39, 0.52, 0.88);
+        if (abs(norm_xy.y) > scope_h) {
+            col = col * 0.04;
         }
     }
 

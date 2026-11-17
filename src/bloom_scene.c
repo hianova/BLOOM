@@ -11,6 +11,8 @@
  * ============================================================================
  */
 
+#define SC_MAX_COORD_Q16 INT64_C(0x0FFFFFFFFFFF)
+
 static inline int64_t sc_abs64(int64_t x) {
     if (x == INT64_MIN) return INT64_MAX;
     return (x < 0) ? -x : x;
@@ -220,7 +222,127 @@ int64_t bloom_smax_q16(int64_t a_q16, int64_t b_q16, int64_t k_q16) {
     return sc_neg64(bloom_smin_q16(sc_neg64(a_q16), sc_neg64(b_q16), k_q16));
 }
 
-/* 1. CSG Primitive & Binary glTF (.glb) Ingestion */
+/* 1. CSG Primitive, CAD Mesh (.stl/.glb) Ingestion & Cross-Section Plane */
+void bloom_rot_inv_euler_q16(const int32_t in_pt_q16[3],
+                             const int32_t rot_euler_q16[3],
+                             int32_t out_pt_q16[3]) {
+    if (!in_pt_q16 || !out_pt_q16) return;
+    if (!rot_euler_q16 || (rot_euler_q16[0] == 0 && rot_euler_q16[1] == 0 && rot_euler_q16[2] == 0)) {
+        out_pt_q16[0] = in_pt_q16[0];
+        out_pt_q16[1] = in_pt_q16[1];
+        out_pt_q16[2] = in_pt_q16[2];
+        return;
+    }
+    int64_t x = sc_clamp64((int64_t)in_pt_q16[0], -0x1FFFFFFFLL, 0x1FFFFFFFLL);
+    int64_t y = sc_clamp64((int64_t)in_pt_q16[1], -0x1FFFFFFFLL, 0x1FFFFFFFLL);
+    int64_t z = sc_clamp64((int64_t)in_pt_q16[2], -0x1FFFFFFFLL, 0x1FFFFFFFLL);
+
+    int64_t sx = bloom_sin_q16(rot_euler_q16[0]), cx = bloom_cos_q16(rot_euler_q16[0]);
+    int64_t sy = bloom_sin_q16(rot_euler_q16[1]), cy = bloom_cos_q16(rot_euler_q16[1]);
+    int64_t sz = bloom_sin_q16(rot_euler_q16[2]), cz = bloom_cos_q16(rot_euler_q16[2]);
+
+    /* Inverse Y -> Inverse X -> Inverse Z */
+    int64_t x1 = (x * cy - z * sy) >> 16;
+    int64_t z1 = (x * sy + z * cy) >> 16;
+
+    int64_t y2 = (y * cx + z1 * sx) >> 16;
+    int64_t z2 = (-y * sx + z1 * cx) >> 16;
+
+    int64_t x3 = (x1 * cz + y2 * sz) >> 16;
+    int64_t y3 = (-x1 * sz + y2 * cz) >> 16;
+
+    out_pt_q16[0] = sc_clamp64_to_i32(x3);
+    out_pt_q16[1] = sc_clamp64_to_i32(y3);
+    out_pt_q16[2] = sc_clamp64_to_i32(z2);
+}
+
+static void sc_vec3_norm_q16(int64_t x, int64_t y, int64_t z, int32_t out_n[3]);
+
+void bloom_section_init64(BloomSectionSpec64 *sec,
+                          uint32_t mode,
+                          const int32_t norm_q16[3],
+                          int32_t dist_q16,
+                          int32_t slab_half_q16,
+                          int32_t min_wall_q16,
+                          int32_t iso_pitch_q16,
+                          uint32_t inspect_flags) {
+    if (!sec) return;
+    uint16_t jc = sec->joint_count;
+    uint16_t bc = sec->brick_count;
+    uint16_t mt = sec->mesh_tri_count;
+    uint16_t mb = sec->mesh_bvh_count;
+    uint16_t gs = sec->global_csg_start;
+    uint16_t gc = sec->global_csg_count;
+    uint32_t mms = sec->mesh_matter_style;
+    int32_t tol = (sec->clearance_tol_q16 > 0) ? sec->clearance_tol_q16 : 13107;
+
+    memset(sec, 0, sizeof(*sec));
+    sec->section_mode = (mode <= BLOOM_SEC_MODE_CORNER) ? mode : BLOOM_SEC_MODE_PLANE;
+    sec->inspect_flags = inspect_flags;
+    sec->joint_count = jc;
+    sec->brick_count = bc;
+    sec->mesh_tri_count = mt;
+    sec->mesh_bvh_count = mb;
+    sec->global_csg_start = gs;
+    sec->global_csg_count = gc;
+    sec->mesh_matter_style = mms;
+    if (norm_q16 && (norm_q16[0] != 0 || norm_q16[1] != 0 || norm_q16[2] != 0)) {
+        sc_vec3_norm_q16(norm_q16[0], norm_q16[1], norm_q16[2], sec->plane_norm_q16);
+    } else {
+        sec->plane_norm_q16[0] = BLOOM_Q16_ONE;
+        sec->plane_norm_q16[1] = 0;
+        sec->plane_norm_q16[2] = 0;
+    }
+    sec->plane_dist_q16 = sc_clamp32(dist_q16, -64 * BLOOM_Q16_ONE, 64 * BLOOM_Q16_ONE);
+    sec->slab_half_q16 = sc_clamp32(slab_half_q16, 1024, 32 * BLOOM_Q16_ONE);
+    sec->min_wall_q16 = sc_clamp32(min_wall_q16, 1024, 8 * BLOOM_Q16_ONE);
+    sec->iso_pitch_q16 = sc_clamp32(iso_pitch_q16, 1024, 8 * BLOOM_Q16_ONE);
+    sec->clearance_tol_q16 = tol;
+    sc_stamp_mac(sec, 0x5EC70064ULL, &sec->mac_lo32, &sec->mac_hi32);
+}
+
+int64_t bloom_section_eval_clip_q16(int64_t raw_d_q16,
+                                    int64_t px_q16,
+                                    int64_t py_q16,
+                                    int64_t pz_q16,
+                                    const BloomFrameHeader64 *hdr,
+                                    const BloomSectionSpec64 *sec,
+                                    bool *out_is_cut) {
+    if (out_is_cut) *out_is_cut = false;
+    if (sec && sec->section_mode != BLOOM_SEC_MODE_OFF) {
+        int64_t cx = sc_clamp64(px_q16, -INT64_C(0x3FFFFFFFFFFF), INT64_C(0x3FFFFFFFFFFF));
+        int64_t cy = sc_clamp64(py_q16, -INT64_C(0x3FFFFFFFFFFF), INT64_C(0x3FFFFFFFFFFF));
+        int64_t cz = sc_clamp64(pz_q16, -INT64_C(0x3FFFFFFFFFFF), INT64_C(0x3FFFFFFFFFFF));
+        int64_t nx = sc_clamp64(sec->plane_norm_q16[0], -BLOOM_Q16_ONE, BLOOM_Q16_ONE);
+        int64_t ny = sc_clamp64(sec->plane_norm_q16[1], -BLOOM_Q16_ONE, BLOOM_Q16_ONE);
+        int64_t nz = sc_clamp64(sec->plane_norm_q16[2], -BLOOM_Q16_ONE, BLOOM_Q16_ONE);
+        if (nx == 0 && ny == 0 && nz == 0) nx = BLOOM_Q16_ONE;
+        int64_t ndotp = (nx * cx + ny * cy + nz * cz) >> 16;
+        int64_t clip_d = -BLOOM_MAX_Q16;
+        if (sec->section_mode == BLOOM_SEC_MODE_SLAB) {
+            int64_t slab_h = sc_max64((int64_t)sec->slab_half_q16, 1024LL);
+            clip_d = sc_sat_sub64(sc_abs64(sc_sat_sub64(ndotp, (int64_t)sec->plane_dist_q16)), slab_h);
+        } else if (sec->section_mode == BLOOM_SEC_MODE_CORNER) {
+            int64_t w1 = sc_sat_sub64(ndotp, (int64_t)sec->plane_dist_q16);
+            int64_t wedge = sc_max64(w1, cz);
+            clip_d = sc_neg64(wedge);
+        } else {
+            clip_d = sc_sat_sub64((int64_t)sec->plane_dist_q16, ndotp);
+        }
+        if (clip_d > raw_d_q16) {
+            if (out_is_cut) *out_is_cut = true;
+            return clip_d;
+        }
+        return raw_d_q16;
+    }
+    if (hdr && (hdr->flags & BLOOM_FLAG_XRAY_ENABLED) != 0U) {
+        int64_t clipped = bloom_prefab_eval_xray_cutaway_q16(raw_d_q16, px_q16, hdr->xray_plane_q16, true);
+        if (clipped > raw_d_q16 && out_is_cut) *out_is_cut = true;
+        return clipped;
+    }
+    return raw_d_q16;
+}
+
 void bloom_csg_op_init64(BloomCsgOp64 *out_op,
                          uint32_t op_id,
                          uint32_t prim_type,
@@ -335,7 +457,533 @@ bool bloom_glb_parse_to_csg64(const uint8_t *glb_bytes,
     return true;
 }
 
-#define SC_MAX_COORD_Q16 INT64_C(0x0FFFFFFFFFFF)
+bool bloom_tri64_init(BloomTri64 *out_tri,
+                      uint32_t tri_id,
+                      uint16_t matter_id,
+                      uint16_t shell_q12,
+                      const int32_t v0_q16[3],
+                      const int32_t v1_q16[3],
+                      const int32_t v2_q16[3]) {
+    if (!out_tri || !v0_q16 || !v1_q16 || !v2_q16) return false;
+    memset(out_tri, 0, sizeof(*out_tri));
+    out_tri->tri_id = tri_id;
+    out_tri->matter_id = matter_id;
+    out_tri->shell_q12 = shell_q12;
+    for (uint32_t a = 0U; a < 3U; ++a) {
+        out_tri->v0_q16[a] = sc_clamp32(v0_q16[a], -64 * BLOOM_Q16_ONE, 64 * BLOOM_Q16_ONE);
+        out_tri->v1_q16[a] = sc_clamp32(v1_q16[a], -64 * BLOOM_Q16_ONE, 64 * BLOOM_Q16_ONE);
+        out_tri->v2_q16[a] = sc_clamp32(v2_q16[a], -64 * BLOOM_Q16_ONE, 64 * BLOOM_Q16_ONE);
+    }
+    int64_t e1x = (int64_t)out_tri->v1_q16[0] - (int64_t)out_tri->v0_q16[0];
+    int64_t e1y = (int64_t)out_tri->v1_q16[1] - (int64_t)out_tri->v0_q16[1];
+    int64_t e1z = (int64_t)out_tri->v1_q16[2] - (int64_t)out_tri->v0_q16[2];
+    int64_t e2x = (int64_t)out_tri->v2_q16[0] - (int64_t)out_tri->v0_q16[0];
+    int64_t e2y = (int64_t)out_tri->v2_q16[1] - (int64_t)out_tri->v0_q16[1];
+    int64_t e2z = (int64_t)out_tri->v2_q16[2] - (int64_t)out_tri->v0_q16[2];
+
+    uint64_t me = (uint64_t)sc_abs64(e1x) | (uint64_t)sc_abs64(e1y) | (uint64_t)sc_abs64(e1z) |
+                  (uint64_t)sc_abs64(e2x) | (uint64_t)sc_abs64(e2y) | (uint64_t)sc_abs64(e2z);
+    uint32_t sh = 0U;
+    while ((me >> sh) > 0x3FFFFFFULL) ++sh;
+    e1x /= (int64_t)(1LL << sh); e1y /= (int64_t)(1LL << sh); e1z /= (int64_t)(1LL << sh);
+    e2x /= (int64_t)(1LL << sh); e2y /= (int64_t)(1LL << sh); e2z /= (int64_t)(1LL << sh);
+
+    int64_t nx = e1y * e2z - e1z * e2y;
+    int64_t ny = e1z * e2x - e1x * e2z;
+    int64_t nz = e1x * e2y - e1y * e2x;
+    if (nx == 0 && ny == 0 && nz == 0) {
+        return false;
+    }
+    sc_vec3_norm_q16(nx, ny, nz, out_tri->normal_q16);
+    sc_stamp_mac(out_tri, 0x74160064ULL, &out_tri->mac_lo32, &out_tri->mac_hi32);
+    return true;
+}
+
+static uint32_t sc_shift_for_vec3(int64_t x, int64_t y, int64_t z, uint64_t limit) {
+    uint64_t m = (uint64_t)sc_abs64(x) | (uint64_t)sc_abs64(y) | (uint64_t)sc_abs64(z);
+    uint32_t sh = 0U;
+    while ((m >> sh) > limit && sh < 48U) ++sh;
+    return sh;
+}
+
+static int64_t sc_edge_sign_dot_q16(int64_t ex, int64_t ey, int64_t ez,
+                                    int64_t nx, int64_t ny, int64_t nz,
+                                    int64_t px, int64_t py, int64_t pz) {
+    int64_t cx = ey * nz - ez * ny;
+    int64_t cy = ez * nx - ex * nz;
+    int64_t cz = ex * ny - ey * nx;
+    uint32_t esh = sc_shift_for_vec3(cx, cy, cz, 0x3FFFFULL);
+    if (esh > 0U) {
+        cx /= (int64_t)(1ULL << esh);
+        cy /= (int64_t)(1ULL << esh);
+        cz /= (int64_t)(1ULL << esh);
+    }
+    return cx * px + cy * py + cz * pz;
+}
+
+static int64_t sc_edge_dist_q16(int64_t ux_o, int64_t uy_o, int64_t uz_o,
+                                int64_t wx_o, int64_t wy_o, int64_t wz_o,
+                                int64_t ux_s, int64_t uy_s, int64_t uz_s,
+                                int64_t wx_s, int64_t wy_s, int64_t wz_s) {
+    int64_t uu = ux_s * ux_s + uy_s * uy_s + uz_s * uz_s;
+    int64_t h_q16 = 0;
+    if (uu > 0) {
+        int64_t uw = ux_s * wx_s + uy_s * wy_s + uz_s * wz_s;
+        if (uw <= 0) {
+            h_q16 = 0;
+        } else if (uw >= uu) {
+            h_q16 = BLOOM_Q16_ONE;
+        } else {
+            uint32_t dsh = 0U;
+            while (sc_abs64(uw >> dsh) > INT64_C(0x3FFFFFFFFFF) || (uu >> dsh) > INT64_C(0x3FFFFFFFFFF)) {
+                ++dsh;
+            }
+            int64_t den = sc_max64(uu >> dsh, 1);
+            h_q16 = sc_clamp64(((uw >> dsh) * 65536LL) / den, 0, BLOOM_Q16_ONE);
+        }
+    }
+    int64_t dx = wx_o - ((ux_o * h_q16) >> 16);
+    int64_t dy = wy_o - ((uy_o * h_q16) >> 16);
+    int64_t dz = wz_o - ((uz_o * h_q16) >> 16);
+    return sc_len3_q16(dx, dy, dz);
+}
+
+int64_t bloom_tri64_eval_ud_q16(const BloomTri64 *tri,
+                                int64_t px_q16,
+                                int64_t py_q16,
+                                int64_t pz_q16) {
+    if (!tri) return (int64_t)BLOOM_MAX_Q16;
+    int64_t cpx = sc_clamp64(px_q16, -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t cpy = sc_clamp64(py_q16, -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t cpz = sc_clamp64(pz_q16, -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+
+    int64_t bax = (int64_t)tri->v1_q16[0] - (int64_t)tri->v0_q16[0];
+    int64_t bay = (int64_t)tri->v1_q16[1] - (int64_t)tri->v0_q16[1];
+    int64_t baz = (int64_t)tri->v1_q16[2] - (int64_t)tri->v0_q16[2];
+    int64_t cbx = (int64_t)tri->v2_q16[0] - (int64_t)tri->v1_q16[0];
+    int64_t cby = (int64_t)tri->v2_q16[1] - (int64_t)tri->v1_q16[1];
+    int64_t cbz = (int64_t)tri->v2_q16[2] - (int64_t)tri->v1_q16[2];
+    int64_t acx = (int64_t)tri->v0_q16[0] - (int64_t)tri->v2_q16[0];
+    int64_t acy = (int64_t)tri->v0_q16[1] - (int64_t)tri->v2_q16[1];
+    int64_t acz = (int64_t)tri->v0_q16[2] - (int64_t)tri->v2_q16[2];
+
+    int64_t pax = cpx - (int64_t)tri->v0_q16[0];
+    int64_t pay = cpy - (int64_t)tri->v0_q16[1];
+    int64_t paz = cpz - (int64_t)tri->v0_q16[2];
+    int64_t pbx = cpx - (int64_t)tri->v1_q16[0];
+    int64_t pby = cpy - (int64_t)tri->v1_q16[1];
+    int64_t pbz = cpz - (int64_t)tri->v1_q16[2];
+    int64_t pcx = cpx - (int64_t)tri->v2_q16[0];
+    int64_t pcy = cpy - (int64_t)tri->v2_q16[1];
+    int64_t pcz = cpz - (int64_t)tri->v2_q16[2];
+
+    uint64_t m = (uint64_t)sc_abs64(bax) | (uint64_t)sc_abs64(bay) | (uint64_t)sc_abs64(baz) |
+                 (uint64_t)sc_abs64(cbx) | (uint64_t)sc_abs64(cby) | (uint64_t)sc_abs64(cbz) |
+                 (uint64_t)sc_abs64(acx) | (uint64_t)sc_abs64(acy) | (uint64_t)sc_abs64(acz) |
+                 (uint64_t)sc_abs64(pax) | (uint64_t)sc_abs64(pay) | (uint64_t)sc_abs64(paz) |
+                 (uint64_t)sc_abs64(pbx) | (uint64_t)sc_abs64(pby) | (uint64_t)sc_abs64(pbz) |
+                 (uint64_t)sc_abs64(pcx) | (uint64_t)sc_abs64(pcy) | (uint64_t)sc_abs64(pcz);
+    uint32_t sh = 0U;
+    while ((m >> sh) > 0x3FFFFULL && sh < 48U) ++sh;
+    int64_t div_s = (int64_t)(1ULL << sh);
+
+    int64_t basx = bax / div_s, basy = bay / div_s, basz = baz / div_s;
+    int64_t cbsx = cbx / div_s, cbsy = cby / div_s, cbsz = cbz / div_s;
+    int64_t acsx = acx / div_s, acsy = acy / div_s, acsz = acz / div_s;
+    int64_t pasx = pax / div_s, pasy = pay / div_s, pasz = paz / div_s;
+    int64_t pbsx = pbx / div_s, pbsy = pby / div_s, pbsz = pbz / div_s;
+    int64_t pcsx = pcx / div_s, pcsy = pcy / div_s, pcsz = pcz / div_s;
+
+    int64_t norx = basy * acsz - basz * acsy;
+    int64_t nory = basz * acsx - basx * acsz;
+    int64_t norz = basx * acsy - basy * acsx;
+    uint32_t nsh = sc_shift_for_vec3(norx, nory, norz, 0x3FFFFULL);
+    if (nsh > 0U) {
+        int64_t ndiv = (int64_t)(1ULL << nsh);
+        norx /= ndiv;
+        nory /= ndiv;
+        norz /= ndiv;
+    }
+
+    int64_t s0 = sc_edge_sign_dot_q16(basx, basy, basz, norx, nory, norz, pasx, pasy, pasz);
+    int64_t s1 = sc_edge_sign_dot_q16(cbsx, cbsy, cbsz, norx, nory, norz, pbsx, pbsy, pbsz);
+    int64_t s2 = sc_edge_sign_dot_q16(acsx, acsy, acsz, norx, nory, norz, pcsx, pcsy, pcsz);
+    int sgn_sum = ((s0 > 0) - (s0 < 0)) + ((s1 > 0) - (s1 < 0)) + ((s2 > 0) - (s2 < 0));
+
+    if (sgn_sum < 2) {
+        int64_t d0 = sc_edge_dist_q16(bax, bay, baz, pax, pay, paz, basx, basy, basz, pasx, pasy, pasz);
+        int64_t d1 = sc_edge_dist_q16(cbx, cby, cbz, pbx, pby, pbz, cbsx, cbsy, cbsz, pbsx, pbsy, pbsz);
+        int64_t d2 = sc_edge_dist_q16(acx, acy, acz, pcx, pcy, pcz, acsx, acsy, acsz, pcsx, pcsy, pcsz);
+        return sc_min64(d0, sc_min64(d1, d2));
+    }
+
+    uint64_t nn = (uint64_t)(norx * norx) + (uint64_t)(nory * nory) + (uint64_t)(norz * norz);
+    uint64_t nlen = sc_isqrt_u64(nn);
+    if (nlen == 0ULL) {
+        return sc_edge_dist_q16(bax, bay, baz, pax, pay, paz, basx, basy, basz, pasx, pasy, pasz);
+    }
+    int64_t d_nor = sc_abs64(norx * pasx + nory * pasy + norz * pasz);
+    uint64_t ud_s = (uint64_t)d_nor / nlen;
+    if (sh > 0U && ud_s > ((uint64_t)SC_MAX_COORD_Q16 >> sh)) {
+        return SC_MAX_COORD_Q16;
+    }
+    return (int64_t)(ud_s << sh);
+}
+
+static void sc_tri_bounds_q16(const BloomTri64 *tri, int32_t out_min[3], int32_t out_max[3]) {
+    int64_t pad = 4096LL + ((int64_t)tri->shell_q12 << 4);
+    for (uint32_t a = 0U; a < 3U; ++a) {
+        int32_t mn = tri->v0_q16[a];
+        if (tri->v1_q16[a] < mn) mn = tri->v1_q16[a];
+        if (tri->v2_q16[a] < mn) mn = tri->v2_q16[a];
+        int32_t mx = tri->v0_q16[a];
+        if (tri->v1_q16[a] > mx) mx = tri->v1_q16[a];
+        if (tri->v2_q16[a] > mx) mx = tri->v2_q16[a];
+        out_min[a] = sc_clamp64_to_i32((int64_t)mn - pad);
+        out_max[a] = sc_clamp64_to_i32((int64_t)mx + pad);
+    }
+}
+
+static uint32_t sc_build_mesh_bvh_rec(const BloomTri64 *tris,
+                                      const uint32_t *sorted_idx,
+                                      const uint64_t *sorted_keys,
+                                      bool use_morton_leaves,
+                                      uint32_t start,
+                                      uint32_t end,
+                                      uint32_t budget,
+                                      BloomBvhNode64 *out_nodes,
+                                      uint32_t *inout_count,
+                                      uint32_t max_nodes) {
+    if (*inout_count >= max_nodes || start >= end || budget == 0U) return 0U;
+    uint32_t my_idx = (*inout_count)++;
+    BloomBvhNode64 *nd = &out_nodes[my_idx];
+    memset(nd, 0, sizeof(*nd));
+    nd->node_id = my_idx;
+
+    int32_t bmin[3] = { BLOOM_MAX_Q16, BLOOM_MAX_Q16, BLOOM_MAX_Q16 };
+    int32_t bmax[3] = { -BLOOM_MAX_Q16, -BLOOM_MAX_Q16, -BLOOM_MAX_Q16 };
+    for (uint32_t i = start; i < end; ++i) {
+        uint32_t ti = use_morton_leaves ? sorted_idx[i] : i;
+        int32_t tmin[3], tmax[3];
+        sc_tri_bounds_q16(&tris[ti], tmin, tmax);
+        for (uint32_t a = 0U; a < 3U; ++a) {
+            if (tmin[a] < bmin[a]) bmin[a] = tmin[a];
+            if (tmax[a] > bmax[a]) bmax[a] = tmax[a];
+        }
+    }
+    for (uint32_t a = 0U; a < 3U; ++a) {
+        nd->aabb_min_q16[a] = bmin[a];
+        nd->aabb_max_q16[a] = bmax[a];
+    }
+    uint32_t rep = use_morton_leaves ? sorted_idx[start] : start;
+    int32_t cx = (int32_t)(((int64_t)tris[rep].v0_q16[0] + tris[rep].v1_q16[0] + tris[rep].v2_q16[0]) / 3LL);
+    int32_t cy = (int32_t)(((int64_t)tris[rep].v0_q16[1] + tris[rep].v1_q16[1] + tris[rep].v2_q16[1]) / 3LL);
+    int32_t cz = (int32_t)(((int64_t)tris[rep].v0_q16[2] + tris[rep].v1_q16[2] + tris[rep].v2_q16[2]) / 3LL);
+    uint64_t mkey = use_morton_leaves ? sorted_keys[start] : bloom_bvh_morton3d_q16(cx, cy, cz);
+    nd->morton_lo32 = (uint32_t)(mkey & 0xFFFFFFFFULL);
+    nd->morton_hi32 = (uint32_t)(mkey >> 32ULL);
+    nd->stage_mask_lo32 = 0xFFFFFFFFU;
+    nd->stage_mask_hi32 = 0xFFFFFFFFU;
+
+    uint32_t span = end - start;
+    if (span == 1U || budget < 3U || (*inout_count + 2U) > max_nodes) {
+        nd->is_leaf = 1U;
+        nd->left_or_first = use_morton_leaves ? sorted_idx[start] : start;
+        nd->right_or_count = span;
+    } else {
+        uint32_t mid = start + (span >> 1U);
+        uint32_t rem = budget - 1U;
+        uint32_t left_b = rem >> 1U;
+        uint32_t right_b = rem - left_b;
+        nd->is_leaf = 0U;
+        nd->left_or_first = sc_build_mesh_bvh_rec(tris, sorted_idx, sorted_keys, use_morton_leaves,
+                                                  start, mid, left_b, out_nodes, inout_count, max_nodes);
+        nd->right_or_count = sc_build_mesh_bvh_rec(tris, sorted_idx, sorted_keys, use_morton_leaves,
+                                                   mid, end, right_b, out_nodes, inout_count, max_nodes);
+    }
+    sc_stamp_mac(nd, 0xBF400064ULL, &nd->mac_lo32, &nd->mac_hi32);
+    return my_idx;
+}
+
+size_t bloom_bvh_build_from_tris64(const BloomTri64 *tris,
+                                   size_t tri_count,
+                                   BloomBvhNode64 *out_nodes,
+                                   size_t max_nodes) {
+    if (!tris || tri_count == 0U || !out_nodes || max_nodes == 0U) return 0U;
+    uint32_t n = (tri_count > BLOOM_MAX_MESH_TRIS) ? BLOOM_MAX_MESH_TRIS : (uint32_t)tri_count;
+    uint32_t cap = (max_nodes > BLOOM_MAX_MESH_BVH_NODES) ? BLOOM_MAX_MESH_BVH_NODES : (uint32_t)max_nodes;
+    bool use_morton_leaves = ((2U * n - 1U) <= cap);
+
+    uint32_t idx[BLOOM_MAX_MESH_TRIS];
+    uint64_t keys[BLOOM_MAX_MESH_TRIS];
+    for (uint32_t i = 0U; i < n; ++i) {
+        idx[i] = i;
+        int32_t cx = (int32_t)(((int64_t)tris[i].v0_q16[0] + tris[i].v1_q16[0] + tris[i].v2_q16[0]) / 3LL);
+        int32_t cy = (int32_t)(((int64_t)tris[i].v0_q16[1] + tris[i].v1_q16[1] + tris[i].v2_q16[1]) / 3LL);
+        int32_t cz = (int32_t)(((int64_t)tris[i].v0_q16[2] + tris[i].v1_q16[2] + tris[i].v2_q16[2]) / 3LL);
+        keys[i] = bloom_bvh_morton3d_q16(cx, cy, cz);
+    }
+    if (use_morton_leaves) {
+        for (uint32_t i = 1U; i < n; ++i) {
+            uint64_t k = keys[i];
+            uint32_t id = idx[i];
+            uint32_t j = i;
+            while (j > 0U && keys[j - 1U] > k) {
+                keys[j] = keys[j - 1U];
+                idx[j] = idx[j - 1U];
+                --j;
+            }
+            keys[j] = k;
+            idx[j] = id;
+        }
+    }
+    uint32_t built = 0U;
+    (void)sc_build_mesh_bvh_rec(tris, idx, keys, use_morton_leaves, 0U, n, cap, out_nodes, &built, cap);
+    return (size_t)built;
+}
+
+static void sc_sort_mesh_tris_morton(BloomTri64 *tris, uint32_t n) {
+    uint64_t keys[BLOOM_MAX_MESH_TRIS];
+    uint32_t limit = (n > BLOOM_MAX_MESH_TRIS) ? BLOOM_MAX_MESH_TRIS : n;
+    for (uint32_t i = 0U; i < limit; ++i) {
+        int32_t cx = (int32_t)(((int64_t)tris[i].v0_q16[0] + tris[i].v1_q16[0] + tris[i].v2_q16[0]) / 3LL);
+        int32_t cy = (int32_t)(((int64_t)tris[i].v0_q16[1] + tris[i].v1_q16[1] + tris[i].v2_q16[1]) / 3LL);
+        int32_t cz = (int32_t)(((int64_t)tris[i].v0_q16[2] + tris[i].v1_q16[2] + tris[i].v2_q16[2]) / 3LL);
+        keys[i] = bloom_bvh_morton3d_q16(cx, cy, cz);
+    }
+    for (uint32_t i = 1U; i < limit; ++i) {
+        uint64_t k = keys[i];
+        BloomTri64 t = tris[i];
+        uint32_t j = i;
+        while (j > 0U && keys[j - 1U] > k) {
+            keys[j] = keys[j - 1U];
+            tris[j] = tris[j - 1U];
+            --j;
+        }
+        keys[j] = k;
+        tris[j] = t;
+    }
+}
+
+static bool sc_ray_pos_x_hits_tri(const BloomTri64 *tri, int64_t px, int64_t ry, int64_t rz) {
+    int64_t e1x = (int64_t)tri->v1_q16[0] - (int64_t)tri->v0_q16[0];
+    int64_t e1y = (int64_t)tri->v1_q16[1] - (int64_t)tri->v0_q16[1];
+    int64_t e1z = (int64_t)tri->v1_q16[2] - (int64_t)tri->v0_q16[2];
+    int64_t e2x = (int64_t)tri->v2_q16[0] - (int64_t)tri->v0_q16[0];
+    int64_t e2y = (int64_t)tri->v2_q16[1] - (int64_t)tri->v0_q16[1];
+    int64_t e2z = (int64_t)tri->v2_q16[2] - (int64_t)tri->v0_q16[2];
+    int64_t ty  = ry - (int64_t)tri->v0_q16[1];
+    int64_t tz  = rz - (int64_t)tri->v0_q16[2];
+
+    uint64_t m = (uint64_t)sc_abs64(e1x) | (uint64_t)sc_abs64(e1y) | (uint64_t)sc_abs64(e1z) |
+                 (uint64_t)sc_abs64(e2x) | (uint64_t)sc_abs64(e2y) | (uint64_t)sc_abs64(e2z) |
+                 (uint64_t)sc_abs64(ty)  | (uint64_t)sc_abs64(tz);
+    uint32_t sh = 0U;
+    while ((m >> sh) > 0x3FFFFULL && sh < 48U) ++sh;
+    int64_t d = (int64_t)(1ULL << sh);
+    int64_t e1ys = e1y / d, e1zs = e1z / d;
+    int64_t e2ys = e2y / d, e2zs = e2z / d;
+    int64_t tys = ty / d, tzs = tz / d;
+
+    int64_t det = -(e1ys * e2zs) + (e1zs * e2ys);
+    if (det == 0) return false;
+    int64_t unum = -(tys * e2zs) + (tzs * e2ys);
+    int64_t vnum = (tys * e1zs) - (tzs * e1ys);
+
+    if (det > 0) {
+        if (unum < 0 || vnum < 0 || (unum + vnum) > det) return false;
+    } else {
+        if (unum > 0 || vnum > 0 || (unum + vnum) < det) return false;
+    }
+
+    int64_t num_u = unum;
+    int64_t num_v = vnum;
+    int64_t den = det;
+    uint32_t qsh = 0U;
+    while ((sc_abs64(num_u >> qsh) > INT64_C(0x3FFFFFFFFFF)) ||
+           (sc_abs64(num_v >> qsh) > INT64_C(0x3FFFFFFFFFF)) ||
+           (sc_abs64(den >> qsh) > INT64_C(0x3FFFFFFFFFF))) {
+        ++qsh;
+    }
+    int64_t sden = den / (int64_t)(1ULL << qsh);
+    if (sden == 0) return false;
+    int64_t u_q16 = ((num_u / (int64_t)(1ULL << qsh)) * 65536LL) / sden;
+    int64_t v_q16 = ((num_v / (int64_t)(1ULL << qsh)) * 65536LL) / sden;
+    int64_t x_hit = (int64_t)tri->v0_q16[0] + (((u_q16 * e1x) + (v_q16 * e2x)) >> 16);
+    return x_hit > px;
+}
+
+bool bloom_stl_parse_to_mesh64(const uint8_t *stl_bytes,
+                               size_t stl_len,
+                               uint16_t matter_id,
+                               bool normalize_unit_bounds,
+                               BloomMeshArena *out_mesh,
+                               uint32_t *out_tri_count) {
+    if (!stl_bytes || stl_len < 84U || !out_mesh) return false;
+    uint32_t raw_cnt = sc_read_u32_le(stl_bytes + 80U);
+    if (raw_cnt == 0U || raw_cnt > 200000U) return false;
+    uint64_t need_bytes = (uint64_t)raw_cnt * 50ULL + 84ULL;
+    if (need_bytes != (uint64_t)stl_len) return false;
+
+    int32_t bmin[3] = { BLOOM_MAX_Q16, BLOOM_MAX_Q16, BLOOM_MAX_Q16 };
+    int32_t bmax[3] = { -BLOOM_MAX_Q16, -BLOOM_MAX_Q16, -BLOOM_MAX_Q16 };
+    for (uint32_t i = 0U; i < raw_cnt; ++i) {
+        const uint8_t *rec = stl_bytes + 84U + (size_t)i * 50U;
+        for (uint32_t k = 0U; k < 3U; ++k) {
+            uint32_t nbits = sc_read_u32_le(rec + (size_t)k * 4U);
+            if ((nbits & 0x7F800000U) == 0x7F800000U) return false;
+        }
+        for (uint32_t v = 0U; v < 3U; ++v) {
+            for (uint32_t a = 0U; a < 3U; ++a) {
+                uint32_t bits = sc_read_u32_le(rec + 12U + (size_t)v * 12U + (size_t)a * 4U);
+                int32_t qv = 0;
+                if (!sc_ieee754_finite_to_q16(bits, &qv)) return false;
+                if (qv < bmin[a]) bmin[a] = qv;
+                if (qv > bmax[a]) bmax[a] = qv;
+            }
+        }
+    }
+
+    int64_t mid[3];
+    int64_t max_span = 1;
+    for (uint32_t a = 0U; a < 3U; ++a) {
+        mid[a] = ((int64_t)bmin[a] + (int64_t)bmax[a]) / 2LL;
+        int64_t sp = (int64_t)bmax[a] - (int64_t)bmin[a];
+        if (sp > max_span) max_span = sp;
+    }
+
+    memset(out_mesh, 0, sizeof(*out_mesh));
+    uint32_t sample_cnt = (raw_cnt > BLOOM_MAX_MESH_TRIS) ? BLOOM_MAX_MESH_TRIS : raw_cnt;
+    uint32_t valid_cnt = 0U;
+    for (uint32_t k = 0U; k < sample_cnt; ++k) {
+        uint32_t src_i = (raw_cnt <= BLOOM_MAX_MESH_TRIS)
+            ? k
+            : (uint32_t)(((uint64_t)k * (uint64_t)raw_cnt) / (uint64_t)sample_cnt);
+        const uint8_t *rec = stl_bytes + 84U + (size_t)src_i * 50U;
+        int32_t verts[3][3];
+        for (uint32_t v = 0U; v < 3U; ++v) {
+            for (uint32_t a = 0U; a < 3U; ++a) {
+                uint32_t bits = sc_read_u32_le(rec + 12U + (size_t)v * 12U + (size_t)a * 4U);
+                int32_t qv = bloom_ieee754_bits_to_q16(bits);
+                if (normalize_unit_bounds) {
+                    int64_t centered = (int64_t)qv - mid[a];
+                    verts[v][a] = sc_clamp64_to_i32((centered * (3LL * BLOOM_Q16_ONE)) / max_span);
+                } else {
+                    verts[v][a] = qv;
+                }
+            }
+        }
+        if (bloom_tri64_init(&out_mesh->map.tris[valid_cnt], valid_cnt + 1U, matter_id, 0U,
+                             verts[0], verts[1], verts[2])) {
+            ++valid_cnt;
+        }
+    }
+    if (valid_cnt == 0U) return false;
+    sc_sort_mesh_tris_morton(out_mesh->map.tris, valid_cnt);
+    (void)bloom_bvh_build_from_tris64(out_mesh->map.tris, valid_cnt,
+                                      out_mesh->map.bvh_nodes, BLOOM_MAX_MESH_BVH_NODES);
+    if (out_tri_count) *out_tri_count = valid_cnt;
+    return true;
+}
+
+bool bloom_glb_parse_to_mesh64(const uint8_t *glb_bytes,
+                               size_t glb_len,
+                               uint16_t matter_id,
+                               bool normalize_unit_bounds,
+                               BloomMeshArena *out_mesh,
+                               uint32_t *out_tri_count) {
+    if (!glb_bytes || glb_len < 28U || !out_mesh) return false;
+    if (sc_read_u32_le(glb_bytes + 0U) != 0x46546C67U) return false;
+    if (sc_read_u32_le(glb_bytes + 4U) != 2U) return false;
+    uint64_t total_len = (uint64_t)sc_read_u32_le(glb_bytes + 8U);
+    if (total_len > (uint64_t)glb_len || total_len < 28ULL || (total_len & 3ULL) != 0ULL) return false;
+
+    uint64_t c0_len = (uint64_t)sc_read_u32_le(glb_bytes + 12U);
+    uint32_t c0_type = sc_read_u32_le(glb_bytes + 16U);
+    if (c0_type != 0x4E4F534AU || c0_len == 0ULL || (c0_len & 3ULL) != 0ULL) return false;
+    if (20ULL + c0_len + 8ULL > total_len) return false;
+
+    const uint8_t *jbuf = glb_bytes + 20U;
+    uint64_t jfirst = 0ULL;
+    while (jfirst < c0_len &&
+           (jbuf[jfirst] == ' ' || jbuf[jfirst] == '\t' || jbuf[jfirst] == '\r' || jbuf[jfirst] == '\n')) {
+        ++jfirst;
+    }
+    if (jfirst >= c0_len || jbuf[jfirst] != '{') return false;
+    uint64_t jlast = c0_len;
+    while (jlast > jfirst &&
+           (jbuf[jlast - 1ULL] == ' ' || jbuf[jlast - 1ULL] == '\t' ||
+            jbuf[jlast - 1ULL] == '\r' || jbuf[jlast - 1ULL] == '\n')) {
+        --jlast;
+    }
+    if (jlast <= jfirst + 1ULL || jbuf[jlast - 1ULL] != '}') return false;
+    for (uint64_t k = 0ULL; k < c0_len; ++k) {
+        if (jbuf[k] == 0U) return false;
+    }
+
+    uint64_t c1_hdr = 20ULL + c0_len;
+    uint64_t c1_len = (uint64_t)sc_read_u32_le(glb_bytes + (size_t)c1_hdr);
+    uint32_t c1_type = sc_read_u32_le(glb_bytes + (size_t)c1_hdr + 4U);
+    if (c1_type != 0x004E4942U || c1_len < 36ULL || (c1_len & 3ULL) != 0ULL) return false;
+    if (c1_hdr + 8ULL + c1_len > total_len) return false;
+
+    const uint8_t *bin = glb_bytes + (size_t)c1_hdr + 8U;
+    uint32_t raw_tris = (uint32_t)(c1_len / 36ULL);
+    if (raw_tris == 0U) return false;
+
+    int32_t bmin[3] = { BLOOM_MAX_Q16, BLOOM_MAX_Q16, BLOOM_MAX_Q16 };
+    int32_t bmax[3] = { -BLOOM_MAX_Q16, -BLOOM_MAX_Q16, -BLOOM_MAX_Q16 };
+    uint32_t vtotal = raw_tris * 3U;
+    for (uint32_t i = 0U; i < vtotal; ++i) {
+        for (uint32_t a = 0U; a < 3U; ++a) {
+            uint32_t bits = sc_read_u32_le(bin + (size_t)i * 12U + (size_t)a * 4U);
+            int32_t qv = 0;
+            if (!sc_ieee754_finite_to_q16(bits, &qv)) return false;
+            if (qv < bmin[a]) bmin[a] = qv;
+            if (qv > bmax[a]) bmax[a] = qv;
+        }
+    }
+
+    int64_t mid[3];
+    int64_t max_span = 1;
+    for (uint32_t a = 0U; a < 3U; ++a) {
+        mid[a] = ((int64_t)bmin[a] + (int64_t)bmax[a]) / 2LL;
+        int64_t sp = (int64_t)bmax[a] - (int64_t)bmin[a];
+        if (sp > max_span) max_span = sp;
+    }
+
+    memset(out_mesh, 0, sizeof(*out_mesh));
+    uint32_t sample_cnt = (raw_tris > BLOOM_MAX_MESH_TRIS) ? BLOOM_MAX_MESH_TRIS : raw_tris;
+    uint32_t valid_cnt = 0U;
+    for (uint32_t k = 0U; k < sample_cnt; ++k) {
+        uint32_t src_t = (raw_tris <= BLOOM_MAX_MESH_TRIS)
+            ? k
+            : (uint32_t)(((uint64_t)k * (uint64_t)raw_tris) / (uint64_t)sample_cnt);
+        int32_t verts[3][3];
+        for (uint32_t v = 0U; v < 3U; ++v) {
+            for (uint32_t a = 0U; a < 3U; ++a) {
+                uint32_t bits = sc_read_u32_le(bin + (size_t)src_t * 36U + (size_t)v * 12U + (size_t)a * 4U);
+                int32_t qv = bloom_ieee754_bits_to_q16(bits);
+                if (normalize_unit_bounds) {
+                    int64_t centered = (int64_t)qv - mid[a];
+                    verts[v][a] = sc_clamp64_to_i32((centered * (3LL * BLOOM_Q16_ONE)) / max_span);
+                } else {
+                    verts[v][a] = qv;
+                }
+            }
+        }
+        if (bloom_tri64_init(&out_mesh->map.tris[valid_cnt], valid_cnt + 1U, matter_id, 0U,
+                             verts[0], verts[1], verts[2])) {
+            ++valid_cnt;
+        }
+    }
+    if (valid_cnt == 0U) return false;
+    sc_sort_mesh_tris_morton(out_mesh->map.tris, valid_cnt);
+    (void)bloom_bvh_build_from_tris64(out_mesh->map.tris, valid_cnt,
+                                      out_mesh->map.bvh_nodes, BLOOM_MAX_MESH_BVH_NODES);
+    if (out_tri_count) *out_tri_count = valid_cnt;
+    return true;
+}
 
 int64_t bloom_csg_eval_single_q16(const BloomCsgOp64 *op,
                                   int64_t px_q16,
@@ -728,6 +1376,119 @@ int64_t bloom_bvh_eval_csg_q16(const BloomBvhNode64 *nodes,
     return best_d;
 }
 
+int64_t bloom_mesh_eval_sdf_q16(const BloomMeshArena *mesh,
+                                uint32_t tri_count,
+                                uint32_t bvh_count,
+                                bool solid_parity,
+                                int64_t px_q16,
+                                int64_t py_q16,
+                                int64_t pz_q16,
+                                uint32_t *out_visited) {
+    if (!mesh || tri_count == 0U || bvh_count == 0U) {
+        if (out_visited) *out_visited = 0U;
+        return (int64_t)BLOOM_MAX_Q16;
+    }
+    uint32_t tcnt = (tri_count > BLOOM_MAX_MESH_TRIS) ? BLOOM_MAX_MESH_TRIS : tri_count;
+    uint32_t ncnt = (bvh_count > BLOOM_MAX_MESH_BVH_NODES) ? BLOOM_MAX_MESH_BVH_NODES : bvh_count;
+    const BloomTri64 *tris = mesh->map.tris;
+    const BloomBvhNode64 *nodes = mesh->map.bvh_nodes;
+
+    int64_t cpx = sc_clamp64(px_q16, -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t cpy = sc_clamp64(py_q16, -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t cpz = sc_clamp64(pz_q16, -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+
+    uint32_t stack[128];
+    uint32_t sp = 0U;
+    stack[sp++] = 0U;
+    int64_t best_ud = (int64_t)BLOOM_MAX_Q16;
+    uint32_t visited = 0U;
+    uint16_t hit_shell_q12 = 0U;
+
+    while (sp > 0U && visited <= (ncnt * 2U)) {
+        uint32_t nid = stack[--sp];
+        if (nid >= ncnt) continue;
+        const BloomBvhNode64 *nd = &nodes[nid];
+        ++visited;
+
+        if (sc_aabb_lower_bound_q16(nd, cpx, cpy, cpz, false) >= best_ud) {
+            continue;
+        }
+        if (nd->is_leaf != 0U) {
+            uint32_t first = nd->left_or_first;
+            uint32_t cnt = nd->right_or_count;
+            for (uint32_t k = 0U; k < cnt && (first + k) < tcnt; ++k) {
+                const BloomTri64 *tr = &tris[first + k];
+                int64_t ud = bloom_tri64_eval_ud_q16(tr, cpx, cpy, cpz);
+                if (ud < best_ud) {
+                    best_ud = ud;
+                    hit_shell_q12 = tr->shell_q12;
+                }
+            }
+        } else {
+            uint32_t l = nd->left_or_first;
+            uint32_t r = nd->right_or_count;
+            int64_t dl = (l > nid && l < ncnt) ? sc_aabb_lower_bound_q16(&nodes[l], cpx, cpy, cpz, false) : best_ud;
+            int64_t dr = (r > nid && r < ncnt) ? sc_aabb_lower_bound_q16(&nodes[r], cpx, cpy, cpz, false) : best_ud;
+            if (dl < dr) {
+                if (dr < best_ud && sp < 128U) stack[sp++] = r;
+                if (dl < best_ud && sp < 128U) stack[sp++] = l;
+            } else {
+                if (dl < best_ud && sp < 128U) stack[sp++] = l;
+                if (dr < best_ud && sp < 128U) stack[sp++] = r;
+            }
+        }
+    }
+
+    int64_t res = best_ud;
+    if (solid_parity &&
+        cpx >= (int64_t)nodes[0].aabb_min_q16[0] && cpx <= (int64_t)nodes[0].aabb_max_q16[0] &&
+        cpy >= (int64_t)nodes[0].aabb_min_q16[1] && cpy <= (int64_t)nodes[0].aabb_max_q16[1] &&
+        cpz >= (int64_t)nodes[0].aabb_min_q16[2] && cpz <= (int64_t)nodes[0].aabb_max_q16[2]) {
+        int64_t ry = cpy + 3LL;
+        int64_t rz = cpz + 5LL;
+        uint32_t parity = 0U;
+        uint32_t rstack[128];
+        uint32_t rsp = 0U;
+        rstack[rsp++] = 0U;
+        uint32_t rvis = 0U;
+        while (rsp > 0U && rvis <= (ncnt * 2U)) {
+            uint32_t nid = rstack[--rsp];
+            if (nid >= ncnt) continue;
+            const BloomBvhNode64 *nd = &nodes[nid];
+            ++rvis;
+            if (cpx > (int64_t)nd->aabb_max_q16[0] ||
+                ry < (int64_t)nd->aabb_min_q16[1] || ry > (int64_t)nd->aabb_max_q16[1] ||
+                rz < (int64_t)nd->aabb_min_q16[2] || rz > (int64_t)nd->aabb_max_q16[2]) {
+                continue;
+            }
+            if (nd->is_leaf != 0U) {
+                uint32_t first = nd->left_or_first;
+                uint32_t cnt = nd->right_or_count;
+                for (uint32_t k = 0U; k < cnt && (first + k) < tcnt; ++k) {
+                    if (sc_ray_pos_x_hits_tri(&tris[first + k], cpx, ry, rz)) {
+                        parity ^= 1U;
+                    }
+                }
+            } else {
+                uint32_t l = nd->left_or_first;
+                uint32_t r = nd->right_or_count;
+                if (r > nid && r < ncnt && rsp < 128U) rstack[rsp++] = r;
+                if (l > nid && l < ncnt && rsp < 128U) rstack[rsp++] = l;
+            }
+        }
+        visited += rvis;
+        if (parity != 0U) {
+            res = -best_ud;
+        }
+    }
+
+    if (hit_shell_q12 > 0U) {
+        res = sc_sat_sub64(res, (int64_t)hit_shell_q12 << 4);
+    }
+    if (out_visited) *out_visited = visited;
+    return res;
+}
+
 /* 3. Volume-Preserving Q16.16 Dual-Quaternion Skeletal Skinning */
 static void sc_quat_normalize_q16(int32_t q[4]) {
     uint64_t max_a = 0ULL;
@@ -1061,6 +1822,28 @@ int64_t bloom_sdf_brick64_sample_q16(const BloomSdfBrick64 *brick,
     return c0 + (((c1 - c0) * fz) >> 16);
 }
 
+int64_t bloom_sdf_brick64_eval_world_q16(const BloomSdfBrick64 *brick,
+                                         int64_t px_q16,
+                                         int64_t py_q16,
+                                         int64_t pz_q16) {
+    if (!brick || brick->voxel_step_q16 <= 0) return (int64_t)BLOOM_MAX_Q16;
+    int64_t cpx = sc_clamp64(px_q16, -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t cpy = sc_clamp64(py_q16, -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t cpz = sc_clamp64(pz_q16, -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+
+    int64_t span = 3LL * (int64_t)brick->voxel_step_q16;
+    int64_t bx0 = (int64_t)brick->origin_q16[0];
+    int64_t by0 = (int64_t)brick->origin_q16[1];
+    int64_t bz0 = (int64_t)brick->origin_q16[2];
+
+    int64_t qx = sc_clamp64(cpx, bx0, bx0 + span);
+    int64_t qy = sc_clamp64(cpy, by0, by0 + span);
+    int64_t qz = sc_clamp64(cpz, bz0, bz0 + span);
+    int64_t out_d = sc_len3_q16(cpx - qx, cpy - qy, cpz - qz);
+    int64_t samp = bloom_sdf_brick64_sample_q16(brick, qx, qy, qz);
+    return samp + out_d;
+}
+
 /* 5. Constitutive Physical Matter Optics & 128-Hex Wire Protocol */
 void bloom_matter_init64(BloomMatter64 *out_matter,
                          uint32_t matter_id,
@@ -1295,28 +2078,342 @@ static void sc_vec3_norm_q16(int64_t x, int64_t y, int64_t z, int32_t out_n[3]) 
     out_n[2] = (int32_t)((cz * 65536LL) / len);
 }
 
-bool bloom_scene_raycast64(BloomEngineArena *arena,
-                           int32_t cursor_norm_x_q16,
-                           int32_t cursor_norm_y_q16,
-                           BloomRaycastHit64 *out_hit) {
+static int64_t sc_eval_inst_sdf_world_q16(const BloomEngineArena *arena,
+                                          const BloomPrefabInst64 *inst,
+                                          int64_t px,
+                                          int64_t py,
+                                          int64_t pz) {
+    uint32_t pid = inst->prefab_id;
+    if (pid == 0U || pid > BLOOM_MAX_PREFABS) return (int64_t)BLOOM_MAX_Q16;
+    const BloomPrefabDesc64 *pf = &arena->map.prefabs[pid - 1U];
+
+    int64_t sc = (inst->scale_q16 > 4096)
+        ? sc_clamp64((int64_t)inst->scale_q16, 4096, 256LL * BLOOM_Q16_ONE)
+        : (int64_t)BLOOM_Q16_ONE;
+    int32_t rel[3] = {
+        sc_clamp64_to_i32(px - (int64_t)inst->pos_q16[0]),
+        sc_clamp64_to_i32(py - (int64_t)inst->pos_q16[1]),
+        sc_clamp64_to_i32(pz - (int64_t)inst->pos_q16[2])
+    };
+    int32_t rot_rel[3];
+    bloom_rot_inv_euler_q16(rel, inst->rot_euler_q16, rot_rel);
+
+    int64_t lx = ((int64_t)rot_rel[0] * 65536LL) / sc;
+    int64_t ly = ((int64_t)rot_rel[1] * 65536LL) / sc;
+    int64_t lz = ((int64_t)rot_rel[2] * 65536LL) / sc;
+
+    int64_t d_local = 0;
+    if (pf->csg_count > 0U &&
+        (size_t)pf->csg_start_idx + (size_t)pf->csg_count <= BLOOM_MAX_CSG_OPS) {
+        uint32_t dummy_mat = 0U;
+        d_local = bloom_csg_eval_program_q16(
+            &arena->map.csg_ops[pf->csg_start_idx],
+            pf->csg_count, lx, ly, lz, &dummy_mat);
+    } else {
+        d_local = bloom_prefab_eval_sdf_q16(pf, lx, ly, lz, inst->param_override_q16);
+    }
+    d_local = sc_clamp64(d_local, -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    return (d_local * sc) >> 16;
+}
+
+static int64_t sc_eval_scene_core_q16(const BloomEngineArena *arena,
+                                      const BloomMeshArena *opt_mesh,
+                                      int64_t px,
+                                      int64_t py,
+                                      int64_t pz,
+                                      bool apply_clip,
+                                      uint32_t *out_inst_id,
+                                      uint32_t *out_prefab_id,
+                                      uint32_t *out_matter_id,
+                                      uint32_t *inout_bvh_vis) {
+    const BloomFrameHeader64 *hdr = &arena->map.frame_hdr;
+    const BloomSectionSpec64 *sec = &arena->map.section_spec;
+    uint32_t inst_n = (hdr->inst_count > BLOOM_MAX_INSTANCES) ? BLOOM_MAX_INSTANCES : hdr->inst_count;
+
+    int64_t min_d = (int64_t)BLOOM_MAX_Q16;
+    uint32_t best_inst = 0U;
+    uint32_t best_prefab = 0U;
+    uint32_t best_matter = 0U;
+
+    for (uint32_t i = 0U; i < inst_n; ++i) {
+        const BloomPrefabInst64 *inst = &arena->map.instances[i];
+        if ((inst->flags & BLOOM_INST_FLAG_ACTIVE) == 0U) continue;
+        uint32_t pid = inst->prefab_id;
+        if (pid == 0U || pid > BLOOM_MAX_PREFABS) continue;
+        const BloomPrefabDesc64 *pf = &arena->map.prefabs[pid - 1U];
+
+        int64_t sc = (inst->scale_q16 > 4096)
+            ? sc_clamp64((int64_t)inst->scale_q16, 4096, 256LL * BLOOM_Q16_ONE)
+            : (int64_t)BLOOM_Q16_ONE;
+        int64_t br = sc_clamp64((int64_t)pf->bounding_radius_q16, 0, 1024LL * BLOOM_Q16_ONE);
+        if (br > 0) {
+            int64_t lx = ((px - (int64_t)inst->pos_q16[0]) * 65536LL) / sc;
+            int64_t ly = ((py - (int64_t)inst->pos_q16[1]) * 65536LL) / sc;
+            int64_t lz = ((pz - (int64_t)inst->pos_q16[2]) * 65536LL) / sc;
+            int64_t bound_d = sc_clamp64(sc_len3_q16(lx, ly, lz) - (br + 32768LL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+            if (((bound_d * sc) >> 16) >= min_d) continue;
+        }
+
+        int64_t d_world = sc_eval_inst_sdf_world_q16(arena, inst, px, py, pz);
+        if (apply_clip) {
+            d_world = bloom_section_eval_clip_q16(d_world, px, py, pz, hdr, sec, NULL);
+        }
+        if (d_world < min_d) {
+            min_d = d_world;
+            best_inst = (inst->inst_id != 0U) ? inst->inst_id : (i + 1U);
+            best_prefab = pid;
+            best_matter = (inst->matter_override_id < BLOOM_MAX_MATTERS &&
+                           (inst->flags & BLOOM_INST_FLAG_OVERRIDDEN) != 0U)
+                ? inst->matter_override_id
+                : pf->matter_id;
+        }
+    }
+
+    if (sec->global_csg_count > 0U &&
+        (size_t)sec->global_csg_start + (size_t)sec->global_csg_count <= BLOOM_MAX_CSG_OPS) {
+        uint32_t vis = 0U;
+        uint32_t csg_mat = arena->map.csg_ops[sec->global_csg_start].matter_id;
+        uint32_t bvh_n = (hdr->bvh_count > BLOOM_MAX_BVH_NODES) ? BLOOM_MAX_BVH_NODES : hdr->bvh_count;
+        int64_t d_csg = (sec->global_csg_start == 0U && bvh_n > 0U)
+            ? bloom_bvh_eval_csg_q16(arena->map.bvh_nodes, bvh_n, arena->map.csg_ops,
+                                     sec->global_csg_count, px, py, pz, &vis)
+            : bloom_csg_eval_program_q16(&arena->map.csg_ops[sec->global_csg_start],
+                                         sec->global_csg_count, px, py, pz, &csg_mat);
+        if (inout_bvh_vis) *inout_bvh_vis += vis;
+        if (apply_clip) {
+            d_csg = bloom_section_eval_clip_q16(d_csg, px, py, pz, hdr, sec, NULL);
+        }
+        if (d_csg < min_d) {
+            min_d = d_csg;
+            best_inst = 99U;
+            best_prefab = 0U;
+            best_matter = csg_mat;
+        }
+    }
+
+    if (sec->joint_count > 0U) {
+        uint32_t jcnt = (sec->joint_count > BLOOM_MAX_JOINTS) ? BLOOM_MAX_JOINTS : sec->joint_count;
+        int64_t d_sk = bloom_skeleton_eval_sdf_q16(arena->map.joints, jcnt, px, py, pz);
+        if (apply_clip) {
+            d_sk = bloom_section_eval_clip_q16(d_sk, px, py, pz, hdr, sec, NULL);
+        }
+        if (d_sk < min_d) {
+            min_d = d_sk;
+            best_inst = 100U;
+            best_prefab = 0U;
+            best_matter = arena->map.joints[0].matter_id;
+        }
+    }
+
+    if (sec->brick_count > 0U) {
+        uint32_t bcnt = (sec->brick_count > BLOOM_MAX_BRICKS) ? BLOOM_MAX_BRICKS : sec->brick_count;
+        for (uint32_t b = 0U; b < bcnt; ++b) {
+            int64_t d_br = bloom_sdf_brick64_eval_world_q16(&arena->map.bricks[b], px, py, pz);
+            if (apply_clip) {
+                d_br = bloom_section_eval_clip_q16(d_br, px, py, pz, hdr, sec, NULL);
+            }
+            if (d_br < min_d) {
+                min_d = d_br;
+                best_inst = 101U;
+                best_prefab = 0U;
+                best_matter = arena->map.bricks[b].matter_id;
+            }
+        }
+    }
+
+    if (opt_mesh && sec->mesh_tri_count > 0U && sec->mesh_bvh_count > 0U) {
+        uint32_t vis = 0U;
+        bool solid = (sec->inspect_flags & BLOOM_INSPECT_MESH_SOLID) != 0U;
+        int64_t d_mesh = bloom_mesh_eval_sdf_q16(
+            opt_mesh, sec->mesh_tri_count, sec->mesh_bvh_count, solid, px, py, pz, &vis);
+        if (inout_bvh_vis) *inout_bvh_vis += vis;
+        if (apply_clip) {
+            d_mesh = bloom_section_eval_clip_q16(d_mesh, px, py, pz, hdr, sec, NULL);
+        }
+        if (d_mesh < min_d) {
+            min_d = d_mesh;
+            best_inst = 102U;
+            best_prefab = 0U;
+            best_matter = sec->mesh_matter_style & 0xFFFFU;
+        }
+    }
+
+    if (out_inst_id) *out_inst_id = best_inst;
+    if (out_prefab_id) *out_prefab_id = best_prefab;
+    if (out_matter_id) *out_matter_id = best_matter;
+    return min_d;
+}
+
+static int64_t sc_eval_scene_at_q16(const BloomEngineArena *arena,
+                                    const BloomMeshArena *opt_mesh,
+                                    int64_t px,
+                                    int64_t py,
+                                    int64_t pz,
+                                    uint32_t *out_inst_id,
+                                    uint32_t *out_prefab_id,
+                                    uint32_t *inout_bvh_vis) {
+    return sc_eval_scene_core_q16(arena, opt_mesh, px, py, pz, true,
+                                  out_inst_id, out_prefab_id, NULL, inout_bvh_vis);
+}
+
+static int64_t sc_hess_proj_q16(const int32_t a[3],
+                                const int64_t hmat[3][3],
+                                const int32_t b[3],
+                                int64_t glen_q16) {
+    int64_t hb0 = (hmat[0][0] * (int64_t)b[0] + hmat[0][1] * (int64_t)b[1] + hmat[0][2] * (int64_t)b[2]) >> 16;
+    int64_t hb1 = (hmat[1][0] * (int64_t)b[0] + hmat[1][1] * (int64_t)b[1] + hmat[1][2] * (int64_t)b[2]) >> 16;
+    int64_t hb2 = (hmat[2][0] * (int64_t)b[0] + hmat[2][1] * (int64_t)b[1] + hmat[2][2] * (int64_t)b[2]) >> 16;
+    int64_t num = ((int64_t)a[0] * hb0 + (int64_t)a[1] * hb1 + (int64_t)a[2] * hb2) >> 16;
+    num = sc_clamp64(num, -INT64_C(0x3FFFFFFFFFF), INT64_C(0x3FFFFFFFFFF));
+    return sc_clamp64((num * 65536LL) / sc_max64(glen_q16, 4096LL),
+                      -1024LL * BLOOM_Q16_ONE, 1024LL * BLOOM_Q16_ONE);
+}
+
+void bloom_scene_eval_jet2_q16(const BloomEngineArena *arena,
+                               const BloomMeshArena *opt_mesh,
+                               int64_t px_q16,
+                               int64_t py_q16,
+                               int64_t pz_q16,
+                               BloomFieldJet64 *out_jet) {
+    if (!out_jet) return;
+    memset(out_jet, 0, sizeof(*out_jet));
+    if (!arena) return;
+
+    int64_t cx = sc_clamp64(px_q16, -SC_MAX_COORD_Q16 + 16384LL, SC_MAX_COORD_Q16 - 16384LL);
+    int64_t cy = sc_clamp64(py_q16, -SC_MAX_COORD_Q16 + 16384LL, SC_MAX_COORD_Q16 - 16384LL);
+    int64_t cz = sc_clamp64(pz_q16, -SC_MAX_COORD_Q16 + 16384LL, SC_MAX_COORD_Q16 - 16384LL);
+    const int64_t h = 4096LL; /* 1/16 unit: 1/(2h)=8, 1/h^2=256, 1/(4h^2)=64 */
+
+    uint32_t mid = 0U;
+    int64_t f0   = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx, cy, cz, false, NULL, NULL, &mid, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_px = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx + h, cy, cz, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_mx = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx - h, cy, cz, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_py = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx, cy + h, cz, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_my = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx, cy - h, cz, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_pz = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx, cy, cz + h, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_mz = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx, cy, cz - h, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+
+    int64_t f_pp0 = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx + h, cy + h, cz, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_pm0 = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx + h, cy - h, cz, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_mp0 = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx - h, cy + h, cz, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_mm0 = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx - h, cy - h, cz, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+
+    int64_t f_0pp = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx, cy + h, cz + h, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_0pm = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx, cy + h, cz - h, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_0mp = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx, cy - h, cz + h, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_0mm = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx, cy - h, cz - h, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+
+    int64_t f_p0p = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx + h, cy, cz + h, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_p0m = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx + h, cy, cz - h, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_m0p = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx - h, cy, cz + h, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+    int64_t f_m0m = sc_clamp64(sc_eval_scene_core_q16(arena, opt_mesh, cx - h, cy, cz - h, false, NULL, NULL, NULL, NULL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
+
+    int64_t gx = (f_px - f_mx) * 8LL;
+    int64_t gy = (f_py - f_my) * 8LL;
+    int64_t gz = (f_pz - f_mz) * 8LL;
+    int64_t glen = sc_max64(sc_len3_q16(gx, gy, gz), 4096LL);
+
+    int32_t n[3];
+    sc_vec3_norm_q16(gx, gy, gz, n);
+
+    int64_t d2x = sc_clamp64(f_px - 2LL * f0 + f_mx, -0x0FFFFFFFLL, 0x0FFFFFFFLL);
+    int64_t d2y = sc_clamp64(f_py - 2LL * f0 + f_my, -0x0FFFFFFFLL, 0x0FFFFFFFLL);
+    int64_t d2z = sc_clamp64(f_pz - 2LL * f0 + f_mz, -0x0FFFFFFFLL, 0x0FFFFFFFLL);
+    int64_t dxy = sc_clamp64((f_pp0 - f_pm0) - (f_mp0 - f_mm0), -0x0FFFFFFFLL, 0x0FFFFFFFLL);
+    int64_t dyz = sc_clamp64((f_0pp - f_0pm) - (f_0mp - f_0mm), -0x0FFFFFFFLL, 0x0FFFFFFFLL);
+    int64_t dxz = sc_clamp64((f_p0p - f_p0m) - (f_m0p - f_m0m), -0x0FFFFFFFLL, 0x0FFFFFFFLL);
+
+    int64_t hxx = sc_clamp64(d2x * 256LL, -BLOOM_MAX_Q16, BLOOM_MAX_Q16);
+    int64_t hyy = sc_clamp64(d2y * 256LL, -BLOOM_MAX_Q16, BLOOM_MAX_Q16);
+    int64_t hzz = sc_clamp64(d2z * 256LL, -BLOOM_MAX_Q16, BLOOM_MAX_Q16);
+    int64_t hxy = sc_clamp64(dxy * 64LL, -BLOOM_MAX_Q16, BLOOM_MAX_Q16);
+    int64_t hyz = sc_clamp64(dyz * 64LL, -BLOOM_MAX_Q16, BLOOM_MAX_Q16);
+    int64_t hxz = sc_clamp64(dxz * 64LL, -BLOOM_MAX_Q16, BLOOM_MAX_Q16);
+
+    int64_t hmat[3][3] = {
+        { hxx, hxy, hxz },
+        { hxy, hyy, hyz },
+        { hxz, hyz, hzz }
+    };
+
+    int32_t up_ref[3];
+    if (sc_abs64((int64_t)n[1]) < 52000LL) {
+        up_ref[0] = 0; up_ref[1] = BLOOM_Q16_ONE; up_ref[2] = 0;
+    } else {
+        up_ref[0] = BLOOM_Q16_ONE; up_ref[1] = 0; up_ref[2] = 0;
+    }
+    int32_t t1[3], t2[3];
+    sc_vec3_norm_q16(((int64_t)up_ref[1] * n[2] - (int64_t)up_ref[2] * n[1]) >> 16,
+                     ((int64_t)up_ref[2] * n[0] - (int64_t)up_ref[0] * n[2]) >> 16,
+                     ((int64_t)up_ref[0] * n[1] - (int64_t)up_ref[1] * n[0]) >> 16, t1);
+    sc_vec3_norm_q16(((int64_t)n[1] * t1[2] - (int64_t)n[2] * t1[1]) >> 16,
+                     ((int64_t)n[2] * t1[0] - (int64_t)n[0] * t1[2]) >> 16,
+                     ((int64_t)n[0] * t1[1] - (int64_t)n[1] * t1[0]) >> 16, t2);
+
+    int64_t s11 = sc_hess_proj_q16(t1, hmat, t1, glen);
+    int64_t s22 = sc_hess_proj_q16(t2, hmat, t2, glen);
+    int64_t s12 = sc_hess_proj_q16(t1, hmat, t2, glen);
+
+    int64_t diff_s = s11 - s22;
+    int64_t two_s12 = 2LL * s12;
+    int64_t aniso = sc_len2_q16(diff_s, two_s12);
+
+    int64_t bx = BLOOM_Q16_ONE;
+    int64_t by = 0;
+    if (aniso > 64LL) {
+        if (diff_s >= 0) {
+            bx = diff_s + aniso;
+            by = two_s12;
+        } else {
+            bx = two_s12;
+            by = aniso - diff_s;
+        }
+    }
+    int64_t blen = sc_max64(sc_len2_q16(bx, by), 1LL);
+    int64_t ux = sc_clamp64(bx, -0x3FFFFFFFFFFLL, 0x3FFFFFFFFFFLL) * 65536LL / blen;
+    int64_t uy = sc_clamp64(by, -0x3FFFFFFFFFFLL, 0x3FFFFFFFFFFLL) * 65536LL / blen;
+
+    int32_t e1[3];
+    sc_vec3_norm_q16((ux * t1[0] + uy * t2[0]) >> 16,
+                     (ux * t1[1] + uy * t2[1]) >> 16,
+                     (ux * t1[2] + uy * t2[2]) >> 16, e1);
+
+    out_jet->sdf_q16 = sc_clamp64_to_i32(f0);
+    out_jet->grad_q16[0] = n[0];
+    out_jet->grad_q16[1] = n[1];
+    out_jet->grad_q16[2] = n[2];
+    out_jet->hess_diag_q16[0] = (int32_t)hxx;
+    out_jet->hess_diag_q16[1] = (int32_t)hyy;
+    out_jet->hess_diag_q16[2] = (int32_t)hzz;
+    out_jet->mean_curv_q16 = sc_clamp64_to_i32((s11 + s22) / 2LL);
+    out_jet->gauss_curv_q16 = sc_clamp64_to_i32(((s11 * s22) - (s12 * s12)) >> 16);
+    out_jet->prin_dir_q16[0] = e1[0];
+    out_jet->prin_dir_q16[1] = e1[1];
+    out_jet->prin_dir_q16[2] = e1[2];
+    out_jet->anisotropy_q16 = sc_clamp64_to_i32(aniso);
+    out_jet->matter_id = mid;
+    sc_stamp_mac(out_jet, 0x4E720064ULL, &out_jet->mac_lo32, &out_jet->mac_hi32);
+}
+
+bool bloom_scene_raycast_ex64(BloomEngineArena *arena,
+                              const BloomMeshArena *opt_mesh,
+                              int32_t cursor_norm_x_q16,
+                              int32_t cursor_norm_y_q16,
+                              BloomRaycastHit64 *out_hit) {
     if (!arena) return false;
     BloomRaycastHit64 hit;
     memset(&hit, 0, sizeof(hit));
     hit.ray_origin_q16[0] = cursor_norm_x_q16;
     hit.ray_origin_q16[1] = cursor_norm_y_q16;
 
-    const BloomFrameHeader64 *hdr = &arena->cells[BLOOM_SLOT_HEADER].frame_hdr;
-    const BloomCamera64 *cam = &arena->cells[BLOOM_SLOT_CAMERA].camera;
+    const BloomFrameHeader64 *hdr = &arena->map.frame_hdr;
+    const BloomCamera64 *cam = &arena->map.camera;
 
-    /* Build camera orthonormal basis (fwd, right, up_ortho) in Q16 */
     int32_t fwd[3], right[3], up_v[3];
     sc_vec3_norm_q16((int64_t)cam->target_q16[0] - cam->eye_q16[0],
                      (int64_t)cam->target_q16[1] - cam->eye_q16[1],
                      (int64_t)cam->target_q16[2] - cam->eye_q16[2], fwd);
-    /* right = normalize(cross(world_up, fwd)) in left-handed / forward +Z convention:
-       cross((0,1,0), fwd) = (fwd.z, 0, -fwd.x) */
     sc_vec3_norm_q16(fwd[2], 0, -fwd[0], right);
-    /* up_v = cross(fwd, right) */
     up_v[0] = (int32_t)(((int64_t)fwd[1] * right[2] - (int64_t)fwd[2] * right[1]) >> 16);
     up_v[1] = (int32_t)(((int64_t)fwd[2] * right[0] - (int64_t)fwd[0] * right[2]) >> 16);
     up_v[2] = (int32_t)(((int64_t)fwd[0] * right[1] - (int64_t)fwd[1] * right[0]) >> 16);
@@ -1329,7 +2426,6 @@ bool bloom_scene_raycast64(BloomEngineArena *arena,
     int64_t cnx = sc_clamp64((int64_t)cursor_norm_x_q16, -4LL * BLOOM_Q16_ONE, 4LL * BLOOM_Q16_ONE);
     int64_t cny = sc_clamp64((int64_t)cursor_norm_y_q16, -4LL * BLOOM_Q16_ONE, 4LL * BLOOM_Q16_ONE);
 
-    /* cursor_norm in [-65536..+65536], screen Y+ down -> world Y+ up (-cursor_norm_y) */
     int64_t uvx = ((cnx * aspect_q16) >> 17);
     int64_t uvy = -(cny >> 1);
 
@@ -1339,8 +2435,6 @@ bool bloom_scene_raycast64(BloomEngineArena *arena,
                      ((int64_t)right[2] * uvx + (int64_t)up_v[2] * uvy + (int64_t)fwd[2] * fov_z_q16) >> 16,
                      rd);
 
-    uint32_t inst_n = (hdr->inst_count > BLOOM_MAX_INSTANCES) ? BLOOM_MAX_INSTANCES : hdr->inst_count;
-    bool xray_on = (hdr->flags & BLOOM_FLAG_XRAY_ENABLED) != 0U;
     int64_t t = 8192;
     const int64_t t_max = 32LL * BLOOM_Q16_ONE;
     uint32_t total_bvh_vis = 0U;
@@ -1350,56 +2444,10 @@ bool bloom_scene_raycast64(BloomEngineArena *arena,
         int64_t py = cam->eye_q16[1] + (((int64_t)rd[1] * t) >> 16);
         int64_t pz = cam->eye_q16[2] + (((int64_t)rd[2] * t) >> 16);
 
-        int64_t min_d = (int64_t)BLOOM_MAX_Q16;
         uint32_t best_inst = 0U;
-        uint32_t best_inst_slot = 0U;
         uint32_t best_prefab = 0U;
-
-        for (uint32_t i = 0U; i < inst_n; ++i) {
-            const BloomPrefabInst64 *inst = &arena->map.instances[i];
-            if ((inst->flags & BLOOM_INST_FLAG_ACTIVE) == 0U) continue;
-            uint32_t pid = inst->prefab_id;
-            if (pid == 0U || pid > BLOOM_MAX_PREFABS) continue;
-            const BloomPrefabDesc64 *pf = &arena->map.prefabs[pid - 1U];
-
-            int64_t sc = (inst->scale_q16 > 4096)
-                ? sc_clamp64((int64_t)inst->scale_q16, 4096, 256LL * BLOOM_Q16_ONE)
-                : (int64_t)BLOOM_Q16_ONE;
-            int64_t lx = ((px - (int64_t)inst->pos_q16[0]) * 65536LL) / sc;
-            int64_t ly = ((py - (int64_t)inst->pos_q16[1]) * 65536LL) / sc;
-            int64_t lz = ((pz - (int64_t)inst->pos_q16[2]) * 65536LL) / sc;
-
-            /* Fast bounding-sphere skip: note xray cutaway is max(d, xray_plane - px),
-               which only INCREASES SDF, so bound_d remains a valid lower bound! */
-            int64_t br = sc_clamp64((int64_t)pf->bounding_radius_q16, 0, 1024LL * BLOOM_Q16_ONE);
-            int64_t bound_d = sc_clamp64(sc_len3_q16(lx, ly, lz) - (br + 32768LL), -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
-            if (((bound_d * sc) >> 16) >= min_d) continue;
-
-            int64_t d_local = sc_clamp64(bloom_prefab_eval_sdf_q16(pf, lx, ly, lz, inst->param_override_q16),
-                                         -SC_MAX_COORD_Q16, SC_MAX_COORD_Q16);
-            int64_t d_world = (d_local * sc) >> 16;
-            d_world = bloom_prefab_eval_xray_cutaway_q16(d_world, px, hdr->xray_plane_q16, xray_on);
-            if (d_world < min_d) {
-                min_d = d_world;
-                best_inst = (inst->inst_id != 0U) ? inst->inst_id : (i + 1U);
-                best_inst_slot = i;
-                best_prefab = pid;
-            }
-        }
-
-        uint32_t bvh_n = (hdr->bvh_count > BLOOM_MAX_BVH_NODES) ? BLOOM_MAX_BVH_NODES : hdr->bvh_count;
-        uint32_t csg_n = (hdr->csg_count > BLOOM_MAX_CSG_OPS) ? BLOOM_MAX_CSG_OPS : hdr->csg_count;
-        if (bvh_n > 0U && csg_n > 0U) {
-            uint32_t vis = 0U;
-            int64_t d_bvh = bloom_bvh_eval_csg_q16(
-                arena->map.bvh_nodes, bvh_n,
-                arena->map.csg_ops, csg_n,
-                px, py, pz, &vis);
-            total_bvh_vis += vis;
-            if (d_bvh < min_d && best_inst == 0U) {
-                min_d = d_bvh;
-            }
-        }
+        int64_t min_d = sc_eval_scene_at_q16(arena, opt_mesh, px, py, pz,
+                                             &best_inst, &best_prefab, &total_bvh_vis);
 
         if (min_d < 512) {
             hit.hit_valid = (best_inst != 0U) ? 1U : 0U;
@@ -1412,25 +2460,15 @@ bool bloom_scene_raycast64(BloomEngineArena *arena,
             hit.hit_pos_q16[1] = sc_clamp64_to_i32(py);
             hit.hit_pos_q16[2] = sc_clamp64_to_i32(pz);
 
-            /* Finite-difference SDF surface normal */
-            if (best_prefab >= 1U && best_prefab <= BLOOM_MAX_PREFABS && best_inst_slot < inst_n) {
-                const BloomPrefabDesc64 *pf = &arena->map.prefabs[best_prefab - 1U];
-                int64_t eps = 1024;
-                const BloomPrefabInst64 *inst = &arena->map.instances[best_inst_slot];
-                int64_t sc = (inst->scale_q16 > 4096)
-                    ? sc_clamp64((int64_t)inst->scale_q16, 4096, 256LL * BLOOM_Q16_ONE)
-                    : (int64_t)BLOOM_Q16_ONE;
-                int64_t lx = ((px - (int64_t)inst->pos_q16[0]) * 65536LL) / sc;
-                int64_t ly = ((py - (int64_t)inst->pos_q16[1]) * 65536LL) / sc;
-                int64_t lz = ((pz - (int64_t)inst->pos_q16[2]) * 65536LL) / sc;
-                int64_t gx = sc_sat_sub64(bloom_prefab_eval_sdf_q16(pf, lx + eps, ly, lz, inst->param_override_q16),
-                                          bloom_prefab_eval_sdf_q16(pf, lx - eps, ly, lz, inst->param_override_q16));
-                int64_t gy = sc_sat_sub64(bloom_prefab_eval_sdf_q16(pf, lx, ly + eps, lz, inst->param_override_q16),
-                                          bloom_prefab_eval_sdf_q16(pf, lx, ly - eps, lz, inst->param_override_q16));
-                int64_t gz = sc_sat_sub64(bloom_prefab_eval_sdf_q16(pf, lx, ly, lz + eps, inst->param_override_q16),
-                                          bloom_prefab_eval_sdf_q16(pf, lx, ly, lz - eps, inst->param_override_q16));
-                sc_vec3_norm_q16(gx, gy, gz, hit.hit_normal_q16);
-            }
+            int64_t eps = 1024;
+            int64_t gx = sc_sat_sub64(sc_eval_scene_at_q16(arena, opt_mesh, px + eps, py, pz, NULL, NULL, NULL),
+                                      sc_eval_scene_at_q16(arena, opt_mesh, px - eps, py, pz, NULL, NULL, NULL));
+            int64_t gy = sc_sat_sub64(sc_eval_scene_at_q16(arena, opt_mesh, px, py + eps, pz, NULL, NULL, NULL),
+                                      sc_eval_scene_at_q16(arena, opt_mesh, px, py - eps, pz, NULL, NULL, NULL));
+            int64_t gz = sc_sat_sub64(sc_eval_scene_at_q16(arena, opt_mesh, px, py, pz + eps, NULL, NULL, NULL),
+                                      sc_eval_scene_at_q16(arena, opt_mesh, px, py, pz - eps, NULL, NULL, NULL));
+            sc_vec3_norm_q16(gx, gy, gz, hit.hit_normal_q16);
+
             sc_stamp_mac(&hit, 0x4A1CA570ULL, &hit.mac_lo32, &hit.mac_hi32);
             arena->map.ray_hit = hit;
             if (out_hit) *out_hit = hit;
@@ -1444,4 +2482,271 @@ bool bloom_scene_raycast64(BloomEngineArena *arena,
     arena->map.ray_hit = hit;
     if (out_hit) *out_hit = hit;
     return false;
+}
+
+bool bloom_scene_raycast64(BloomEngineArena *arena,
+                           int32_t cursor_norm_x_q16,
+                           int32_t cursor_norm_y_q16,
+                           BloomRaycastHit64 *out_hit) {
+    return bloom_scene_raycast_ex64(arena, NULL, cursor_norm_x_q16, cursor_norm_y_q16, out_hit);
+}
+
+void bloom_metric_eval_scale64(int32_t beta_q16,
+                               int32_t phi_q16,
+                               int32_t flux_q16,
+                               const int32_t vel_dir_q16[3],
+                               const int32_t center_q16[3],
+                               BloomMetricScale64 *out_metric) {
+    if (!out_metric) return;
+    memset(out_metric, 0, sizeof(*out_metric));
+
+    int64_t b = sc_clamp64((int64_t)beta_q16, -62259LL, 62259LL);
+    int64_t phi = sc_clamp64((int64_t)phi_q16, -32768LL, 49152LL);
+    int64_t flux = sc_clamp64((int64_t)flux_q16, -262144LL, 262144LL);
+
+    int64_t om_b2 = 65536LL - ((b * b) >> 16);
+    if (om_b2 < 1024LL) om_b2 = 1024LL;
+    int64_t sqrt_om = sc_max64((int64_t)bloom_isqrt_u64_to_i32((uint64_t)om_b2 << 16ULL), 1LL);
+    int32_t gamma_q16 = sc_clamp64_to_i32((65536LL << 16) / sqrt_om);
+
+    uint64_t d_num = ((uint64_t)(65536LL + b)) << 32ULL;
+    uint64_t d_den = (uint64_t)(65536LL - b);
+    int32_t doppler_q16 = bloom_isqrt_u64_to_i32(d_num / d_den);
+
+    int32_t z_q16 = BLOOM_Q16_ONE;
+    if (phi > 0LL) {
+        if (phi >= 32768LL) {
+            z_q16 = 0;
+        } else {
+            uint64_t term = (uint64_t)(65536LL - 2LL * phi);
+            z_q16 = bloom_isqrt_u64_to_i32(term << 16ULL);
+        }
+    }
+
+    int32_t vdir[3] = { 0, 0, BLOOM_Q16_ONE };
+    if (vel_dir_q16) {
+        sc_vec3_norm_q16((int64_t)vel_dir_q16[0], (int64_t)vel_dir_q16[1], (int64_t)vel_dir_q16[2], vdir);
+    }
+
+    out_metric->proper_time_q16 = (int32_t)sqrt_om;
+    out_metric->lorentz_beta_q16 = (int32_t)b;
+    out_metric->lorentz_gamma_q16 = gamma_q16;
+    out_metric->doppler_factor_q16 = doppler_q16;
+    out_metric->metric_potential_q16 = (int32_t)phi;
+    out_metric->grav_redshift_q16 = z_q16;
+    out_metric->flux_pressure_q16 = (int32_t)flux;
+    out_metric->spatial_scale_q16 = BLOOM_Q16_ONE;
+    out_metric->rel_vel_dir_q16[0] = vdir[0];
+    out_metric->rel_vel_dir_q16[1] = vdir[1];
+    out_metric->rel_vel_dir_q16[2] = vdir[2];
+    if (center_q16) {
+        out_metric->center_pos_q16[0] = center_q16[0];
+        out_metric->center_pos_q16[1] = center_q16[1];
+        out_metric->center_pos_q16[2] = center_q16[2];
+    }
+    sc_stamp_mac(out_metric, 0x3E721C64ULL, &out_metric->mac_lo32, &out_metric->mac_hi32);
+}
+
+void bloom_camera_step_cine64(BloomCamera64 *cam,
+                              BloomRegBank64 *opt_regs,
+                              const int32_t subject_pos_q16[3],
+                              int32_t deadzone_q16,
+                              int32_t trauma_impulse_q16) {
+    if (!cam) return;
+    int64_t dz = sc_max64((int64_t)deadzone_q16, 0LL);
+
+    if (subject_pos_q16) {
+        for (uint32_t a = 0U; a < 3U; ++a) {
+            int64_t diff = (int64_t)subject_pos_q16[a] - (int64_t)cam->target_q16[a];
+            if (diff > dz) {
+                cam->target_q16[a] = sc_clamp64_to_i32((int64_t)cam->target_q16[a] + ((diff - dz) / 4LL));
+            } else if (diff < -dz) {
+                cam->target_q16[a] = sc_clamp64_to_i32((int64_t)cam->target_q16[a] + ((diff + dz) / 4LL));
+            }
+        }
+    }
+
+    int64_t trauma = (trauma_impulse_q16 > 0) ? sc_clamp64((int64_t)trauma_impulse_q16, 0LL, BLOOM_Q16_ONE) : 0LL;
+    uint32_t ep = 0U;
+    if (opt_regs) {
+        int64_t prev_tr = sc_clamp64((int64_t)opt_regs->channels_q16[BLOOM_REG_CINE_TRAUMA], 0LL, BLOOM_Q16_ONE);
+        int64_t decayed = (prev_tr * 7LL) >> 3;
+        trauma = sc_clamp64(decayed + trauma, 0LL, BLOOM_Q16_ONE);
+        opt_regs->channels_q16[BLOOM_REG_CINE_TRAUMA] = (int32_t)trauma;
+        opt_regs->dirty_mask |= (1U << BLOOM_REG_CINE_TRAUMA);
+        opt_regs->epoch++;
+        ep = opt_regs->epoch;
+        sc_stamp_mac(opt_regs, 0x2E9B0064ULL, &opt_regs->mac_lo32, &opt_regs->mac_hi32);
+    }
+
+    bloom_camera_sync_from_orbit(cam);
+
+    if (trauma > 256LL) {
+        int64_t amp = (trauma * trauma) >> 20;
+        int64_t sx = ((ep & 1U) == 0U) ? amp : -amp;
+        int64_t sy = ((ep & 2U) == 0U) ? (amp / 2LL) : -(amp / 2LL);
+        cam->eye_q16[0] = sc_clamp64_to_i32((int64_t)cam->eye_q16[0] + sx);
+        cam->eye_q16[1] = sc_clamp64_to_i32((int64_t)cam->eye_q16[1] + sy);
+    }
+
+    int64_t d_tgt = sc_len3_q16((int64_t)cam->target_q16[0] - (int64_t)cam->eye_q16[0],
+                                (int64_t)cam->target_q16[1] - (int64_t)cam->eye_q16[1],
+                                (int64_t)cam->target_q16[2] - (int64_t)cam->eye_q16[2]);
+    cam->focus_dist_q16 = sc_clamp64_to_i32(sc_max64(d_tgt, (int64_t)BLOOM_Q16_ONE));
+}
+
+static inline uint32_t sc_rgb_luma255(const uint8_t *px) {
+    return (54U * (uint32_t)px[0] + 183U * (uint32_t)px[1] + 19U * (uint32_t)px[2]) >> 8U;
+}
+
+bool bloom_moodboard_extract_rgb24(const uint8_t *rgb,
+                                   uint32_t width,
+                                   uint32_t height,
+                                   uint32_t stride_bytes,
+                                   BloomMoodboard64 *out_mood) {
+    if (!rgb || !out_mood || width < 2U || height < 2U || stride_bytes < width * 3U) {
+        return false;
+    }
+    memset(out_mood, 0, sizeof(*out_mood));
+
+    uint32_t cols = (width < 32U) ? width : 32U;
+    uint32_t rows = (height < 32U) ? height : 32U;
+    uint64_t sum_r = 0ULL, sum_g = 0ULL, sum_b = 0ULL;
+    uint64_t sum_luma = 0ULL, sum_edge = 0ULL;
+    int64_t sum_warm = 0;
+    uint32_t min_y = 255U, max_y = 0U;
+    uint32_t spec_cnt = 0U, total_cnt = 0U;
+    uint32_t best_chroma = 0U;
+    uint32_t accent_r = 128U, accent_g = 128U, accent_b = 128U;
+    uint64_t bin_sum[4] = { 0ULL, 0ULL, 0ULL, 0ULL };
+    uint32_t bin_cnt[4] = { 0U, 0U, 0U, 0U };
+
+    for (uint32_t r = 0U; r < rows; ++r) {
+        uint32_t sy = (r * (height - 1U)) / (rows - 1U);
+        uint32_t y0 = (sy > 0U) ? (sy - 1U) : 0U;
+        uint32_t y1 = (sy + 1U < height) ? (sy + 1U) : sy;
+        for (uint32_t c = 0U; c < cols; ++c) {
+            uint32_t sx = (c * (width - 1U)) / (cols - 1U);
+            uint32_t x0 = (sx > 0U) ? (sx - 1U) : 0U;
+            uint32_t x1 = (sx + 1U < width) ? (sx + 1U) : sx;
+
+            const uint8_t *p = rgb + (size_t)sy * (size_t)stride_bytes + (size_t)sx * 3U;
+            uint32_t pr = p[0], pg = p[1], pb = p[2];
+            uint32_t lum = sc_rgb_luma255(p);
+
+            sum_r += pr; sum_g += pg; sum_b += pb;
+            sum_luma += lum;
+            sum_warm += (int64_t)pr - (int64_t)pb;
+            if (lum < min_y) min_y = lum;
+            if (lum > max_y) max_y = lum;
+            if (lum > 220U) spec_cnt++;
+
+            uint32_t mx = (pr > pg) ? ((pr > pb) ? pr : pb) : ((pg > pb) ? pg : pb);
+            uint32_t mn = (pr < pg) ? ((pr < pb) ? pr : pb) : ((pg < pb) ? pg : pb);
+            uint32_t chroma = mx - mn;
+            if (chroma > best_chroma || total_cnt == 0U) {
+                best_chroma = chroma;
+                accent_r = pr; accent_g = pg; accent_b = pb;
+            }
+
+            uint32_t lx0 = sc_rgb_luma255(rgb + (size_t)sy * (size_t)stride_bytes + (size_t)x0 * 3U);
+            uint32_t lx1 = sc_rgb_luma255(rgb + (size_t)sy * (size_t)stride_bytes + (size_t)x1 * 3U);
+            uint32_t ly0 = sc_rgb_luma255(rgb + (size_t)y0 * (size_t)stride_bytes + (size_t)sx * 3U);
+            uint32_t ly1 = sc_rgb_luma255(rgb + (size_t)y1 * (size_t)stride_bytes + (size_t)sx * 3U);
+            uint32_t gx_d = (lx1 >= lx0) ? (lx1 - lx0) : (lx0 - lx1);
+            uint32_t gy_d = (ly1 >= ly0) ? (ly1 - ly0) : (ly0 - ly1);
+            sum_edge += gx_d + gy_d;
+
+            uint32_t bk = (lum >> 6U) & 3U;
+            bin_sum[bk] += lum;
+            bin_cnt[bk]++;
+            total_cnt++;
+        }
+    }
+
+    uint32_t avg_r = (uint32_t)(sum_r / total_cnt);
+    uint32_t avg_g = (uint32_t)(sum_g / total_cnt);
+    uint32_t avg_b = (uint32_t)(sum_b / total_cnt);
+    uint32_t avg_y = (uint32_t)(sum_luma / total_cnt);
+
+    out_mood->dominant_rgb24 = (avg_r << 16U) | (avg_g << 8U) | avg_b;
+    out_mood->accent_rgb24 = (accent_r << 16U) | (accent_g << 8U) | accent_b;
+    out_mood->warmth_q16 = (int32_t)((sum_warm * (int64_t)BLOOM_Q16_ONE) / ((int64_t)total_cnt * 255LL));
+    out_mood->contrast_q16 = (int32_t)(((uint64_t)(max_y - min_y) * (uint64_t)BLOOM_Q16_ONE) / 255ULL);
+    out_mood->edge_density_q16 = sc_clamp64_to_i32((int64_t)((sum_edge * (uint64_t)BLOOM_Q16_ONE) / ((uint64_t)total_cnt * 255ULL)));
+    out_mood->specular_hint_q16 = (int32_t)(((uint64_t)spec_cnt * (uint64_t)BLOOM_Q16_ONE) / (uint64_t)total_cnt);
+
+    for (uint32_t k = 0U; k < 4U; ++k) {
+        uint32_t fallback_y = k * 64U + 32U;
+        uint32_t by = (bin_cnt[k] > 0U) ? (uint32_t)(bin_sum[k] / bin_cnt[k]) : fallback_y;
+        out_mood->palette_luma_q16[k] = (int32_t)(((uint64_t)by * (uint64_t)BLOOM_Q16_ONE) / 255ULL);
+    }
+
+    uint32_t matter = BLOOM_MATTER_CRYSTAL_GLASS;
+    if (avg_y < 55U) {
+        matter = BLOOM_MATTER_OBSIDIAN;
+    } else if (out_mood->warmth_q16 > 10000 && avg_r > 120U) {
+        matter = BLOOM_MATTER_AURUM_GOLD;
+    } else if (avg_b > avg_r + 24U && avg_b >= avg_g) {
+        matter = BLOOM_MATTER_SAPPHIRE;
+    } else if (avg_g > avg_r + 20U && avg_g > avg_b + 12U) {
+        matter = BLOOM_MATTER_IMPERIAL_JADE;
+    } else if (out_mood->specular_hint_q16 > 8192 || out_mood->contrast_q16 > 36000) {
+        matter = BLOOM_MATTER_TITANIUM;
+    }
+    out_mood->inferred_matter_id = matter;
+    out_mood->inferred_prim_mask = (out_mood->edge_density_q16 > 16384)
+        ? BLOOM_CSG_MASK_PACK(BLOOM_CSG_PRIM_OCTAHEDRON, BLOOM_CSG_PRIM_BOX, BLOOM_CSG_BOOL_INTERSECT, 0, 1)
+        : BLOOM_CSG_MASK_PACK(BLOOM_CSG_PRIM_SPHERE, BLOOM_CSG_PRIM_TORUS, BLOOM_CSG_BOOL_SMOOTH_UNION, 4, 0);
+
+    sc_stamp_mac(out_mood, 0x400DB064ULL, &out_mood->mac_lo32, &out_mood->mac_hi32);
+    return true;
+}
+
+void bloom_moodboard_compile_to_ssot64(const BloomMoodboard64 *mood,
+                                       uint32_t style_id,
+                                       uint32_t prefab_id,
+                                       BloomArtStyle64 *out_style,
+                                       BloomPrefabDesc64 *out_prefab) {
+    if (!mood) return;
+    uint32_t matter = mood->inferred_matter_id & 7U;
+    uint32_t sid = (style_id >= 1U && style_id <= BLOOM_MAX_STYLES) ? style_id : 1U;
+    uint32_t pid = (prefab_id >= 1U && prefab_id <= BLOOM_MAX_PREFABS) ? prefab_id : 1U;
+
+    if (out_style) {
+        memset(out_style, 0, sizeof(*out_style));
+        out_style->style_id = sid;
+        out_style->base_rgb24 = mood->dominant_rgb24;
+        out_style->accent_rgb24 = mood->accent_rgb24;
+        out_style->roughness_q16 = sc_clamp32(8192 + (mood->edge_density_q16 >> 1), 1638, 49152);
+        out_style->metallic_q16 = sc_clamp32(mood->specular_hint_q16 * 2, 0, 62000);
+        out_style->emissive_gain_q16 = (mood->specular_hint_q16 > 12000) ? 98304 : 65536;
+        out_style->sdf_noise_freq_q16 = 131072;
+        out_style->sdf_noise_amp_q16 = 2048;
+        out_style->msdf_stroke_q16 = 3072;
+        out_style->strobe_hz_q16 = 0; /* TRC <= 3.0 Hz strictly safe */
+        out_style->matter_slot = matter;
+        sc_stamp_mac(out_style, 0x5791E064ULL, &out_style->mac_lo32, &out_style->mac_hi32);
+    }
+
+    if (out_prefab) {
+        memset(out_prefab, 0, sizeof(*out_prefab));
+        out_prefab->prefab_id = pid;
+        out_prefab->art_style_id = sid;
+        out_prefab->matter_id = matter;
+        out_prefab->csg_op_mask = (mood->inferred_prim_mask != 0U)
+            ? mood->inferred_prim_mask
+            : BLOOM_CSG_MASK_PACK(BLOOM_CSG_PRIM_SPHERE, BLOOM_CSG_PRIM_NONE, BLOOM_CSG_BOOL_UNION, 0, 0);
+        out_prefab->bounding_radius_q16 = 98304;
+        out_prefab->prim_params_q16[0] = 65536;
+        out_prefab->prim_params_q16[1] = 24576;
+        out_prefab->prim_params_q16[2] = 49152;
+        out_prefab->prim_params_q16[3] = 49152;
+        out_prefab->prim_params_q16[4] = 49152;
+        out_prefab->prim_params_q16[5] = 16384;
+        out_prefab->flags = 1U;
+        uint64_t h = bloom_hash56_fnv1a(out_prefab, 0x550794EFULL);
+        out_prefab->hash_lo32 = (uint32_t)(h & 0xFFFFFFFFULL);
+        out_prefab->hash_hi32 = (uint32_t)(h >> 32ULL);
+    }
 }

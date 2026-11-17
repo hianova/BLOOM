@@ -10,10 +10,17 @@ struct BloomGpuCtx {
     BloomEngineArena       *arena;
     SDL_GPUDevice          *device;
     SDL_GPUComputePipeline *pipeline;
+    SDL_GPUComputePipeline *pipe_rc2;
+    SDL_GPUComputePipeline *pipe_rc1;
+    SDL_GPUComputePipeline *pipe_rc0;
     SDL_GPUBuffer          *arena_gpu_buf;
+    SDL_GPUBuffer          *mesh_gpu_buf;
+    SDL_GPUBuffer          *rc_gpu_buf;
     SDL_GPUTransferBuffer  *upload_tbuf;
+    SDL_GPUTransferBuffer  *mesh_upload_tbuf;
     SDL_GPUTexture         *frame_tex;
     SDL_GPUTransferBuffer  *download_tbuf;
+    SDL_AudioStream        *audio_stream;
     uint32_t                width;
     uint32_t                height;
     uint32_t                dispatch_count;
@@ -244,17 +251,23 @@ BloomGpuCtx *bloom_gpu_init(BloomEngineArena *arena, const char *shader_path) {
     pipe_info.format = chosen_fmt;
     pipe_info.num_samplers = 0U;
     pipe_info.num_readonly_storage_textures = 0U;
-    pipe_info.num_readonly_storage_buffers = 1U;
+    pipe_info.num_readonly_storage_buffers = 2U;
     pipe_info.num_readwrite_storage_textures = 1U;
-    pipe_info.num_readwrite_storage_buffers = 0U;
+    pipe_info.num_readwrite_storage_buffers = 1U;
     pipe_info.num_uniform_buffers = 0U;
     pipe_info.threadcount_x = 8U;
     pipe_info.threadcount_y = 8U;
     pipe_info.threadcount_z = 1U;
 
     ctx->pipeline = SDL_CreateGPUComputePipeline(dev, &pipe_info);
+    pipe_info.entrypoint = "bloom_rc_cascade2";
+    ctx->pipe_rc2 = SDL_CreateGPUComputePipeline(dev, &pipe_info);
+    pipe_info.entrypoint = "bloom_rc_cascade1";
+    ctx->pipe_rc1 = SDL_CreateGPUComputePipeline(dev, &pipe_info);
+    pipe_info.entrypoint = "bloom_rc_cascade0";
+    ctx->pipe_rc0 = SDL_CreateGPUComputePipeline(dev, &pipe_info);
     SDL_free(code);
-    if (!ctx->pipeline) {
+    if (!ctx->pipeline || !ctx->pipe_rc2 || !ctx->pipe_rc1 || !ctx->pipe_rc0) {
         fprintf(stderr, "[BLOOM SDL3-GPU] SDL_CreateGPUComputePipeline('%s') failed: %s\n",
                 resolved_path, SDL_GetError());
         bloom_gpu_destroy(ctx);
@@ -267,13 +280,25 @@ BloomGpuCtx *bloom_gpu_init(BloomEngineArena *arena, const char *shader_path) {
     buf_info.size = (Uint32)BLOOM_ARENA_BYTES;
     ctx->arena_gpu_buf = SDL_CreateGPUBuffer(dev, &buf_info);
 
+    buf_info.size = (Uint32)BLOOM_MESH_ARENA_BYTES;
+    ctx->mesh_gpu_buf = SDL_CreateGPUBuffer(dev, &buf_info);
+
+    buf_info.usage = SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ | SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE;
+    buf_info.size = (Uint32)BLOOM_RC_BUFFER_BYTES;
+    ctx->rc_gpu_buf = SDL_CreateGPUBuffer(dev, &buf_info);
+
     SDL_GPUTransferBufferCreateInfo up_info;
     memset(&up_info, 0, sizeof(up_info));
     up_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
     up_info.size = (Uint32)BLOOM_ARENA_BYTES;
     ctx->upload_tbuf = SDL_CreateGPUTransferBuffer(dev, &up_info);
 
-    if (!ctx->arena_gpu_buf || !ctx->upload_tbuf || !bloom_gpu_alloc_frame_targets(ctx, w, h)) {
+    up_info.size = (Uint32)BLOOM_MESH_ARENA_BYTES;
+    ctx->mesh_upload_tbuf = SDL_CreateGPUTransferBuffer(dev, &up_info);
+
+    if (!ctx->arena_gpu_buf || !ctx->mesh_gpu_buf || !ctx->rc_gpu_buf || !ctx->upload_tbuf ||
+        !ctx->mesh_upload_tbuf || !bloom_gpu_alloc_frame_targets(ctx, w, h) ||
+        !bloom_gpu_upload_mesh(ctx, NULL)) {
         fprintf(stderr, "[BLOOM SDL3-GPU] GPU resource allocation failed: %s\n", SDL_GetError());
         bloom_gpu_destroy(ctx);
         return NULL;
@@ -329,9 +354,57 @@ uint32_t bloom_gpu_idle_skip_count(const BloomGpuCtx *ctx) {
     return ctx ? ctx->idle_skip_count : 0U;
 }
 
+bool bloom_gpu_upload_mesh(BloomGpuCtx *ctx, const BloomMeshArena *mesh) {
+    if (!ctx || !ctx->device || !ctx->mesh_gpu_buf || !ctx->mesh_upload_tbuf) {
+        return false;
+    }
+    void *mapped = SDL_MapGPUTransferBuffer(ctx->device, ctx->mesh_upload_tbuf, false);
+    if (!mapped) {
+        return false;
+    }
+    if (mesh) {
+        memcpy(mapped, mesh, BLOOM_MESH_ARENA_BYTES);
+    } else {
+        memset(mapped, 0, BLOOM_MESH_ARENA_BYTES);
+    }
+    SDL_UnmapGPUTransferBuffer(ctx->device, ctx->mesh_upload_tbuf);
+
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ctx->device);
+    if (!cmd) {
+        return false;
+    }
+    SDL_GPUCopyPass *copy_pass = SDL_BeginGPUCopyPass(cmd);
+    if (!copy_pass) {
+        SDL_CancelGPUCommandBuffer(cmd);
+        return false;
+    }
+    SDL_GPUTransferBufferLocation src_loc;
+    memset(&src_loc, 0, sizeof(src_loc));
+    src_loc.transfer_buffer = ctx->mesh_upload_tbuf;
+    src_loc.offset = 0U;
+
+    SDL_GPUBufferRegion dst_reg;
+    memset(&dst_reg, 0, sizeof(dst_reg));
+    dst_reg.buffer = ctx->mesh_gpu_buf;
+    dst_reg.offset = 0U;
+    dst_reg.size = (Uint32)BLOOM_MESH_ARENA_BYTES;
+
+    SDL_UploadToGPUBuffer(copy_pass, &src_loc, &dst_reg, false);
+    SDL_EndGPUCopyPass(copy_pass);
+
+    SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+    if (!fence) {
+        return false;
+    }
+    bool ok = SDL_WaitForGPUFences(ctx->device, true, &fence, 1U);
+    SDL_ReleaseGPUFence(ctx->device, fence);
+    return ok;
+}
+
 bool bloom_gpu_render(BloomGpuCtx *ctx, bool force_render) {
-    if (!ctx || !ctx->arena || !ctx->device || !ctx->pipeline ||
-        !ctx->arena_gpu_buf || !ctx->upload_tbuf || !ctx->frame_tex) {
+    if (!ctx || !ctx->arena || !ctx->device || !ctx->pipeline || !ctx->pipe_rc2 ||
+        !ctx->pipe_rc1 || !ctx->pipe_rc0 || !ctx->arena_gpu_buf ||
+        !ctx->mesh_gpu_buf || !ctx->rc_gpu_buf || !ctx->upload_tbuf || !ctx->frame_tex) {
         return false;
     }
 
@@ -379,14 +452,36 @@ bool bloom_gpu_render(BloomGpuCtx *ctx, bool force_render) {
     rw_tex.layer = 0U;
     rw_tex.cycle = false;
 
-    SDL_GPUComputePass *comp_pass = SDL_BeginGPUComputePass(cmd, &rw_tex, 1U, NULL, 0U);
+    SDL_GPUStorageBufferReadWriteBinding rw_buf;
+    memset(&rw_buf, 0, sizeof(rw_buf));
+    rw_buf.buffer = ctx->rc_gpu_buf;
+    rw_buf.cycle = false;
+
+    SDL_GPUBuffer *ro_bufs[2] = { ctx->arena_gpu_buf, ctx->mesh_gpu_buf };
+    if ((hdr->flags & BLOOM_FLAG_RADIANCE_CASCADES) != 0U) {
+        SDL_GPUComputePipeline *rc_pipes[3] = { ctx->pipe_rc2, ctx->pipe_rc1, ctx->pipe_rc0 };
+        const Uint32 rc_gx[3] = { 64U, 64U, 32U };
+        const Uint32 rc_gy[3] = { 1U,  4U,  1U };
+        for (uint32_t p = 0U; p < 3U; ++p) {
+            SDL_GPUComputePass *rc_pass = SDL_BeginGPUComputePass(cmd, &rw_tex, 1U, &rw_buf, 1U);
+            if (!rc_pass) {
+                SDL_CancelGPUCommandBuffer(cmd);
+                return false;
+            }
+            SDL_BindGPUComputePipeline(rc_pass, rc_pipes[p]);
+            SDL_BindGPUComputeStorageBuffers(rc_pass, 0U, ro_bufs, 2U);
+            SDL_DispatchGPUCompute(rc_pass, rc_gx[p], rc_gy[p], 1U);
+            SDL_EndGPUComputePass(rc_pass);
+        }
+    }
+
+    SDL_GPUComputePass *comp_pass = SDL_BeginGPUComputePass(cmd, &rw_tex, 1U, &rw_buf, 1U);
     if (!comp_pass) {
         SDL_CancelGPUCommandBuffer(cmd);
         return false;
     }
     SDL_BindGPUComputePipeline(comp_pass, ctx->pipeline);
-    SDL_GPUBuffer *ro_bufs[1] = { ctx->arena_gpu_buf };
-    SDL_BindGPUComputeStorageBuffers(comp_pass, 0U, ro_bufs, 1U);
+    SDL_BindGPUComputeStorageBuffers(comp_pass, 0U, ro_bufs, 2U);
     SDL_DispatchGPUCompute(comp_pass, (ctx->width + 7U) / 8U, (ctx->height + 7U) / 8U, 1U);
     SDL_EndGPUComputePass(comp_pass);
 
@@ -404,22 +499,19 @@ bool bloom_gpu_render(BloomGpuCtx *ctx, bool force_render) {
     return true;
 }
 
-bool bloom_gpu_write_ppm(const BloomGpuCtx *ctx,
-                         const char *ppm_path,
-                         uint64_t *out_fnv_hash,
-                         uint32_t *out_nonblack_px) {
+static const uint8_t *bloom_gpu_map_frame_rgba8(const BloomGpuCtx *ctx) {
     if (!ctx || !ctx->device || !ctx->frame_tex || !ctx->download_tbuf) {
-        return false;
+        return NULL;
     }
 
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ctx->device);
     if (!cmd) {
-        return false;
+        return NULL;
     }
     SDL_GPUCopyPass *copy_pass = SDL_BeginGPUCopyPass(cmd);
     if (!copy_pass) {
         SDL_CancelGPUCommandBuffer(cmd);
-        return false;
+        return NULL;
     }
 
     SDL_GPUTextureRegion src_reg;
@@ -443,16 +535,22 @@ bool bloom_gpu_write_ppm(const BloomGpuCtx *ctx,
 
     SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
     if (!fence) {
-        return false;
+        return NULL;
     }
     bool waited = SDL_WaitForGPUFences(ctx->device, true, &fence, 1U);
     SDL_ReleaseGPUFence(ctx->device, fence);
     if (!waited) {
-        return false;
+        return NULL;
     }
 
-    const uint8_t *rgba = (const uint8_t *)SDL_MapGPUTransferBuffer(
-        ctx->device, ctx->download_tbuf, false);
+    return (const uint8_t *)SDL_MapGPUTransferBuffer(ctx->device, ctx->download_tbuf, false);
+}
+
+bool bloom_gpu_write_ppm(const BloomGpuCtx *ctx,
+                         const char *ppm_path,
+                         uint64_t *out_fnv_hash,
+                         uint32_t *out_nonblack_px) {
+    const uint8_t *rgba = bloom_gpu_map_frame_rgba8(ctx);
     if (!rgba) {
         return false;
     }
@@ -523,6 +621,333 @@ static void bloom_host_stamp_mac(void *block64, uint64_t seed, uint32_t *out_lo,
     *out_hi = (uint32_t)(mac >> 32ULL);
 }
 
+static void bloom_host_put_u16_le(uint8_t *dst, uint16_t v) {
+    dst[0] = (uint8_t)(v & 0xFFU);
+    dst[1] = (uint8_t)((v >> 8U) & 0xFFU);
+}
+
+static void bloom_host_put_u32_le(uint8_t *dst, uint32_t v) {
+    dst[0] = (uint8_t)(v & 0xFFU);
+    dst[1] = (uint8_t)((v >> 8U) & 0xFFU);
+    dst[2] = (uint8_t)((v >> 16U) & 0xFFU);
+    dst[3] = (uint8_t)((v >> 24U) & 0xFFU);
+}
+
+bool bloom_gpu_push_audio_i16(BloomGpuCtx *ctx,
+                              const int16_t *stereo_pcm,
+                              uint32_t sample_frames) {
+    if (!ctx || !ctx->audio_stream || !stereo_pcm || sample_frames == 0U) {
+        return false;
+    }
+    if (SDL_GetAudioStreamQueued(ctx->audio_stream) > (int)(BLOOM_AUDIO_SAMPLE_RATE / 4U) * 4) {
+        return true;
+    }
+    return SDL_PutAudioStreamData(ctx->audio_stream, stereo_pcm, (int)(sample_frames * 2U * sizeof(int16_t)));
+}
+
+bool bloom_write_wav_i16(const char *wav_path,
+                         const int16_t *stereo_pcm,
+                         uint32_t sample_frames,
+                         uint32_t sample_rate_hz) {
+    if (!wav_path || wav_path[0] == '\0' || !stereo_pcm || sample_frames == 0U) {
+        return false;
+    }
+    uint32_t sr = (sample_rate_hz >= 8000U) ? sample_rate_hz : BLOOM_AUDIO_SAMPLE_RATE;
+    uint32_t data_bytes = sample_frames * 4U;
+    uint8_t hdr_bytes[44];
+    memcpy(hdr_bytes + 0U, "RIFF", 4U);
+    bloom_host_put_u32_le(hdr_bytes + 4U, 36U + data_bytes);
+    memcpy(hdr_bytes + 8U, "WAVEfmt ", 8U);
+    bloom_host_put_u32_le(hdr_bytes + 16U, 16U);
+    bloom_host_put_u16_le(hdr_bytes + 20U, 1U);  /* PCM */
+    bloom_host_put_u16_le(hdr_bytes + 22U, 2U);  /* stereo */
+    bloom_host_put_u32_le(hdr_bytes + 24U, sr);
+    bloom_host_put_u32_le(hdr_bytes + 28U, sr * 4U);
+    bloom_host_put_u16_le(hdr_bytes + 32U, 4U);
+    bloom_host_put_u16_le(hdr_bytes + 34U, 16U);
+    memcpy(hdr_bytes + 36U, "data", 4U);
+    bloom_host_put_u32_le(hdr_bytes + 40U, data_bytes);
+
+    FILE *fp = fopen(wav_path, "wb");
+    if (!fp) return false;
+    bool ok = (fwrite(hdr_bytes, 1U, 44U, fp) == 44U) &&
+              (fwrite(stereo_pcm, 4U, sample_frames, fp) == sample_frames);
+    fclose(fp);
+    return ok;
+}
+
+bool bloom_export_webgpu_html(const char *html_path,
+                              const BloomEngineArena *arena,
+                              const char *wgsl_path) {
+    if (!html_path || html_path[0] == '\0' || !arena) {
+        return false;
+    }
+    size_t wgsl_sz = 0U;
+    uint8_t *wgsl_raw = NULL;
+    if (wgsl_path && wgsl_path[0] != '\0' && bloom_str_ends_with(wgsl_path, ".wgsl")) {
+        wgsl_raw = bloom_try_read_file(wgsl_path, &wgsl_sz);
+    }
+    if (!wgsl_raw) {
+        wgsl_raw = bloom_try_read_file("shaders/bloom_core.wgsl", &wgsl_sz);
+    }
+    if (!wgsl_raw) {
+        return false;
+    }
+
+    FILE *fp = fopen(html_path, "wb");
+    if (!fp) {
+        SDL_free(wgsl_raw);
+        return false;
+    }
+
+    uint32_t w_px = (arena->map.frame_hdr.width_px >= 160U && arena->map.frame_hdr.width_px <= 4096U)
+        ? arena->map.frame_hdr.width_px : 1280U;
+    uint32_t h_px = (arena->map.frame_hdr.height_px >= 120U && arena->map.frame_hdr.height_px <= 4096U)
+        ? arena->map.frame_hdr.height_px : 720U;
+
+    fprintf(fp,
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n"
+        "<title>BLOOM v%s WebGPU Standalone</title>\n"
+        "<style>html,body{margin:0;height:100%%;background:#050810;color:#d6f2ff;font:13px/1.4 ui-monospace,monospace;"
+        "display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:hidden}"
+        "canvas{max-width:100vw;max-height:94vh;box-shadow:0 12px 48px rgba(0,220,255,.18);border-radius:8px;cursor:grab}"
+        "#bar{padding:6px 12px;opacity:.85}</style></head><body>\n"
+        "<canvas id=\"c\" width=\"%u\" height=\"%u\"></canvas>\n"
+        "<div id=\"bar\">BLOOM v%s WebGPU (16KB Arena SSOT, Drag to Orbit, Wheel to Zoom)</div>\n"
+        "<script type=\"module\">\nconst WGSL = `",
+        BLOOM_VERSION_STRING, w_px, h_px, BLOOM_VERSION_STRING);
+
+    for (size_t i = 0U; i < wgsl_sz; ++i) {
+        uint8_t ch = wgsl_raw[i];
+        if (ch == '\\' || ch == '`' || ch == '$') {
+            fputc('\\', fp);
+        }
+        fputc((int)ch, fp);
+    }
+    SDL_free(wgsl_raw);
+
+    fprintf(fp, "`;\nconst ARENA_U32 = new Uint32Array([\n");
+    const uint32_t *u32p = (const uint32_t *)arena->cells;
+    for (size_t i = 0U; i < 4096U; ++i) {
+        fprintf(fp, "0x%08x%s", u32p[i], (i + 1U < 4096U) ? ((i & 15U) == 15U ? ",\n" : ",") : "\n");
+    }
+
+    fputs(
+        "]);\nconst BLIT = `@group(0) @binding(0) var srcTex : texture_2d<f32>;\n"
+        "@vertex fn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n"
+        "  let p = array<vec2<f32>,3>(vec2<f32>(-1.0,-3.0),vec2<f32>(3.0,1.0),vec2<f32>(-1.0,1.0));\n"
+        "  return vec4<f32>(p[vi],0.0,1.0);\n}\n"
+        "@fragment fn fs(@builtin(position) pos : vec4<f32>) -> @location(0) vec4<f32> {\n"
+        "  return textureLoad(srcTex, vec2<i32>(i32(pos.x), i32(pos.y)), 0);\n}`;\n"
+        "async function main() {\n"
+        "  const bar = document.getElementById('bar');\n"
+        "  if (!navigator.gpu) { bar.textContent = 'WebGPU unavailable in this browser'; return; }\n"
+        "  const adapter = await navigator.gpu.requestAdapter();\n"
+        "  if (!adapter) { bar.textContent = 'No WebGPU adapter found'; return; }\n"
+        "  const device = await adapter.requestDevice();\n"
+        "  const canvas = document.getElementById('c');\n"
+        "  const ctx = canvas.getContext('webgpu');\n"
+        "  const fmt = navigator.gpu.getPreferredCanvasFormat();\n"
+        "  ctx.configure({ device, format: fmt, alphaMode: 'opaque' });\n",
+        fp);
+
+    fprintf(fp,
+        "  const W = %u, H = %u;\n"
+        "  const arenaBuf = device.createBuffer({ size: 16384, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });\n"
+        "  const meshBuf  = device.createBuffer({ size: 32768, usage: GPUBufferUsage.STORAGE });\n"
+        "  const rcBuf    = device.createBuffer({ size: 524288, usage: GPUBufferUsage.STORAGE });\n"
+        "  const outTex   = device.createTexture({ size: [W, H], format: 'rgba8unorm', usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING });\n"
+        "  device.queue.writeBuffer(arenaBuf, 0, ARENA_U32);\n"
+        "  const csMod = device.createShaderModule({ code: WGSL });\n"
+        "  const bgl0 = device.createBindGroupLayout({ entries: [\n"
+        "    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },\n"
+        "    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }\n"
+        "  ]});\n"
+        "  const bgl1 = device.createBindGroupLayout({ entries: [\n"
+        "    { binding: 0, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },\n"
+        "    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }\n"
+        "  ]});\n"
+        "  const playout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1] });\n"
+        "  const mkPipe = (ep) => device.createComputePipeline({ layout: playout, compute: { module: csMod, entryPoint: ep } });\n"
+        "  const pRc2 = mkPipe('bloom_rc_cascade2'), pRc1 = mkPipe('bloom_rc_cascade1'), pRc0 = mkPipe('bloom_rc_cascade0'), pMain = mkPipe('bloom_render_frame');\n"
+        "  const bg0 = device.createBindGroup({ layout: bgl0, entries: [{ binding: 0, resource: { buffer: arenaBuf } }, { binding: 1, resource: { buffer: meshBuf } }] });\n"
+        "  const bg1 = device.createBindGroup({ layout: bgl1, entries: [{ binding: 0, resource: outTex.createView() }, { binding: 1, resource: { buffer: rcBuf } }] });\n"
+        "  const vsMod = device.createShaderModule({ code: BLIT });\n"
+        "  const rPipe = device.createRenderPipeline({ layout: 'auto', vertex: { module: vsMod, entryPoint: 'vs' }, fragment: { module: vsMod, entryPoint: 'fs', targets: [{ format: fmt }] } });\n"
+        "  const rBg = device.createBindGroup({ layout: rPipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: outTex.createView() }] });\n",
+        w_px, h_px);
+
+    fputs(
+        "  let yaw = (ARENA_U32[16 + 13] | 0) / 65536.0, pitch = (ARENA_U32[16 + 14] | 0) / 65536.0, dist = Math.max((ARENA_U32[16 + 15] | 0) / 65536.0, 2.0);\n"
+        "  let drag = false, lx = 0, ly = 0;\n"
+        "  canvas.onpointerdown = (e) => { drag = true; lx = e.clientX; ly = e.clientY; };\n"
+        "  window.onpointerup = () => { drag = false; };\n"
+        "  window.onpointermove = (e) => { if (!drag) return; yaw += (e.clientX - lx) * 0.008; pitch = Math.max(-1.25, Math.min(1.25, pitch + (e.clientY - ly) * 0.006)); lx = e.clientX; ly = e.clientY; };\n"
+        "  canvas.onwheel = (e) => { e.preventDefault(); dist = Math.max(2.0, Math.min(14.0, dist + e.deltaY * 0.004)); };\n"
+        "  function frame() {\n"
+        "    ARENA_U32[5] = (ARENA_U32[5] + 1) >>> 0;\n"
+        "    const tx = (ARENA_U32[16 + 3] | 0) / 65536.0, ty = (ARENA_U32[16 + 4] | 0) / 65536.0, tz = (ARENA_U32[16 + 5] | 0) / 65536.0;\n"
+        "    const cp = Math.cos(pitch), sp = Math.sin(pitch), cy = Math.cos(yaw), sy = Math.sin(yaw);\n"
+        "    ARENA_U32[16] = Math.round((tx + dist * cp * sy) * 65536) | 0;\n"
+        "    ARENA_U32[17] = Math.round((ty + dist * sp) * 65536) | 0;\n"
+        "    ARENA_U32[18] = Math.round((tz - dist * cp * cy) * 65536) | 0;\n"
+        "    device.queue.writeBuffer(arenaBuf, 0, ARENA_U32, 0, 32);\n"
+        "    const enc = device.createCommandEncoder();\n"
+        "    const cpPass = enc.beginComputePass();\n"
+        "    cpPass.setBindGroup(0, bg0); cpPass.setBindGroup(1, bg1);\n"
+        "    if ((ARENA_U32[14] & 32) !== 0) {\n"
+        "      cpPass.setPipeline(pRc2); cpPass.dispatchWorkgroups(64, 1, 1);\n"
+        "      cpPass.setPipeline(pRc1); cpPass.dispatchWorkgroups(64, 4, 1);\n"
+        "      cpPass.setPipeline(pRc0); cpPass.dispatchWorkgroups(32, 1, 1);\n"
+        "    }\n"
+        "    cpPass.setPipeline(pMain); cpPass.dispatchWorkgroups(Math.ceil(W / 8), Math.ceil(H / 8), 1);\n"
+        "    cpPass.end();\n"
+        "    const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: {r:0,g:0,b:0,a:1} }] });\n"
+        "    rp.setPipeline(rPipe); rp.setBindGroup(0, rBg); rp.draw(3); rp.end();\n"
+        "    device.queue.submit([enc.finish()]);\n"
+        "    requestAnimationFrame(frame);\n"
+        "  }\n"
+        "  requestAnimationFrame(frame);\n"
+        "}\nmain();\n</script></body></html>\n",
+        fp);
+
+    bool ok = (ferror(fp) == 0);
+    fclose(fp);
+    return ok;
+}
+
+static void bloom_fmt_smpte(uint32_t frame_idx, uint32_t fps, char *buf, size_t cap) {
+    uint32_t rate = (fps > 0U) ? fps : 24U;
+    uint32_t f = frame_idx % rate;
+    uint32_t tot_sec = frame_idx / rate;
+    uint32_t s = tot_sec % 60U;
+    uint32_t m = (tot_sec / 60U) % 60U;
+    uint32_t h = (tot_sec / 3600U) + 1U;
+    snprintf(buf, cap, "%02u:%02u:%02u:%02u", h, m, s, f);
+}
+
+bool bloom_write_cmx3600_edl(const char *edl_path,
+                             const char *reel_title,
+                             uint32_t total_frames,
+                             uint32_t fps) {
+    if (!edl_path || edl_path[0] == '\0') {
+        return false;
+    }
+    FILE *fp = fopen(edl_path, "wb");
+    if (!fp) {
+        return false;
+    }
+    uint32_t rate = (fps > 0U) ? fps : 24U;
+    uint32_t frames = (total_frames >= 4U) ? total_frames : 96U;
+    const char *title = (reel_title && reel_title[0] != '\0') ? reel_title : "BLOOM_V9_REEL";
+    static const char *const k_vcam_clips[4] = {
+        "VCAM_01_ORBIT_TELEPHOTO_135MM",
+        "VCAM_02_CHASE_DYNAMIC_24MM",
+        "VCAM_03_GEODESIC_DOLLY_35MM",
+        "VCAM_04_TACTICAL_OPTICS_18MM"
+    };
+
+    fprintf(fp, "TITLE: %s\nFCM: NON-DROP FRAME\n\n", title);
+    uint32_t rec_cur = 0U;
+    for (uint32_t e = 0U; e < 4U; ++e) {
+        uint32_t next_f = (e == 3U) ? frames : ((frames * (e + 1U)) / 4U);
+        char s_in[16], s_out[16], r_in[16], r_out[16];
+        bloom_fmt_smpte(0U, rate, s_in, sizeof(s_in));
+        bloom_fmt_smpte(next_f - rec_cur, rate, s_out, sizeof(s_out));
+        bloom_fmt_smpte(rec_cur, rate, r_in, sizeof(r_in));
+        bloom_fmt_smpte(next_f, rate, r_out, sizeof(r_out));
+        fprintf(fp, "%03u  AX       V     C        %s %s %s %s\n* FROM CLIP NAME: %s\n",
+                e + 1U, s_in, s_out, r_in, r_out, k_vcam_clips[e]);
+        rec_cur = next_f;
+    }
+    bool ok = (ferror(fp) == 0);
+    fclose(fp);
+    return ok;
+}
+
+bool bloom_gpu_write_kitty_tty(const BloomGpuCtx *ctx,
+                               FILE *out_stream,
+                               uint32_t max_cols_px) {
+    if (!out_stream) {
+        return false;
+    }
+    const uint8_t *rgba = bloom_gpu_map_frame_rgba8(ctx);
+    if (!rgba) {
+        return false;
+    }
+
+    uint32_t max_w = (max_cols_px >= 16U && max_cols_px <= 1920U) ? max_cols_px : 160U;
+    uint32_t step = 1U;
+    while (step < ctx->width && (ctx->width / step) > max_w) {
+        step++;
+    }
+    uint32_t ow = ctx->width / step;
+    uint32_t oh = ctx->height / step;
+    if (ow == 0U) ow = 1U;
+    if (oh == 0U) oh = 1U;
+
+    size_t rgb_len = (size_t)ow * (size_t)oh * 3U;
+    uint8_t *rgb = (uint8_t *)malloc(rgb_len);
+    size_t b64_cap = ((rgb_len + 2U) / 3U) * 4U + 1U;
+    char *b64 = (char *)malloc(b64_cap);
+    if (!rgb || !b64) {
+        free(rgb);
+        free(b64);
+        SDL_UnmapGPUTransferBuffer(ctx->device, ctx->download_tbuf);
+        return false;
+    }
+
+    for (uint32_t y = 0U; y < oh; ++y) {
+        uint32_t sy = y * step;
+        if (sy >= ctx->height) sy = ctx->height - 1U;
+        for (uint32_t x = 0U; x < ow; ++x) {
+            uint32_t sx = x * step;
+            if (sx >= ctx->width) sx = ctx->width - 1U;
+            size_t si = ((size_t)sy * (size_t)ctx->width + (size_t)sx) * 4U;
+            size_t di = ((size_t)y * (size_t)ow + (size_t)x) * 3U;
+            rgb[di + 0U] = rgba[si + 0U];
+            rgb[di + 1U] = rgba[si + 1U];
+            rgb[di + 2U] = rgba[si + 2U];
+        }
+    }
+    SDL_UnmapGPUTransferBuffer(ctx->device, ctx->download_tbuf);
+
+    static const char k_b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t bp = 0U;
+    for (size_t i = 0U; i < rgb_len; i += 3U) {
+        uint32_t b0 = rgb[i];
+        uint32_t b1 = (i + 1U < rgb_len) ? rgb[i + 1U] : 0U;
+        uint32_t b2 = (i + 2U < rgb_len) ? rgb[i + 2U] : 0U;
+        uint32_t tri = (b0 << 16U) | (b1 << 8U) | b2;
+        b64[bp++] = k_b64[(tri >> 18U) & 63U];
+        b64[bp++] = k_b64[(tri >> 12U) & 63U];
+        b64[bp++] = (i + 1U < rgb_len) ? k_b64[(tri >> 6U) & 63U] : '=';
+        b64[bp++] = (i + 2U < rgb_len) ? k_b64[tri & 63U] : '=';
+    }
+    b64[bp] = '\0';
+
+    size_t off = 0U;
+    bool first = true;
+    while (off < bp) {
+        size_t chunk = bp - off;
+        if (chunk > 4096U) chunk = 4096U;
+        uint32_t more = (off + chunk < bp) ? 1U : 0U;
+        if (first) {
+            fprintf(out_stream, "\x1b_Ga=T,f=24,s=%u,v=%u,m=%u;", ow, oh, more);
+            first = false;
+        } else {
+            fprintf(out_stream, "\x1b_Gm=%u;", more);
+        }
+        (void)fwrite(b64 + off, 1U, chunk, out_stream);
+        fputs("\x1b\\\n", out_stream);
+        off += chunk;
+    }
+
+    free(b64);
+    free(rgb);
+    return (ferror(out_stream) == 0);
+}
+
 int bloom_gpu_run_window(BloomGpuCtx *ctx,
                          BloomEngineArena *arena,
                          void (*step_cb)(void *),
@@ -531,8 +956,20 @@ int bloom_gpu_run_window(BloomGpuCtx *ctx,
         return -1;
     }
 
+    if (!ctx->audio_stream && SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        SDL_AudioSpec spec;
+        spec.format = SDL_AUDIO_S16;
+        spec.channels = 2;
+        spec.freq = (int)BLOOM_AUDIO_SAMPLE_RATE;
+        ctx->audio_stream = SDL_OpenAudioDeviceStream(
+            SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+        if (ctx->audio_stream) {
+            (void)SDL_ResumeAudioStreamDevice(ctx->audio_stream);
+        }
+    }
+
     SDL_Window *win = SDL_CreateWindow(
-        "BLOOM v7.0.1 Studio",
+        "BLOOM v9.0.0 Studio",
         (int)ctx->width,
         (int)ctx->height,
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
@@ -745,6 +1182,9 @@ void bloom_gpu_destroy(BloomGpuCtx *ctx) {
     if (!ctx) {
         return;
     }
+    if (ctx->audio_stream) {
+        SDL_DestroyAudioStream(ctx->audio_stream);
+    }
     if (ctx->device) {
         (void)SDL_WaitForGPUIdle(ctx->device);
         if (ctx->download_tbuf) {
@@ -753,11 +1193,29 @@ void bloom_gpu_destroy(BloomGpuCtx *ctx) {
         if (ctx->frame_tex) {
             SDL_ReleaseGPUTexture(ctx->device, ctx->frame_tex);
         }
+        if (ctx->mesh_upload_tbuf) {
+            SDL_ReleaseGPUTransferBuffer(ctx->device, ctx->mesh_upload_tbuf);
+        }
         if (ctx->upload_tbuf) {
             SDL_ReleaseGPUTransferBuffer(ctx->device, ctx->upload_tbuf);
         }
+        if (ctx->rc_gpu_buf) {
+            SDL_ReleaseGPUBuffer(ctx->device, ctx->rc_gpu_buf);
+        }
+        if (ctx->mesh_gpu_buf) {
+            SDL_ReleaseGPUBuffer(ctx->device, ctx->mesh_gpu_buf);
+        }
         if (ctx->arena_gpu_buf) {
             SDL_ReleaseGPUBuffer(ctx->device, ctx->arena_gpu_buf);
+        }
+        if (ctx->pipe_rc0) {
+            SDL_ReleaseGPUComputePipeline(ctx->device, ctx->pipe_rc0);
+        }
+        if (ctx->pipe_rc1) {
+            SDL_ReleaseGPUComputePipeline(ctx->device, ctx->pipe_rc1);
+        }
+        if (ctx->pipe_rc2) {
+            SDL_ReleaseGPUComputePipeline(ctx->device, ctx->pipe_rc2);
         }
         if (ctx->pipeline) {
             SDL_ReleaseGPUComputePipeline(ctx->device, ctx->pipeline);

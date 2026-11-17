@@ -7,6 +7,6 @@
 #include "bloom_prefab.h"
 #include "bloom_host.h"
 
-#define BLOOM_VERSION_STRING "7.0.1"
+#define BLOOM_VERSION_STRING "9.0.0"
 
 #endif /* BLOOM_H */

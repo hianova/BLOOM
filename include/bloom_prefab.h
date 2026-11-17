@@ -103,7 +103,7 @@ uint32_t bloom_prefab_cull_wave64(const BloomPrefabInst64 *instances,
                                   BloomPrefabInst64 *out_compacted,
                                   uint64_t *out_active_mask);
 
-/* 6. FLOW v7.0.1 Arena Init, @swap Safe Chart Switch, SEARU Heal & Full Frame Step */
+/* 6. FLOW v7.1.0 Arena Init, @swap Safe Chart Switch, SEARU Heal, Swept-CCD & Full Frame Step */
 typedef struct {
     int64_t  db0_q16;
     int64_t  db1_q16;
@@ -112,6 +112,38 @@ typedef struct {
 } BloomBilevelTerm;
 
 void bloom_arena_init_default(BloomEngineArena *arena, uint32_t width_px, uint32_t height_px);
+
+bool bloom_swept_sphere_ccd_q16(const int32_t pos_a_q16[3],
+                                const int32_t vel_a_q16[3],
+                                int32_t rad_a_q16,
+                                const int32_t pos_b_q16[3],
+                                const int32_t vel_b_q16[3],
+                                int32_t rad_b_q16,
+                                int32_t *out_toi_q16,
+                                int32_t out_normal_q16[3]);
+
+int32_t bloom_scene_eval_pair_clearance_q16(const BloomEngineArena *arena,
+                                            uint32_t slot_a,
+                                            uint32_t slot_b,
+                                            int32_t out_witness_q16[3],
+                                            int32_t out_norm_q16[3]);
+
+void bloom_physics_step_arena64(BloomEngineArena *arena, int32_t dt_q16);
+
+void bloom_inst_set_vel_q16(BloomPrefabInst64 *inst, const int32_t vel_q16[3]);
+void bloom_inst_get_vel_q16(const BloomPrefabInst64 *inst, int32_t out_vel_q16[3]);
+
+/* Pure-GPR Modal Physical-Modeling DSP Synthesizer & Sub-Frame Sensory Lock */
+void bloom_audio_init_rig(BloomAudioRig *rig, uint32_t sample_rate_hz);
+void bloom_audio_excite_impact64(BloomAudioRig *rig,
+                                 const BloomEngineArena *arena,
+                                 uint32_t inst_slot,
+                                 int32_t impact_speed_q16,
+                                 int32_t pan_q16);
+uint32_t bloom_audio_step_frame64(BloomAudioRig *rig,
+                                  const BloomEngineArena *arena,
+                                  int16_t *out_stereo_pcm,
+                                  uint32_t sample_frames);
 
 bool bloom_arena_try_swap_chart(BloomEngineArena *arena,
                                 uint32_t flow_slot,
@@ -131,6 +163,30 @@ bool bloom_arena_heal_and_swap(BloomEngineArena *arena,
                                uint32_t max_iters);
 
 bool bloom_arena_step_dynamics(BloomEngineArena *arena, uint16_t mode_req);
+
+/* 6b. Concentric SDF Gameplay Shells, Fulcrum Impulse, Hitstop & 16KB Spacetime Time-Rewind */
+void bloom_gameplay_init64(BloomGameplayState64 *gp,
+                           uint32_t player_inst_id,
+                           int32_t hurt_q16,
+                           int32_t graze_q16,
+                           int32_t hit_q16);
+
+uint32_t bloom_gameplay_step64(BloomGameplayState64 *gp,
+                               BloomEngineArena *arena,
+                               BloomAudioRig *opt_audio,
+                               const int32_t fulcrum_imp_q16[3],
+                               bool trigger_action);
+
+void bloom_rewind_init64(BloomRewindCtrl64 *ctrl, uint32_t capacity);
+void bloom_rewind_push(BloomRewindCtrl64 *ctrl,
+                       BloomSpacetimeSnap *ring_buf,
+                       const BloomEngineArena *arena,
+                       const BloomAudioRig *audio);
+bool bloom_rewind_restore(BloomRewindCtrl64 *ctrl,
+                          const BloomSpacetimeSnap *ring_buf,
+                          uint32_t steps_back,
+                          BloomEngineArena *out_arena,
+                          BloomAudioRig *out_audio);
 
 /* 7. Unified .bloom 64B Container Export / Validate (Zero-Parse Mmap Ready) */
 void bloom_image_seal_arena(BloomEngineArena *arena);

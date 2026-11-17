@@ -22,6 +22,7 @@
 
 typedef struct {
     BloomEngineArena *arena;
+    BloomMeshArena   *mesh;
     BloomGpuCtx      *gpu;
 } BloomJsiHandle;
 
@@ -33,6 +34,10 @@ static void bloom_jsi_finalize(void *ptr) {
     if (h->gpu) {
         bloom_gpu_destroy(h->gpu);
         h->gpu = NULL;
+    }
+    if (h->mesh) {
+        free(h->mesh);
+        h->mesh = NULL;
     }
     if (h->arena) {
         free(h->arena);
@@ -64,9 +69,19 @@ LEAN_EXPORT lean_obj_res bloom_jsi_create(uint32_t w, uint32_t h, b_lean_obj_arg
     BloomEngineArena *arena = (BloomEngineArena *)raw_page;
     bloom_arena_init_default(arena, w, h);
 
+    void *raw_mesh = NULL;
+    if (posix_memalign(&raw_mesh, 64U, sizeof(BloomMeshArena)) != 0 || !raw_mesh) {
+        free(arena);
+        return lean_io_result_mk_error(
+            lean_mk_io_user_error(lean_mk_string("bloom_jsi_create: posix_memalign(mesh) failed")));
+    }
+    BloomMeshArena *mesh = (BloomMeshArena *)raw_mesh;
+    memset(mesh, 0, sizeof(*mesh));
+
     const char *spath = lean_string_cstr(shader_path);
     BloomGpuCtx *gpu = bloom_gpu_init(arena, spath);
     if (!gpu) {
+        free(mesh);
         free(arena);
         return lean_io_result_mk_error(
             lean_mk_io_user_error(lean_mk_string("bloom_jsi_create: SDL3 GPU initialization failed")));
@@ -75,11 +90,13 @@ LEAN_EXPORT lean_obj_res bloom_jsi_create(uint32_t w, uint32_t h, b_lean_obj_arg
     BloomJsiHandle *handle = (BloomJsiHandle *)calloc(1U, sizeof(BloomJsiHandle));
     if (!handle) {
         bloom_gpu_destroy(gpu);
+        free(mesh);
         free(arena);
         return lean_io_result_mk_error(
             lean_mk_io_user_error(lean_mk_string("bloom_jsi_create: handle alloc failed")));
     }
     handle->arena = arena;
+    handle->mesh = mesh;
     handle->gpu = gpu;
 
     lean_object *ext = lean_alloc_external(g_bloom_jsi_class, handle);
@@ -754,6 +771,35 @@ LEAN_EXPORT lean_obj_res bloom_jsi_export_ppm(b_lean_obj_arg eng, b_lean_obj_arg
     return lean_io_result_mk_ok(lean_box_uint32(nonblack));
 }
 
+LEAN_EXPORT lean_obj_res bloom_jsi_set_section_spec(b_lean_obj_arg eng,
+                                                       uint32_t mode,
+                                                       uint32_t nx_q16,
+                                                       uint32_t ny_q16,
+                                                       uint32_t nz_q16,
+                                                       uint32_t dist_q16,
+                                                       uint32_t inspect_flags) {
+    BloomJsiHandle *h = bloom_jsi_unwrap(eng);
+    BloomEngineArena *arena = h->arena;
+    const int32_t norm[3] = { (int32_t)nx_q16, (int32_t)ny_q16, (int32_t)nz_q16 };
+    BloomSectionSpec64 *sec = &arena->map.section_spec;
+    bloom_section_init64(sec, mode, norm, (int32_t)dist_q16,
+                         sec->slab_half_q16 > 0 ? sec->slab_half_q16 : 16384,
+                         sec->min_wall_q16 > 0 ? sec->min_wall_q16 : 11796,
+                         sec->iso_pitch_q16 > 0 ? sec->iso_pitch_q16 : 9830,
+                         inspect_flags);
+    arena->map.frame_hdr.xray_plane_q16 = (int32_t)dist_q16;
+    arena->map.frame_hdr.flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_obj_res bloom_jsi_step_physics(b_lean_obj_arg eng, uint32_t dt_q16) {
+    BloomJsiHandle *h = bloom_jsi_unwrap(eng);
+    bloom_physics_step_arena64(h->arena, (int32_t)dt_q16);
+    const BloomPhysicsSummary64 *ps = &h->arena->map.phys_summary;
+    uint32_t packed = (uint32_t)ps->interference_pairs | ((uint32_t)ps->ccd_hit_count << 16U);
+    return lean_io_result_mk_ok(lean_box_uint32(packed));
+}
+
 LEAN_EXPORT lean_obj_res bloom_jsi_frame_hash(b_lean_obj_arg eng) {
     BloomJsiHandle *h = bloom_jsi_unwrap(eng);
     uint64_t fnv = 0ULL;
@@ -1348,7 +1394,7 @@ LEAN_EXPORT lean_obj_res bloom_jsi_verify_searu_core(uint64_t seed) {
         (void)bloom_latex_eval_box_sdf_q16(&lboxes[0], INT32_MIN, INT32_MAX);
     }
 
-    /* 7. FLOW v7.0.1 Symbiotic SEARU x 2-Jet (`searu_heal_and_swap`, `SEARU_SOLVE_INLINE` & Ring-0) */
+    /* 7. FLOW v7.1.0 Symbiotic SEARU x 2-Jet (`searu_heal_and_swap`, `SEARU_SOLVE_INLINE` & Ring-0) */
     {
         BloomEngineArena *heal_arena = NULL;
         SEARU_REQ(posix_memalign((void **)&heal_arena, BLOOM_VM_PAGE_ALIGN, sizeof(BloomEngineArena)) == 0 && heal_arena != NULL,
@@ -1358,6 +1404,375 @@ LEAN_EXPORT lean_obj_res bloom_jsi_verify_searu_core(uint64_t seed) {
         if (v7_err != NULL) {
             return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(v7_err)));
         }
+    }
+
+    /* 8. v7.1.0 Binary .stl / .glb CAD Mesh Ingestion, Morton BVH Parity, Jordan Parity, Swept-CCD & Coupled Thermal */
+    {
+        /* Closed 12-triangle unit cube mesh [-0.5 .. +0.5]^3 */
+        static const int8_t cube_tris[12][3][3] = {
+            {{-1,-1,-1}, { 1, 1,-1}, { 1,-1,-1}}, {{-1,-1,-1}, {-1, 1,-1}, { 1, 1,-1}},
+            {{-1,-1, 1}, { 1,-1, 1}, { 1, 1, 1}}, {{-1,-1, 1}, { 1, 1, 1}, {-1, 1, 1}},
+            {{-1,-1,-1}, {-1,-1, 1}, {-1, 1, 1}}, {{-1,-1,-1}, {-1, 1, 1}, {-1, 1,-1}},
+            {{ 1,-1,-1}, { 1, 1, 1}, { 1,-1, 1}}, {{ 1,-1,-1}, { 1, 1,-1}, { 1, 1, 1}},
+            {{-1,-1,-1}, { 1,-1, 1}, {-1,-1, 1}}, {{-1,-1,-1}, { 1,-1,-1}, { 1,-1, 1}},
+            {{-1, 1,-1}, {-1, 1, 1}, { 1, 1, 1}}, {{-1, 1,-1}, { 1, 1, 1}, { 1, 1,-1}}
+        };
+        uint8_t stl[84 + 12 * 50];
+        memset(stl, 0, sizeof(stl));
+        memcpy(stl, "BLOOM710_CUBE_STL", 17U);
+        searu_put_u32_le(stl + 80U, 12U);
+        for (uint32_t t = 0U; t < 12U; ++t) {
+            uint8_t *rec = stl + 84U + t * 50U;
+            for (uint32_t v = 0U; v < 3U; ++v) {
+                for (uint32_t a = 0U; a < 3U; ++a) {
+                    /* IEEE-754 float32 for -0.5 (0xBF000000) or +0.5 (0x3F000000) */
+                    uint32_t bits = (cube_tris[t][v][a] < 0) ? 0xBF000000U : 0x3F000000U;
+                    searu_put_u32_le(rec + 12U + v * 12U + a * 4U, bits);
+                }
+            }
+        }
+
+        BloomMeshArena *mesh = NULL;
+        SEARU_REQ(posix_memalign((void **)&mesh, 64U, sizeof(BloomMeshArena)) == 0 && mesh != NULL,
+                  "Mesh arena allocated");
+        uint32_t tcnt = 0U;
+        SEARU_REQ(bloom_stl_parse_to_mesh64(stl, sizeof(stl), BLOOM_MATTER_TITANIUM, false, mesh, &tcnt) && tcnt == 12U,
+                  "Valid 12-tri cube STL parsed to BloomMeshArena");
+        /* Reject truncated & NaN STL inputs cleanly */
+        SEARU_REQ(!bloom_stl_parse_to_mesh64(stl, sizeof(stl) - 1U, 0U, false, mesh, &tcnt), "Truncated STL rejected");
+        stl[96U] = 0x01U; stl[97U] = 0x00U; stl[98U] = 0xC0U; stl[99U] = 0x7FU; /* NaN */
+        SEARU_REQ(!bloom_stl_parse_to_mesh64(stl, sizeof(stl), 0U, false, mesh, &tcnt), "NaN vertex STL rejected");
+
+        uint32_t mbvh_n = (uint32_t)bloom_bvh_build_from_tris64(mesh->map.tris, 12U, mesh->map.bvh_nodes, BLOOM_MAX_MESH_BVH_NODES);
+        SEARU_REQ(mbvh_n > 0U, "Mesh BVH built");
+        /* Interior origin (0,0,0) has negative SDF (-0.5 = -32768), exterior (2,0,0) has positive SDF (+1.5 = +98304) */
+        uint32_t vis = 0U;
+        int64_t sd_in  = bloom_mesh_eval_sdf_q16(mesh, 12U, mbvh_n, true, 0, 0, 0, &vis);
+        int64_t sd_out = bloom_mesh_eval_sdf_q16(mesh, 12U, mbvh_n, true, 2 * BLOOM_Q16_ONE, 0, 0, &vis);
+        SEARU_REQ(sd_in < -30000 && sd_in > -35000 && sd_out > 96000 && sd_out < 101000,
+                  "Closed cube STL Jordan parity interior(-0.5) & exterior(+1.5) exact");
+
+        /* Multi-triangle GLB mesh ingestion */
+        uint8_t glb_m[32 + 3 * 36];
+        memset(glb_m, 0, sizeof(glb_m));
+        searu_put_u32_le(glb_m + 0U, 0x46546C67U);
+        searu_put_u32_le(glb_m + 4U, 2U);
+        searu_put_u32_le(glb_m + 8U, sizeof(glb_m));
+        searu_put_u32_le(glb_m + 12U, 4U);
+        searu_put_u32_le(glb_m + 16U, 0x4E4F534AU);
+        memcpy(glb_m + 20U, "{  }", 4U);
+        searu_put_u32_le(glb_m + 24U, 3U * 36U);
+        searu_put_u32_le(glb_m + 28U, 0x004E4942U);
+        for (uint32_t t = 0U; t < 3U; ++t) {
+            for (uint32_t v = 0U; v < 3U; ++v) {
+                for (uint32_t a = 0U; a < 3U; ++a) {
+                    uint32_t bits = (cube_tris[t][v][a] < 0) ? 0xBF000000U : 0x3F000000U;
+                    searu_put_u32_le(glb_m + 32U + t * 36U + v * 12U + a * 4U, bits);
+                }
+            }
+        }
+        uint32_t glb_t = 0U;
+        SEARU_REQ(bloom_glb_parse_to_mesh64(glb_m, sizeof(glb_m), BLOOM_MATTER_AURUM_GOLD, true, mesh, &glb_t) && glb_t == 3U,
+                  "Multi-triangle GLB mesh parsed & normalized cleanly");
+        free(mesh);
+
+        /* Swept-CCD Continuous Collision + Coupled Thermal-Mechanical Physics */
+        const int32_t pa[3] = { -4 * BLOOM_Q16_ONE, 0, 0 };
+        const int32_t va[3] = {  8 * BLOOM_Q16_ONE, 0, 0 };
+        const int32_t pb[3] = {  0, 0, 0 };
+        const int32_t vb[3] = {  0, 0, 0 };
+        int32_t toi = 0, cnrm[3] = { 0 };
+        SEARU_REQ(bloom_swept_sphere_ccd_q16(pa, va, 32768, pb, vb, 32768, &toi, cnrm) &&
+                  toi > 23500 && toi < 25600 && cnrm[0] < -60000,
+                  "High-speed swept-sphere CCD zero-tunneling TOI exact");
+
+        BloomEngineArena *phys_arena = NULL;
+        SEARU_REQ(posix_memalign((void **)&phys_arena, BLOOM_VM_PAGE_ALIGN, sizeof(BloomEngineArena)) == 0 && phys_arena != NULL,
+                  "Phys arena allocated");
+        bloom_arena_init_default(phys_arena, 320U, 180U);
+        const int32_t pos0[3] = { 0, 0, 0 };
+        const int32_t pos1[3] = { 32768 /* 0.5 overlap */, 0, 0 };
+        uint32_t id1 = bloom_prefab_spawn_inst(phys_arena, BLOOM_PREFAB_CRYSTAL_SPHERE, pos0, BLOOM_Q16_ONE);
+        uint32_t id2 = bloom_prefab_spawn_inst(phys_arena, BLOOM_PREFAB_CRYSTAL_SPHERE, pos1, BLOOM_Q16_ONE);
+        phys_arena->map.instances[id1 - 1U].thermal_kelvin = 900U;
+        phys_arena->map.instances[id2 - 1U].thermal_kelvin = 300U;
+        bloom_physics_step_arena64(phys_arena, BLOOM_Q16_ONE);
+        SEARU_REQ(phys_arena->map.phys_summary.interference_pairs == 1U &&
+                  phys_arena->map.phys_summary.min_clearance_q16 < 0 &&
+                  phys_arena->map.instances[id1 - 1U].thermal_kelvin < 900U &&
+                  phys_arena->map.instances[id2 - 1U].thermal_kelvin > 300U,
+                  "Multi-body interference detection & coupled conductive heat transfer exact");
+        free(phys_arena);
+    }
+
+    /* 9. BLOOM v8.0.0: 2-Jet Differential Geometry, Sub-Frame Rebound & Modal Physical DSP */
+    {
+        BloomEngineArena *v8_arena = NULL;
+        SEARU_REQ(posix_memalign((void **)&v8_arena, BLOOM_VM_PAGE_ALIGN, sizeof(BloomEngineArena)) == 0 && v8_arena != NULL,
+                  "v8.0.0 arena allocated");
+        bloom_arena_init_default(v8_arena, 320U, 180U);
+        const int32_t orig[3] = { 0, 0, 0 };
+
+        /* 9a. 2-Jet Convex Sphere (H > 0, K > 0), Concave Vessel Cavity (H < 0), Hyperbolic Torus Waist (K < 0) */
+        (void)bloom_prefab_spawn_inst(v8_arena, BLOOM_PREFAB_CRYSTAL_SPHERE, orig, BLOOM_Q16_ONE);
+        BloomFieldJet64 jet_sph;
+        bloom_scene_eval_jet2_q16(v8_arena, NULL, BLOOM_Q16_ONE, 0, 0, &jet_sph);
+        SEARU_REQ(jet_sph.grad_q16[0] > 60000 && jet_sph.mean_curv_q16 > 50000 && jet_sph.gauss_curv_q16 > 40000,
+                  "2-Jet convex sphere H > 0 and K > 0 exact");
+
+        bloom_arena_init_default(v8_arena, 320U, 180U);
+        (void)bloom_prefab_spawn_inst(v8_arena, BLOOM_PREFAB_JADE_VESSEL, orig, BLOOM_Q16_ONE);
+        BloomFieldJet64 jet_cav;
+        bloom_scene_eval_jet2_q16(v8_arena, NULL, 42598, 0, 0, &jet_cav);
+        SEARU_REQ(jet_cav.grad_q16[0] < -60000 && jet_cav.mean_curv_q16 < -50000 && jet_cav.gauss_curv_q16 > 30000,
+                  "2-Jet concave spherical cavity H < 0 exact");
+
+        bloom_arena_init_default(v8_arena, 320U, 180U);
+        BloomPrefabDesc64 *tor = &v8_arena->map.prefabs[8];
+        memset(tor, 0, sizeof(*tor));
+        tor->prefab_id = 9U;
+        tor->art_style_id = 6U;
+        tor->matter_id = BLOOM_MATTER_SAPPHIRE;
+        tor->csg_op_mask = BLOOM_CSG_MASK_PACK(BLOOM_CSG_PRIM_TORUS, BLOOM_CSG_PRIM_NONE, BLOOM_CSG_BOOL_UNION, 0, 0);
+        tor->bounding_radius_q16 = 98304;
+        tor->prim_params_q16[0] = 65536; /* R = 1.0 */
+        tor->prim_params_q16[1] = 16384; /* r = 0.25 */
+        tor->flags = 1U;
+        (void)bloom_prefab_spawn_inst(v8_arena, 9U, orig, BLOOM_Q16_ONE);
+        BloomFieldJet64 jet_sad;
+        bloom_scene_eval_jet2_q16(v8_arena, NULL, 49152 /* 0.75 inner waist */, 0, 0, &jet_sad);
+        SEARU_REQ(jet_sad.gauss_curv_q16 < -100000 && jet_sad.anisotropy_q16 > 150000,
+                  "2-Jet hyperbolic torus saddle K < 0 & principal anisotropy exact");
+
+        /* 9b. Sub-frame Swept-CCD piecewise rebound + pre-TOI sample silence & post-TOI ringing */
+        bloom_arena_init_default(v8_arena, 320U, 180U);
+        const int32_t lp_a[3] = { -163840 /* -2.5 */, 0, 0 };
+        const int32_t lp_b[3] = {  163840 /* +2.5 */, 0, 0 };
+        const int32_t lv_a[3] = {  262144 /* +4.0 */, 0, 0 };
+        const int32_t lv_b[3] = { -262144 /* -4.0 */, 0, 0 };
+        uint32_t sid_a = bloom_prefab_spawn_inst(v8_arena, BLOOM_PREFAB_CRYSTAL_SPHERE, lp_a, BLOOM_Q16_ONE);
+        uint32_t sid_b = bloom_prefab_spawn_inst(v8_arena, BLOOM_PREFAB_CRYSTAL_SPHERE, lp_b, BLOOM_Q16_ONE);
+        bloom_inst_set_vel_q16(&v8_arena->map.instances[sid_a - 1U], lv_a);
+        bloom_inst_set_vel_q16(&v8_arena->map.instances[sid_b - 1U], lv_b);
+        bloom_physics_step_arena64(v8_arena, BLOOM_Q16_ONE);
+
+        int32_t post_va[3], post_vb[3];
+        bloom_inst_get_vel_q16(&v8_arena->map.instances[sid_a - 1U], post_va);
+        bloom_inst_get_vel_q16(&v8_arena->map.instances[sid_b - 1U], post_vb);
+        SEARU_REQ((v8_arena->map.phys_summary.phys_flags & BLOOM_PHYS_FLAG_CCD_HIT) != 0U &&
+                  v8_arena->map.phys_summary.earliest_toi_q16 > 22000 &&
+                  v8_arena->map.phys_summary.earliest_toi_q16 < 27000 &&
+                  post_va[0] < 0 && post_vb[0] > 0 &&
+                  v8_arena->map.instances[sid_a - 1U].pos_q16[0] < 0 &&
+                  v8_arena->map.instances[sid_b - 1U].pos_q16[0] > 0,
+                  "Sub-frame Swept-CCD TOI + piecewise elastic rebound non-tunneling exact");
+
+        BloomAudioRig *rig = (BloomAudioRig *)calloc(1U, sizeof(BloomAudioRig));
+        const uint32_t frame_samps = BLOOM_AUDIO_SAMPLE_RATE / 60U;
+        int16_t *pcm = (int16_t *)calloc(2U * (size_t)frame_samps, sizeof(int16_t));
+        SEARU_REQ(rig != NULL && pcm != NULL, "Audio rig & PCM scratch allocated");
+        bloom_audio_init_rig(rig, BLOOM_AUDIO_SAMPLE_RATE);
+        uint32_t hit_samp = bloom_audio_step_frame64(rig, v8_arena, pcm, frame_samps);
+        SEARU_REQ(hit_samp >= 260U && hit_samp <= 340U && rig->hdr.peak_abs_pcm > 500,
+                  "Sub-frame sensory-locked DSP sample index & post-TOI amplitude exact");
+        bool pre_silent = true;
+        for (uint32_t s = 0U; s < hit_samp; ++s) {
+            if (pcm[2U * s] != 0 || pcm[2U * s + 1U] != 0) { pre_silent = false; break; }
+        }
+        SEARU_REQ(pre_silent, "Zero pre-TOI audio leakage strictly guaranteed");
+
+        /* 9c. Constitutive Glass vs Water Q-damping + Thermal Softening (300K vs 1200K) pitch shift */
+        BloomAudioRig *rig_g = (BloomAudioRig *)calloc(1U, sizeof(BloomAudioRig));
+        BloomAudioRig *rig_w = (BloomAudioRig *)calloc(1U, sizeof(BloomAudioRig));
+        SEARU_REQ(rig_g != NULL && rig_w != NULL, "Constitutive audio rigs allocated");
+        bloom_arena_init_default(v8_arena, 320U, 180U);
+        uint32_t sg = bloom_prefab_spawn_inst(v8_arena, BLOOM_PREFAB_CRYSTAL_SPHERE, orig, BLOOM_Q16_ONE);
+        uint32_t sw = bloom_prefab_spawn_inst(v8_arena, BLOOM_PREFAB_CAPSULE_PILLAR, orig, BLOOM_Q16_ONE);
+        uint32_t st = bloom_prefab_spawn_inst(v8_arena, BLOOM_PREFAB_CITADEL_CORE, orig, BLOOM_Q16_ONE);
+
+        bloom_audio_init_rig(rig_g, BLOOM_AUDIO_SAMPLE_RATE);
+        bloom_audio_init_rig(rig_w, BLOOM_AUDIO_SAMPLE_RATE);
+        bloom_audio_excite_impact64(rig_g, v8_arena, sg - 1U, 4 * BLOOM_Q16_ONE, 0);
+        bloom_audio_excite_impact64(rig_w, v8_arena, sw - 1U, 4 * BLOOM_Q16_ONE, 0);
+        SEARU_REQ(rig_g->voices[0].decay_q15[0] > rig_w->voices[0].decay_q15[0],
+                  "Crystal Glass constitutive Q-factor exceeds Liquid Water damping");
+
+        v8_arena->map.instances[st - 1U].thermal_kelvin = 300U;
+        bloom_audio_init_rig(rig_g, BLOOM_AUDIO_SAMPLE_RATE);
+        bloom_audio_excite_impact64(rig_g, v8_arena, st - 1U, 4 * BLOOM_Q16_ONE, 0);
+        v8_arena->map.instances[st - 1U].thermal_kelvin = 1200U;
+        bloom_audio_init_rig(rig_w, BLOOM_AUDIO_SAMPLE_RATE);
+        bloom_audio_excite_impact64(rig_w, v8_arena, st - 1U, 4 * BLOOM_Q16_ONE, 0);
+        SEARU_REQ(rig_w->voices[0].cos_q14[0] > rig_g->voices[0].cos_q14[0],
+                  "1200K thermal modulus softening lowers modal frequency vs 300K");
+
+        free(rig_w);
+        free(rig_g);
+        free(pcm);
+        free(rig);
+        free(v8_arena);
+    }
+
+    /* 10. BLOOM v9.0.0: Concentric Gameplay Shells, 16KB Time-Rewind, Metric/Doppler & Moodboard */
+    {
+        BloomEngineArena *gp_arena = NULL;
+        BloomEngineArena *rw_saved = NULL;
+        SEARU_REQ(posix_memalign((void **)&gp_arena, BLOOM_VM_PAGE_ALIGN, sizeof(BloomEngineArena)) == 0 && gp_arena != NULL,
+                  "v9 gameplay arena allocated");
+        SEARU_REQ(posix_memalign((void **)&rw_saved, BLOOM_VM_PAGE_ALIGN, sizeof(BloomEngineArena)) == 0 && rw_saved != NULL,
+                  "v9 rewind comparison arena allocated");
+        BloomAudioRig *gp_rig = (BloomAudioRig *)calloc(1U, sizeof(BloomAudioRig));
+        BloomAudioRig *rw_rig_saved = (BloomAudioRig *)calloc(1U, sizeof(BloomAudioRig));
+        BloomSpacetimeSnap *rw_ring = (BloomSpacetimeSnap *)calloc(BLOOM_REWIND_RING_CAP, sizeof(BloomSpacetimeSnap));
+        int16_t *gp_pcm = (int16_t *)calloc(1600U, sizeof(int16_t));
+        SEARU_REQ(gp_rig && rw_rig_saved && rw_ring && gp_pcm, "v9 scratch buffers allocated");
+
+        /* 10a. Concentric SDF Shells (hurt < 0 < graze <= hit), Hysteresis, Fulcrum & -18dB Hitstop */
+        bloom_arena_init_default(gp_arena, 320U, 180U);
+        bloom_audio_init_rig(gp_rig, BLOOM_AUDIO_SAMPLE_RATE);
+        const int32_t p_pl[3] = { 0, 0, 0 };
+        const int32_t p_hz[3] = { 170393 /* +2.60 (clr = +0.60) */, 0, 0 };
+        uint32_t pid = bloom_prefab_spawn_inst(gp_arena, BLOOM_PREFAB_CRYSTAL_SPHERE, p_pl, BLOOM_Q16_ONE);
+        uint32_t hid = bloom_prefab_spawn_inst(gp_arena, BLOOM_PREFAB_CRYSTAL_SPHERE, p_hz, BLOOM_Q16_ONE);
+        gp_arena->map.instances[pid - 1U].flags |= BLOOM_INST_FLAG_COLLIDABLE;
+        gp_arena->map.instances[hid - 1U].flags |= BLOOM_INST_FLAG_COLLIDABLE;
+
+        BloomGameplayState64 gp;
+        bloom_gameplay_init64(&gp, pid, 16384 /* hurt=0.25 */, 32768 /* graze=0.50 */, 65536 /* hit=1.00 */);
+        const int32_t imp_x[3] = { 16384, 0, 0 };
+        uint32_t ev0 = bloom_gameplay_step64(&gp, gp_arena, gp_rig, imp_x, true);
+        int32_t vp0[3], vj0[3];
+        bloom_inst_get_vel_q16(&gp_arena->map.instances[pid - 1U], vp0);
+        bloom_inst_get_vel_q16(&gp_arena->map.instances[hid - 1U], vj0);
+        SEARU_REQ((ev0 & BLOOM_GP_EVENT_FULCRUM) != 0U && gp.graze_latched == 0U &&
+                  vp0[0] == 16384 && vj0[0] == -16384 && (vp0[0] + vj0[0]) == 0,
+                  "Fulcrum action conserves equal-and-opposite momentum inside hit shell");
+
+        /* Enter graze shell (clr = 0.40 <= 0.50), hold in deadband (0.55), then exit (0.75) */
+        bloom_inst_set_vel_q16(&gp_arena->map.instances[pid - 1U], NULL);
+        bloom_inst_set_vel_q16(&gp_arena->map.instances[hid - 1U], NULL);
+        gp_arena->map.instances[pid - 1U].pos_q16[0] = 0;
+        gp_arena->map.instances[hid - 1U].pos_q16[0] = 157286; /* +2.40 -> clr = +0.40 */
+        uint32_t ev_gr = bloom_gameplay_step64(&gp, gp_arena, gp_rig, NULL, false);
+        SEARU_REQ((ev_gr & BLOOM_GP_EVENT_GRAZE) != 0U && gp.graze_latched == 1U && gp.graze_score == 1U,
+                  "Concentric graze shell latches cleanly on enter");
+        gp_arena->map.instances[hid - 1U].pos_q16[0] = 167116; /* +2.55 -> clr = +0.55 in deadband */
+        (void)bloom_gameplay_step64(&gp, gp_arena, gp_rig, NULL, false);
+        SEARU_REQ(gp.graze_latched == 1U && gp.graze_score == 1U, "Graze hysteresis zero-chatter in deadband");
+        gp_arena->map.instances[hid - 1U].pos_q16[0] = 180224; /* +2.75 -> clr = +0.75 >= hyst_exit */
+        (void)bloom_gameplay_step64(&gp, gp_arena, gp_rig, NULL, false);
+        SEARU_REQ(gp.graze_latched == 0U, "Graze hysteresis releases cleanly above exit threshold");
+
+        /* 6-frame Input Buffer delayed fulfillment + -18dB Hitstop contrast vs catharsis release */
+        gp_arena->map.instances[hid - 1U].pos_q16[0] = 229376; /* +3.50 -> clr = +1.50 > hit */
+        uint32_t ev_far = bloom_gameplay_step64(&gp, gp_arena, gp_rig, imp_x, true);
+        SEARU_REQ((ev_far & BLOOM_GP_EVENT_FULCRUM) == 0U && gp.buffered_action == 1U, "Out-of-range input buffered");
+        gp_arena->map.instances[hid - 1U].pos_q16[0] = 163840; /* +2.50 -> clr = +0.50 <= hit */
+        uint32_t ev_buf = bloom_gameplay_step64(&gp, gp_arena, gp_rig, NULL, false);
+        SEARU_REQ((ev_buf & BLOOM_GP_EVENT_FULCRUM) != 0U && gp.buffered_action == 0U, "Buffered input fires in range");
+
+        bloom_inst_set_vel_q16(&gp_arena->map.instances[pid - 1U], NULL);
+        bloom_inst_set_vel_q16(&gp_arena->map.instances[hid - 1U], NULL);
+        gp_arena->map.instances[pid - 1U].pos_q16[0] = 0;
+        gp_arena->map.instances[hid - 1U].pos_q16[0] = 85196; /* +1.30 -> clr = -0.35 < -0.25 hurt */
+        uint32_t ev_hit = bloom_gameplay_step64(&gp, gp_arena, gp_rig, NULL, false);
+        (void)bloom_audio_step_frame64(gp_rig, gp_arena, gp_pcm, 800U);
+        int32_t peak_duck = gp_rig->hdr.peak_abs_pcm;
+        gp_arena->map.instances[hid - 1U].pos_q16[0] = 229376;
+        for (uint32_t k = 0U; k < 4U; ++k) {
+            (void)bloom_gameplay_step64(&gp, gp_arena, gp_rig, NULL, false);
+        }
+        (void)bloom_audio_step_frame64(gp_rig, gp_arena, gp_pcm, 800U);
+        int32_t peak_boom = gp_rig->hdr.peak_abs_pcm;
+        SEARU_REQ((ev_hit & BLOOM_GP_EVENT_HITSTOP) != 0U && gp.lethal_hits == 1U &&
+                  peak_boom > peak_duck * 2,
+                  "Lethal hitstop -18dB ducking vs post-hitstop catharsis boom verified");
+
+        /* 10b. 16KB Arena + 576B AudioRig circular spacetime time-rewind exactness */
+        BloomRewindCtrl64 rw;
+        bloom_rewind_init64(&rw, BLOOM_REWIND_RING_CAP);
+        bloom_arena_init_default(gp_arena, 320U, 180U);
+        bloom_audio_init_rig(gp_rig, BLOOM_AUDIO_SAMPLE_RATE);
+        (void)bloom_prefab_spawn_inst(gp_arena, BLOOM_PREFAB_CRYSTAL_SPHERE, p_pl, BLOOM_Q16_ONE);
+        (void)bloom_prefab_spawn_inst(gp_arena, BLOOM_PREFAB_CITADEL_CORE, p_hz, BLOOM_Q16_ONE);
+        const int32_t rw_v[3] = { -16384, 0, 0 };
+        bloom_inst_set_vel_q16(&gp_arena->map.instances[1], rw_v);
+
+        for (uint32_t s = 0U; s < 8U; ++s) {
+            bloom_rewind_push(&rw, rw_ring, gp_arena, gp_rig);
+            if (s == 2U) {
+                memcpy(rw_saved, gp_arena, sizeof(BloomEngineArena));
+                memcpy(rw_rig_saved, gp_rig, sizeof(BloomAudioRig));
+            }
+            (void)bloom_arena_step_dynamics(gp_arena, 0x0001U);
+            bloom_physics_step_arena64(gp_arena, 6554);
+            (void)bloom_audio_step_frame64(gp_rig, gp_arena, gp_pcm, 800U);
+        }
+        SEARU_REQ(bloom_rewind_restore(&rw, rw_ring, 5U, gp_arena, gp_rig) &&
+                  memcmp(gp_arena, rw_saved, sizeof(BloomEngineArena)) == 0 &&
+                  memcmp(gp_rig, rw_rig_saved, sizeof(BloomAudioRig)) == 0 &&
+                  rw.branch_epoch == 1U,
+                  "16KB Arena + 576B AudioRig O(1) spacetime rewind byte-identical");
+
+        /* 10c. Relativistic Doppler Audio + Metric Horizon + Moodboard + CineCamera */
+        BloomMetricScale64 ms0, ms_pos, ms_neg, ms_bh;
+        bloom_metric_eval_scale64(0, 0, 0, NULL, NULL, &ms0);
+        bloom_metric_eval_scale64(32768, 16384, 65536, NULL, NULL, &ms_pos);
+        bloom_metric_eval_scale64(-32768, 32768, 0, NULL, NULL, &ms_neg);
+        bloom_metric_eval_scale64(0, 40000, 0, NULL, NULL, &ms_bh);
+        SEARU_REQ(ms0.lorentz_gamma_q16 == 65536 && ms0.doppler_factor_q16 == 65536 &&
+                  ms_pos.doppler_factor_q16 > 110000 && ms_neg.doppler_factor_q16 < 40000 &&
+                  ms_bh.grav_redshift_q16 == 0,
+                  "Relativistic Lorentz gamma, Doppler D=sqrt((1+b)/(1-b)) & Schwarzschild horizon exact");
+
+        bloom_arena_init_default(gp_arena, 320U, 180U);
+        (void)bloom_prefab_spawn_inst(gp_arena, BLOOM_PREFAB_CRYSTAL_SPHERE, p_pl, BLOOM_Q16_ONE);
+        gp_arena->map.frame_hdr.flags |= BLOOM_FLAG_METRIC_FIELD;
+        bloom_reg_bank_set_q16(&gp_arena->map.reg_bank, BLOOM_REG_LORENTZ_BETA, 0);
+        bloom_audio_init_rig(rw_rig_saved, BLOOM_AUDIO_SAMPLE_RATE);
+        bloom_audio_excite_impact64(rw_rig_saved, gp_arena, 0U, 4 * BLOOM_Q16_ONE, 0);
+        bloom_reg_bank_set_q16(&gp_arena->map.reg_bank, BLOOM_REG_LORENTZ_BETA, 32768);
+        bloom_audio_init_rig(gp_rig, BLOOM_AUDIO_SAMPLE_RATE);
+        bloom_audio_excite_impact64(gp_rig, gp_arena, 0U, 4 * BLOOM_Q16_ONE, 0);
+        SEARU_REQ(gp_rig->voices[0].cos_q14[0] < rw_rig_saved->voices[0].cos_q14[0],
+                  "Positive Lorentz beta blueshifts modal resonator frequency");
+
+        uint8_t gold_rgb[16 * 16 * 3];
+        for (uint32_t y = 0U; y < 16U; ++y) {
+            for (uint32_t x = 0U; x < 16U; ++x) {
+                size_t k = ((size_t)y * 16U + (size_t)x) * 3U;
+                bool checker = (((x + y) & 1U) != 0U);
+                gold_rgb[k + 0U] = checker ? 245U : 190U;
+                gold_rgb[k + 1U] = checker ? 195U : 140U;
+                gold_rgb[k + 2U] = 32U;
+            }
+        }
+        BloomMoodboard64 mb;
+        BloomArtStyle64 mb_st;
+        BloomPrefabDesc64 mb_pf;
+        SEARU_REQ(bloom_moodboard_extract_rgb24(gold_rgb, 16U, 16U, 16U * 3U, &mb) &&
+                  mb.inferred_matter_id == BLOOM_MATTER_AURUM_GOLD,
+                  "Moodboard warm metallic RGB extraction exact");
+        bloom_moodboard_compile_to_ssot64(&mb, 5U, 9U, &mb_st, &mb_pf);
+        uint64_t expected_pf_h = bloom_prefab_calc_hash(&mb_pf);
+        SEARU_REQ(mb_pf.matter_id == BLOOM_MATTER_AURUM_GOLD &&
+                  mb_pf.hash_lo32 == (uint32_t)(expected_pf_h & 0xFFFFFFFFULL),
+                  "Moodboard SSOT prefab hash matches bloom_prefab_calc_hash");
+
+        BloomCamera64 cine_cam;
+        bloom_camera_init64(&cine_cam, 0, 16384, 5 * BLOOM_Q16_ONE, 85 * BLOOM_Q16_ONE, 117964);
+        const int32_t subj[3] = { 2 * BLOOM_Q16_ONE, 0, 0 };
+        bloom_camera_step_cine64(&cine_cam, &gp_arena->map.reg_bank, subj, 16384, 32768);
+        SEARU_REQ(cine_cam.target_q16[0] > 0 &&
+                  bloom_reg_bank_get_q16(&gp_arena->map.reg_bank, BLOOM_REG_CINE_TRAUMA) == 32768,
+                  "CineCamera deadzone follow & trauma envelope exact");
+
+        free(gp_pcm);
+        free(rw_ring);
+        free(rw_rig_saved);
+        free(gp_rig);
+        free(rw_saved);
+        free(gp_arena);
     }
 
     return lean_io_result_mk_ok(lean_box(1));
@@ -1587,6 +2002,300 @@ LEAN_EXPORT lean_obj_res bloom_jsi_verify_gpu_alignment(b_lean_obj_arg eng) {
         if (xr_uni < 200U || (xr_inter * 100U) < (xr_uni * 85U)) {
             snprintf(err_buf, sizeof(err_buf),
                      "X-Ray Cutaway CPU-vs-GPU IoU < 0.85 (inter=%u uni=%u)", xr_inter, xr_uni);
+            goto done;
+        }
+    }
+
+    /* Dispatch 3: Diagonal 3D Section Plane + Overlapping Inst A^B + DQ Joint + SDF Brick + Cube STL Mesh */
+    {
+        bloom_arena_init_default(arena, w, hp);
+        arena->map.camera.eye_q16[0] = 0;
+        arena->map.camera.eye_q16[1] = 0;
+        arena->map.camera.eye_q16[2] = -7 * BLOOM_Q16_ONE;
+        arena->map.camera.target_q16[0] = 0;
+        arena->map.camera.target_q16[1] = 0;
+        arena->map.camera.target_q16[2] = 0;
+        arena->map.camera.focal_mm_q16 = 28 * BLOOM_Q16_ONE;
+
+        /* Overlapping spheres A^B near (+1.4, +0.9, 0) & rotated Citadel block at (-0.6, +1.5, 0) */
+        const int32_t pos_a[3] = {  91750, 58982, 0 };
+        const int32_t pos_b[3] = { 117964, 58982, 0 };
+        uint32_t ia = bloom_prefab_spawn_inst(arena, BLOOM_PREFAB_CRYSTAL_SPHERE, pos_a, 52428);
+        uint32_t ib = bloom_prefab_spawn_inst(arena, BLOOM_PREFAB_CRYSTAL_SPHERE, pos_b, 52428);
+        bloom_prefab_override_inst(&arena->map.instances[ia - 1U], 8U, BLOOM_MATTER_BLACKBODY, 0);
+        bloom_prefab_override_inst(&arena->map.instances[ib - 1U], 8U, BLOOM_MATTER_BLACKBODY, 0);
+
+        /* Articulated DQ Joint in Slots 136..143 near (-1.2, +2.0, 0) */
+        const int32_t qid[4] = { BLOOM_Q16_ONE, 0, 0, 0 };
+        const int32_t jtr[3] = { -78643, 131072, 0 };
+        bloom_joint_dq64_make(&arena->map.joints[0], 1U, 0U, qid, jtr, 49152, 26214, 0, BLOOM_MATTER_BLACKBODY);
+
+        /* Sparse 4x4x4 SDF Brick in Slots 144..151 near (+0.1, +1.4, -0.3) */
+        int32_t bsamples[64];
+        const int32_t borig[3] = { -26214, 72089, -26214 };
+        for (uint32_t z = 0U; z < 4U; ++z) {
+            for (uint32_t y = 0U; y < 4U; ++y) {
+                for (uint32_t x = 0U; x < 4U; ++x) {
+                    bool edge = (x == 0U || x == 3U || y == 0U || y == 3U || z == 0U || z == 3U);
+                    bsamples[z * 16U + y * 4U + x] = edge ? 16384 : -24576;
+                }
+            }
+        }
+        bloom_sdf_brick64_pack(&arena->map.bricks[0], 1U, BLOOM_MATTER_BLACKBODY, borig, 26214, bsamples);
+
+        /* Watertight shifted STL cube at (-1.5, +1.9, 0) -> x+y > 0 region */
+        static const int8_t c_tris[12][3][3] = {
+            {{-1,-1,-1}, { 1, 1,-1}, { 1,-1,-1}}, {{-1,-1,-1}, {-1, 1,-1}, { 1, 1,-1}},
+            {{-1,-1, 1}, { 1,-1, 1}, { 1, 1, 1}}, {{-1,-1, 1}, { 1, 1, 1}, {-1, 1, 1}},
+            {{-1,-1,-1}, {-1,-1, 1}, {-1, 1, 1}}, {{-1,-1,-1}, {-1, 1, 1}, {-1, 1,-1}},
+            {{ 1,-1,-1}, { 1, 1, 1}, { 1,-1, 1}}, {{ 1,-1,-1}, { 1, 1,-1}, { 1, 1, 1}},
+            {{-1,-1,-1}, { 1,-1, 1}, {-1,-1, 1}}, {{-1,-1,-1}, { 1,-1,-1}, { 1,-1, 1}},
+            {{-1, 1,-1}, {-1, 1, 1}, { 1, 1, 1}}, {{-1, 1,-1}, { 1, 1, 1}, { 1, 1,-1}}
+        };
+        uint8_t stl[84 + 12 * 50];
+        memset(stl, 0, sizeof(stl));
+        searu_put_u32_le(stl + 80U, 12U);
+        for (uint32_t t = 0U; t < 12U; ++t) {
+            uint8_t *rec = stl + 84U + t * 50U;
+            for (uint32_t v = 0U; v < 3U; ++v) {
+                /* Center shifted to (+0.3, +0.9, 0.0) with half-extent 0.55 */
+                searu_put_u32_le(rec + 12U + v * 12U + 0U, (c_tris[t][v][0] < 0) ? 0xBE800000U /* -0.25 */ : 0x3F59999AU /* +0.85 */);
+                searu_put_u32_le(rec + 12U + v * 12U + 4U, (c_tris[t][v][1] < 0) ? 0x3EB33333U /* +0.35 */ : 0x3FB9999AU /* +1.45 */);
+                searu_put_u32_le(rec + 12U + v * 12U + 8U, (c_tris[t][v][2] < 0) ? 0xBF000000U /* -0.50 */ : 0x3F000000U /* +0.50 */);
+            }
+        }
+        uint32_t m_tris = 0U;
+        if (!bloom_stl_parse_to_mesh64(stl, sizeof(stl), BLOOM_MATTER_BLACKBODY, false, h->mesh, &m_tris)) {
+            snprintf(err_buf, sizeof(err_buf), "Dispatch 3 STL mesh parse failed");
+            goto done;
+        }
+        uint32_t m_bvh = (uint32_t)bloom_bvh_build_from_tris64(h->mesh->map.tris, m_tris, h->mesh->map.bvh_nodes, BLOOM_MAX_MESH_BVH_NODES);
+
+        BloomSectionSpec64 *sec = &arena->map.section_spec;
+        sec->joint_count = 1U;
+        sec->brick_count = 1U;
+        sec->mesh_tri_count = (uint16_t)m_tris;
+        sec->mesh_bvh_count = (uint16_t)m_bvh;
+        sec->mesh_matter_style = BLOOM_MATTER_BLACKBODY | (8U << 16U);
+        const int32_t diag_n[3] = { 46341, 46341, 0 }; /* (1/sqrt(2), 1/sqrt(2), 0) */
+        bloom_section_init64(sec, BLOOM_SEC_MODE_PLANE, diag_n, 0, 16384, 11796, 9830,
+                             BLOOM_INSPECT_ISOLINES | BLOOM_INSPECT_WALL_DFM |
+                             BLOOM_INSPECT_INTERFERENCE | BLOOM_INSPECT_MESH_SOLID);
+        bloom_physics_step_arena64(arena, BLOOM_Q16_ONE);
+        if (arena->map.phys_summary.interference_pairs < 1U) {
+            snprintf(err_buf, sizeof(err_buf), "Dispatch 3 overlapping pair A^B not detected by physics");
+            goto done;
+        }
+        arena->map.frame_hdr.flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+
+        if (!bloom_gpu_upload_mesh(h->gpu, h->mesh) ||
+            !bloom_gpu_render(h->gpu, true) ||
+            !searu_load_ppm_rgb(h->gpu, ppm_tmp, fg_rgb, rgb_bytes)) {
+            snprintf(err_buf, sizeof(err_buf), "Dispatch 3 CAD mesh/section GPU render failed");
+            goto done;
+        }
+
+        uint32_t d_inter = 0U, d_uni = 0U, diag_leaks_cpu = 0U, diag_leaks_gpu = 0U;
+        int64_t aspect_q16 = ((int64_t)w << 16) / (int64_t)hp;
+        for (uint32_t py = 0U; py < hp; ++py) {
+            int32_t norm_y_q16 = (int32_t)((((int64_t)(2U * py + 1U) * 65536LL) / (int64_t)hp) - 65536LL);
+            for (uint32_t px = 0U; px < w; ++px) {
+                int32_t norm_x_q16 = (int32_t)((((int64_t)(2U * px + 1U) * 65536LL) / (int64_t)w) - 65536LL);
+                size_t idx = ((size_t)py * (size_t)w + (size_t)px) * 3U;
+                int dr = (int)fg_rgb[idx + 0U] - (int)bg_rgb[idx + 0U];
+                int dg = (int)fg_rgb[idx + 1U] - (int)bg_rgb[idx + 1U];
+                int db = (int)fg_rgb[idx + 2U] - (int)bg_rgb[idx + 2U];
+                int l1 = (dr < 0 ? -dr : dr) + (dg < 0 ? -dg : dg) + (db < 0 ? -db : db);
+                bool gpu_hit = (l1 > 45);
+
+                BloomRaycastHit64 hit;
+                bool cpu_hit = bloom_scene_raycast_ex64(arena, h->mesh, norm_x_q16, norm_y_q16, &hit);
+
+                /* Since eye=(0,0,-7) lies ON x+y=0, any ray with rd.x + rd.y < -0.05 never enters x+y >= 0! */
+                int64_t sum_uv = ((int64_t)norm_x_q16 * aspect_q16) / 65536LL - (int64_t)norm_y_q16;
+                if (sum_uv < -6553) {
+                    if (cpu_hit) diag_leaks_cpu++;
+                    if (gpu_hit) diag_leaks_gpu++;
+                }
+                if (cpu_hit && gpu_hit) d_inter++;
+                if (cpu_hit || gpu_hit) d_uni++;
+            }
+        }
+        if (diag_leaks_cpu != 0U || diag_leaks_gpu != 0U) {
+            snprintf(err_buf, sizeof(err_buf),
+                     "Diagonal Section x+y<0 leak (cpu=%u gpu=%u)", diag_leaks_cpu, diag_leaks_gpu);
+            goto done;
+        }
+        if (d_uni < 250U || (d_inter * 100U) < (d_uni * 85U)) {
+            snprintf(err_buf, sizeof(err_buf),
+                     "Dispatch 3 Mesh/Joint/Brick/Section CPU-vs-GPU IoU < 0.85 (inter=%u uni=%u)", d_inter, d_uni);
+            goto done;
+        }
+    }
+
+    /* Dispatch 4: BLOOM v8.0.0 3-Pass Radiance Cascades Thermal Bounce & CSG Blocker Occlusion */
+    {
+        bloom_arena_init_default(arena, w, hp);
+        arena->map.camera.eye_q16[0] = 0;
+        arena->map.camera.eye_q16[1] = 19660; /* +0.30 */
+        arena->map.camera.eye_q16[2] = -7 * BLOOM_Q16_ONE;
+        arena->map.camera.target_q16[0] = 0;
+        arena->map.camera.target_q16[1] = 0;
+        arena->map.camera.target_q16[2] = 0;
+        arena->map.camera.focal_mm_q16 = 28 * BLOOM_Q16_ONE;
+        arena->map.frame_hdr.flags = BLOOM_FLAG_STUDIO_GI | BLOOM_FLAG_RADIANCE_CASCADES | BLOOM_FLAG_DIFF_FIELD;
+
+        const int32_t pos_rec[3]  = { -111411 /* -1.7 */, 0, 0 };
+        const int32_t pos_emit[3] = {  111411 /* +1.7 */, 0, 0 };
+        const int32_t pos_blk[3]  = {  0, 0, 0 };
+        uint32_t id_rec  = bloom_prefab_spawn_inst(arena, BLOOM_PREFAB_CRYSTAL_SPHERE, pos_rec, 72089 /* 1.1x */);
+        uint32_t id_emit = bloom_prefab_spawn_inst(arena, BLOOM_PREFAB_CRYSTAL_SPHERE, pos_emit, 78643 /* 1.2x */);
+        bloom_prefab_override_inst(&arena->map.instances[id_rec - 1U], 4U, BLOOM_MATTER_TITANIUM, 0);
+        bloom_prefab_override_inst(&arena->map.instances[id_emit - 1U], 7U, BLOOM_MATTER_OBSIDIAN, 0);
+
+        BloomPrefabDesc64 *blk = &arena->map.prefabs[8];
+        memset(blk, 0, sizeof(*blk));
+        blk->prefab_id = 9U;
+        blk->art_style_id = 7U;
+        blk->matter_id = BLOOM_MATTER_OBSIDIAN;
+        blk->csg_op_mask = BLOOM_CSG_MASK_PACK(BLOOM_CSG_PRIM_BOX, BLOOM_CSG_PRIM_NONE, BLOOM_CSG_BOOL_UNION, 0, 0);
+        blk->bounding_radius_q16 = 163840; /* 2.5 */
+        blk->prim_params_q16[0] = 22938;   /* 0.35 half-X */
+        blk->prim_params_q16[1] = 117964;  /* 1.80 half-Y */
+        blk->prim_params_q16[2] = 117964;  /* 1.80 half-Z */
+        blk->flags = 1U;
+
+        uint32_t rec_px = 0U;
+        uint64_t cold_sum = 0ULL, hot_sum = 0ULL, occ_sum = 0ULL;
+
+        arena->map.instances[id_emit - 1U].thermal_kelvin = 300U;
+        if (!bloom_gpu_render(h->gpu, true) || !searu_load_ppm_rgb(h->gpu, ppm_tmp, fg_rgb, rgb_bytes)) {
+            snprintf(err_buf, sizeof(err_buf), "Dispatch 4 RC Cold baseline GPU render failed");
+            goto done;
+        }
+        for (uint32_t py = 0U; py < hp; ++py) {
+            int32_t ny = (int32_t)((((int64_t)(2U * py + 1U) * 65536LL) / (int64_t)hp) - 65536LL);
+            for (uint32_t px = 0U; px < w; ++px) {
+                int32_t nx = (int32_t)((((int64_t)(2U * px + 1U) * 65536LL) / (int64_t)w) - 65536LL);
+                BloomRaycastHit64 hit;
+                if (bloom_scene_raycast64(arena, nx, ny, &hit) && hit.hit_inst_id == id_rec) {
+                    size_t idx = ((size_t)py * (size_t)w + (size_t)px) * 3U;
+                    cold_sum += (uint64_t)fg_rgb[idx] + (uint64_t)fg_rgb[idx + 1U] + (uint64_t)fg_rgb[idx + 2U];
+                    rec_px++;
+                }
+            }
+        }
+
+        arena->map.instances[id_emit - 1U].thermal_kelvin = 2200U;
+        arena->map.frame_hdr.flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+        if (!bloom_gpu_render(h->gpu, true) || !searu_load_ppm_rgb(h->gpu, ppm_tmp, fg_rgb, rgb_bytes)) {
+            snprintf(err_buf, sizeof(err_buf), "Dispatch 4 RC Hot unoccluded GPU render failed");
+            goto done;
+        }
+        for (uint32_t py = 0U; py < hp; ++py) {
+            int32_t ny = (int32_t)((((int64_t)(2U * py + 1U) * 65536LL) / (int64_t)hp) - 65536LL);
+            for (uint32_t px = 0U; px < w; ++px) {
+                int32_t nx = (int32_t)((((int64_t)(2U * px + 1U) * 65536LL) / (int64_t)w) - 65536LL);
+                BloomRaycastHit64 hit;
+                if (bloom_scene_raycast64(arena, nx, ny, &hit) && hit.hit_inst_id == id_rec) {
+                    size_t idx = ((size_t)py * (size_t)w + (size_t)px) * 3U;
+                    hot_sum += (uint64_t)fg_rgb[idx] + (uint64_t)fg_rgb[idx + 1U] + (uint64_t)fg_rgb[idx + 2U];
+                }
+            }
+        }
+
+        (void)bloom_prefab_spawn_inst(arena, 9U, pos_blk, BLOOM_Q16_ONE);
+        arena->map.frame_hdr.flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+        if (!bloom_gpu_render(h->gpu, true) || !searu_load_ppm_rgb(h->gpu, ppm_tmp, fg_rgb, rgb_bytes)) {
+            snprintf(err_buf, sizeof(err_buf), "Dispatch 4 RC Hot+Blocker GPU render failed");
+            goto done;
+        }
+        for (uint32_t py = 0U; py < hp; ++py) {
+            int32_t ny = (int32_t)((((int64_t)(2U * py + 1U) * 65536LL) / (int64_t)hp) - 65536LL);
+            for (uint32_t px = 0U; px < w; ++px) {
+                int32_t nx = (int32_t)((((int64_t)(2U * px + 1U) * 65536LL) / (int64_t)w) - 65536LL);
+                BloomRaycastHit64 hit;
+                if (bloom_scene_raycast64(arena, nx, ny, &hit) && hit.hit_inst_id == id_rec) {
+                    size_t idx = ((size_t)py * (size_t)w + (size_t)px) * 3U;
+                    occ_sum += (uint64_t)fg_rgb[idx] + (uint64_t)fg_rgb[idx + 1U] + (uint64_t)fg_rgb[idx + 2U];
+                }
+            }
+        }
+
+        if (rec_px < 80U || hot_sum <= cold_sum + (uint64_t)rec_px * 10ULL ||
+            hot_sum <= occ_sum + (uint64_t)rec_px * 3ULL) {
+            snprintf(err_buf, sizeof(err_buf),
+                     "Dispatch 4 Radiance Cascades GI bounce/occlusion check failed (px=%u cold=%llu hot=%llu occ=%llu)",
+                     rec_px, (unsigned long long)cold_sum, (unsigned long long)hot_sum, (unsigned long long)occ_sum);
+            goto done;
+        }
+    }
+
+    /* Dispatch 5: Relativistic Geodesic Metric Lensing + CineCamera 2.39:1 Letterbox / Flare */
+    {
+        bloom_arena_init_default(arena, w, hp);
+        arena->map.camera.eye_q16[0] = 0;
+        arena->map.camera.eye_q16[1] = 0;
+        arena->map.camera.eye_q16[2] = -7 * BLOOM_Q16_ONE;
+        arena->map.camera.target_q16[0] = 0;
+        arena->map.camera.target_q16[1] = 0;
+        arena->map.camera.target_q16[2] = 0;
+        arena->map.camera.focal_mm_q16 = 28 * BLOOM_Q16_ONE;
+        arena->map.camera.aperture_fstop_q16 = 117964; /* f/1.8 */
+        arena->map.camera.focus_dist_q16 = 7 * BLOOM_Q16_ONE;
+        arena->map.camera.exposure_q16 = BLOOM_Q16_ONE;
+        arena->map.frame_hdr.flags = BLOOM_FLAG_STUDIO_GI;
+
+        const int32_t pos_c[3] = { 0, 0, 0 };
+        const int32_t pos_l[3] = { -131072 /* -2.0 */, 0, 0 };
+        uint32_t id_c = bloom_prefab_spawn_inst(arena, BLOOM_PREFAB_CRYSTAL_SPHERE, pos_c, 39321 /* 0.6x */);
+        (void)bloom_prefab_spawn_inst(arena, BLOOM_PREFAB_CITADEL_CORE, pos_l, 52428 /* 0.8x */);
+        arena->map.frame_hdr.selected_inst_id = id_c;
+        arena->map.instances[id_c - 1U].thermal_kelvin = 2200U;
+
+        if (!bloom_gpu_render(h->gpu, true) || !searu_load_ppm_rgb(h->gpu, ppm_tmp, bg_rgb, rgb_bytes)) {
+            snprintf(err_buf, sizeof(err_buf), "Dispatch 5a flat reference GPU render failed");
+            goto done;
+        }
+
+        bloom_reg_bank_set_q16(&arena->map.reg_bank, BLOOM_REG_METRIC_PHI, 18350 /* 0.28 */);
+        bloom_reg_bank_set_q16(&arena->map.reg_bank, BLOOM_REG_LORENTZ_BETA, 19660 /* 0.30c */);
+        arena->map.frame_hdr.flags = BLOOM_FLAG_STUDIO_GI | BLOOM_FLAG_METRIC_FIELD;
+        if (!bloom_gpu_render(h->gpu, true) || !searu_load_ppm_rgb(h->gpu, ppm_tmp, fg_rgb, rgb_bytes)) {
+            snprintf(err_buf, sizeof(err_buf), "Dispatch 5b geodesic metric GPU render failed");
+            goto done;
+        }
+
+        uint32_t lens_diff_px = 0U;
+        for (uint32_t i = 0U; i < w * hp; ++i) {
+            size_t k = (size_t)i * 3U;
+            int dr = (int)fg_rgb[k] - (int)bg_rgb[k];
+            int dg = (int)fg_rgb[k + 1U] - (int)bg_rgb[k + 1U];
+            int db = (int)fg_rgb[k + 2U] - (int)bg_rgb[k + 2U];
+            int l1 = (dr < 0 ? -dr : dr) + (dg < 0 ? -dg : dg) + (db < 0 ? -db : db);
+            if (l1 > 30) lens_diff_px++;
+        }
+
+        arena->map.frame_hdr.flags = BLOOM_FLAG_STUDIO_GI | BLOOM_FLAG_CINE_OPTICS;
+        if (!bloom_gpu_render(h->gpu, true) || !searu_load_ppm_rgb(h->gpu, ppm_tmp, fg_rgb, rgb_bytes)) {
+            snprintf(err_buf, sizeof(err_buf), "Dispatch 5c CineCamera GPU render failed");
+            goto done;
+        }
+
+        uint64_t lbox_bg_sum = 0ULL, lbox_cine_sum = 0ULL;
+        uint32_t bar_rows = (hp >= 16U) ? (hp / 16U) : 1U;
+        for (uint32_t py = 0U; py < bar_rows; ++py) {
+            for (uint32_t px = 0U; px < w; ++px) {
+                size_t k = ((size_t)py * (size_t)w + (size_t)px) * 3U;
+                lbox_bg_sum += (uint64_t)bg_rgb[k] + (uint64_t)bg_rgb[k + 1U] + (uint64_t)bg_rgb[k + 2U];
+                lbox_cine_sum += (uint64_t)fg_rgb[k] + (uint64_t)fg_rgb[k + 1U] + (uint64_t)fg_rgb[k + 2U];
+            }
+        }
+
+        if (lens_diff_px < 1500U || lbox_bg_sum <= lbox_cine_sum * 2ULL) {
+            snprintf(err_buf, sizeof(err_buf),
+                     "Dispatch 5 Metric/Cine GPU verification failed (lens_diff=%u lbox_bg=%llu lbox_cine=%llu)",
+                     lens_diff_px, (unsigned long long)lbox_bg_sum, (unsigned long long)lbox_cine_sum);
             goto done;
         }
     }
@@ -1826,6 +2535,27 @@ LEAN_EXPORT lean_obj_res l_Bloom_exportPpm___boxed(lean_obj_arg eng, lean_obj_ar
 LEAN_EXPORT lean_obj_res l_Bloom_frameHash___boxed(lean_obj_arg eng, lean_obj_arg world) {
     (void)world;
     lean_obj_res r = bloom_jsi_frame_hash(eng);
+    lean_dec(eng);
+    return r;
+}
+
+LEAN_EXPORT lean_obj_res l_Bloom_setSectionSpec___boxed(lean_obj_arg eng, lean_obj_arg mode,
+                                                        lean_obj_arg nx, lean_obj_arg ny, lean_obj_arg nz,
+                                                        lean_obj_arg dist, lean_obj_arg iflags, lean_obj_arg world) {
+    (void)world;
+    uint32_t um = lean_unbox_uint32(mode), unx = lean_unbox_uint32(nx), uny = lean_unbox_uint32(ny),
+             unz = lean_unbox_uint32(nz), ud = lean_unbox_uint32(dist), ui = lean_unbox_uint32(iflags);
+    lean_dec(mode); lean_dec(nx); lean_dec(ny); lean_dec(nz); lean_dec(dist); lean_dec(iflags);
+    lean_obj_res r = bloom_jsi_set_section_spec(eng, um, unx, uny, unz, ud, ui);
+    lean_dec(eng);
+    return r;
+}
+
+LEAN_EXPORT lean_obj_res l_Bloom_stepPhysics___boxed(lean_obj_arg eng, lean_obj_arg dt, lean_obj_arg world) {
+    (void)world;
+    uint32_t udt = lean_unbox_uint32(dt);
+    lean_dec(dt);
+    lean_obj_res r = bloom_jsi_step_physics(eng, udt);
     lean_dec(eng);
     return r;
 }

@@ -10,14 +10,16 @@
 
 /*
  * ============================================================================
- * BLOOM v7.0.1 — Standalone Zero-Lean-Runtime Pure C17 Native Studio & CLI
+ * BLOOM v9.0.0 — Standalone Zero-Lean-Runtime Pure C17 Studio, Game & CLI
  * ============================================================================
  * Consumes sealed 16,384-byte (256 x 64B) .bloom Arena images compiled AOT by
- * Bloom.lean, driving either:
- *   1. Interactive 60Hz HiDPI SDL3 GPU Native Studio (3D raycast picking,
- *      orbit rig, 2-Jet tactile Flexbox UI, live UTF-8/IME TextInput command
- *      bar, and 15-frame stat() mtime zero-downtime hot-reload), or
- *   2. Headless offscreen GPU compute settlement & deterministic P6 PPM export.
+ * Bloom.lean OR ingests binary .stl / .glb CAD triangle meshes directly into
+ * BloomMeshArena (32,768B = 512 x 64B), driving:
+ *   1. Interactive 60Hz HiDPI SDL3 GPU Native Studio (Radiance Cascades GI,
+ *      2-Jet Curvature Field, Relativistic Geodesic Metric, Thin-Lens CineCamera,
+ *      Concentric SDF Gameplay Shells, 16KB Spacetime Rewind & Modal DSP),
+ *   2. Headless GPU compute, --cine, --metric, --shells, --rewind,
+ *      --import-mood, --export-html, --edl-out, --kitty & --audio-out WAV.
  *
  * Zero <lean/lean.h>, zero -lleanshared, zero Lean runtime dependency.
  * ============================================================================
@@ -28,26 +30,54 @@ typedef struct {
     const char *shader_path;
     const char *watch_svg_path;
     const char *out_ppm_path;
+    const char *out_wav_path;
+    const char *import_mood_path;
+    const char *export_html_path;
+    const char *out_edl_path;
     uint32_t    override_w;
     uint32_t    override_h;
     uint32_t    steps;
+    uint32_t    rewind_steps;
+    int32_t     sec_norm_q16[3];
+    int32_t     sec_dist_q16;
+    int32_t     slab_half_q16;
+    int32_t     impact_vx_q16;
+    int32_t     metric_phi_q16;
+    int32_t     metric_beta_q16;
+    bool        set_section;
+    bool        set_slab;
+    bool        set_corner;
+    bool        inspect_cae;
+    bool        enable_rc;
+    bool        enable_field;
+    bool        enable_cine;
+    bool        has_metric;
+    bool        enable_shells;
+    bool        has_impact;
+    bool        emit_kitty;
     bool        headless;
     bool        show_help;
     bool        show_version;
 } BloomCliArgs;
 
 typedef struct {
-    BloomEngineArena *arena;
-    BloomEngineArena *staging;
-    BloomGpuCtx      *gpu;
-    const char       *bloom_path;
-    const char       *watch_svg_path;
-    time_t            last_bloom_mtime;
-    time_t            last_svg_mtime;
-    uint32_t          frame_tick;
-    uint32_t          matter_cursor;
-    uint16_t          mode_word;
-    bool              alert_toggled;
+    BloomEngineArena    *arena;
+    BloomEngineArena    *staging;
+    BloomMeshArena      *mesh;
+    BloomGpuCtx         *gpu;
+    BloomAudioRig        audio;
+    BloomGameplayState64 gameplay;
+    BloomRewindCtrl64    rewind_ctrl;
+    BloomSpacetimeSnap  *rewind_ring;
+    const char          *bloom_path;
+    const char          *watch_svg_path;
+    time_t               last_bloom_mtime;
+    time_t               last_svg_mtime;
+    uint32_t             frame_tick;
+    uint32_t             matter_cursor;
+    uint16_t             mode_word;
+    bool                 alert_toggled;
+    bool                 mesh_mode;
 } BloomStudioRuntime;
 
 static int32_t cli_clamp64(int64_t v, int32_t lo, int32_t hi) {
@@ -75,21 +105,93 @@ static bool cli_parse_u32(const char *s, uint32_t *out_val) {
     return true;
 }
 
+static bool cli_parse_q16(const char *s, int32_t *out_q16, const char **out_end) {
+    if (!s || !out_q16) return false;
+    const char *p = s;
+    bool neg = false;
+    if (*p == '-') {
+        neg = true;
+        ++p;
+    } else if (*p == '+') {
+        ++p;
+    }
+    if (*p < '0' || *p > '9') return false;
+    int64_t whole = 0;
+    while (*p >= '0' && *p <= '9') {
+        whole = whole * 10LL + (int64_t)(*p - '0');
+        if (whole > 32767LL) whole = 32767LL;
+        ++p;
+    }
+    int64_t frac = 0;
+    int64_t frac_scale = 1;
+    if (*p == '.') {
+        ++p;
+        int digits = 0;
+        while (*p >= '0' && *p <= '9') {
+            if (digits < 4) {
+                frac = frac * 10LL + (int64_t)(*p - '0');
+                frac_scale *= 10LL;
+                ++digits;
+            }
+            ++p;
+        }
+    }
+    int64_t val = (whole * (int64_t)BLOOM_Q16_ONE) + ((frac * (int64_t)BLOOM_Q16_ONE) / frac_scale);
+    if (neg) val = -val;
+    *out_q16 = cli_clamp64(val, -BLOOM_MAX_Q16, BLOOM_MAX_Q16);
+    if (out_end) *out_end = p;
+    return true;
+}
+
+static bool cli_parse_q16_pair(const char *s, int32_t *out_a, int32_t *out_b) {
+    const char *p = s;
+    if (!cli_parse_q16(p, out_a, &p) || *p != ',') return false;
+    ++p;
+    if (!cli_parse_q16(p, out_b, &p) || *p != '\0') return false;
+    return true;
+}
+
+static bool cli_parse_section_vec4(const char *s, int32_t out_n[3], int32_t *out_d) {
+    const char *p = s;
+    for (int i = 0; i < 3; ++i) {
+        if (!cli_parse_q16(p, &out_n[i], &p) || *p != ',') return false;
+        ++p;
+    }
+    if (!cli_parse_q16(p, out_d, &p) || *p != '\0') return false;
+    return true;
+}
+
 static void cli_print_usage(const char *prog) {
-    printf("BLOOM v%s — Pure C17 64-Byte Spatial & Flexbox Native Runner\n", BLOOM_VERSION_STRING);
+    printf("BLOOM v%s — Pure C17 Radiance Cascades, Diff Field, Relativistic Metric, CineCamera & Modal DSP Engine\n", BLOOM_VERSION_STRING);
     printf("Usage:\n");
-    printf("  %s [file.bloom] [--watch-svg <spec.svg>] [--shader <core.wgsl>] [--width W --height H]\n", prog);
-    printf("  %s --headless [file.bloom] --out <frame.ppm> [--width W --height H] [--steps N]\n", prog);
+    printf("  %s [model.{bloom,stl,glb}] [--watch-svg <spec.svg>] [--shader <core.wgsl>] [--width W --height H]\n", prog);
+    printf("  %s --headless [model.{bloom,stl,glb}] [--rc] [--field] [--cine] [--metric phi,beta] [--shells] [--rewind N] [--import-mood ref.ppm] [--export-html app.html] [--edl-out reel.edl] [--kitty] [--impact vx] [--audio-out out.wav] [--out frame.ppm]\n", prog);
     printf("\nOptions:\n");
-    printf("  --headless            Run offscreen GPU compute & exit after rendering\n");
-    printf("  --out <frame.ppm>     Export rendered RGBA8 framebuffer to binary P6 PPM\n");
-    printf("  --steps <N>           FLOW v7.0.1 2-Jet settlement steps in headless mode (default: 60)\n");
-    printf("  --width <W>           Override framebuffer width in pixels\n");
-    printf("  --height <H>          Override framebuffer height in pixels\n");
-    printf("  --watch-svg <file>    Optional W3C .svg file to hot-reload alongside .bloom\n");
-    printf("  --shader <file.wgsl>  WGSL compute shader base path (default: shaders/bloom_core.wgsl)\n");
-    printf("  --version, -v         Print BLOOM version\n");
-    printf("  --help, -h            Show this help message\n");
+    printf("  --rc                   Enable 3-pass zero-noise 3D Radiance Cascades GI\n");
+    printf("  --field                Enable 2-Jet differential geometry curvature/patina fields\n");
+    printf("  --cine                 Enable 2.39:1 thin-lens DoF & anamorphic blue streaks\n");
+    printf("  --metric phi,beta      Enable geodesic lensing + Lorentz Doppler scaling\n");
+    printf("  --shells               Enable concentric SDF hurt/graze/hit gameplay shells\n");
+    printf("  --rewind <N>           Record 16KB spacetime ring and restore N frames back\n");
+    printf("  --import-mood <in.ppm> Compile P6 PPM moodboard into 64B Style & Prefab SSOT\n");
+    printf("  --export-html <out.html> Bundle 16KB Arena + WGSL into single-file WebGPU HTML\n");
+    printf("  --edl-out <out.edl>    Write 24fps CMX 3600 storyboard EDL reel\n");
+    printf("  --kitty                Emit Kitty Graphics APC terminal image payload\n");
+    printf("  --impact <vx>          Launch deterministic sub-frame Swept-CCD sphere impact\n");
+    printf("  --audio-out <out.wav>  Render 48kHz stereo physical-modeling modal DSP WAV\n");
+    printf("  --section nx,ny,nz,d   Enable arbitrary 3D cross-section plane n.p = d\n");
+    printf("  --slab <half>          Enable dual-plane slab tomography around section plane\n");
+    printf("  --corner               Enable surgical quarter-corner cutaway section mode\n");
+    printf("  --inspect              Step CAE physics and print telemetry\n");
+    printf("  --headless             Run offscreen GPU compute & exit after rendering\n");
+    printf("  --out <frame.ppm>      Export rendered RGBA8 framebuffer to binary P6 PPM\n");
+    printf("  --steps <N>            2-Jet settlement steps in headless mode (default: 60)\n");
+    printf("  --width <W>            Override framebuffer width in pixels\n");
+    printf("  --height <H>           Override framebuffer height in pixels\n");
+    printf("  --watch-svg <file>     Optional W3C .svg file to hot-reload alongside .bloom\n");
+    printf("  --shader <file.wgsl>   WGSL compute shader base path (default: shaders/bloom_core.wgsl)\n");
+    printf("  --version, -v          Print BLOOM version\n");
+    printf("  --help, -h             Show this help message\n");
 }
 
 static bool cli_parse_args(int argc, char **argv, BloomCliArgs *out) {
@@ -97,6 +199,8 @@ static bool cli_parse_args(int argc, char **argv, BloomCliArgs *out) {
     out->bloom_path = "build/studio.bloom";
     out->shader_path = "shaders/bloom_core.wgsl";
     out->steps = 60U;
+    out->sec_norm_q16[0] = BLOOM_Q16_ONE;
+    out->slab_half_q16 = 16384;
 
     bool positional_set = false;
     for (int i = 1; i < argc; ++i) {
@@ -111,6 +215,82 @@ static bool cli_parse_args(int argc, char **argv, BloomCliArgs *out) {
         }
         if (strcmp(arg, "--headless") == 0) {
             out->headless = true;
+        } else if (strcmp(arg, "--rc") == 0) {
+            out->enable_rc = true;
+        } else if (strcmp(arg, "--field") == 0) {
+            out->enable_field = true;
+        } else if (strcmp(arg, "--cine") == 0) {
+            out->enable_cine = true;
+        } else if (strcmp(arg, "--metric") == 0) {
+            if (i + 1 >= argc || !cli_parse_q16_pair(argv[++i], &out->metric_phi_q16, &out->metric_beta_q16)) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --metric (expected phi,beta)\n");
+                return false;
+            }
+            out->has_metric = true;
+        } else if (strcmp(arg, "--shells") == 0) {
+            out->enable_shells = true;
+        } else if (strcmp(arg, "--rewind") == 0) {
+            if (i + 1 >= argc || !cli_parse_u32(argv[++i], &out->rewind_steps) ||
+                out->rewind_steps == 0U || out->rewind_steps >= BLOOM_REWIND_RING_CAP) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --rewind (expected 1..63)\n");
+                return false;
+            }
+        } else if (strcmp(arg, "--import-mood") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[BLOOM CLI] Missing path after --import-mood\n");
+                return false;
+            }
+            out->import_mood_path = argv[++i];
+        } else if (strcmp(arg, "--export-html") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[BLOOM CLI] Missing path after --export-html\n");
+                return false;
+            }
+            out->export_html_path = argv[++i];
+            out->headless = true;
+        } else if (strcmp(arg, "--edl-out") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[BLOOM CLI] Missing path after --edl-out\n");
+                return false;
+            }
+            out->out_edl_path = argv[++i];
+            out->headless = true;
+        } else if (strcmp(arg, "--kitty") == 0) {
+            out->emit_kitty = true;
+            out->headless = true;
+        } else if (strcmp(arg, "--impact") == 0) {
+            const char *endp = NULL;
+            if (i + 1 >= argc || !cli_parse_q16(argv[++i], &out->impact_vx_q16, &endp) ||
+                !endp || *endp != '\0') {
+                fprintf(stderr, "[BLOOM CLI] Invalid --impact velocity\n");
+                return false;
+            }
+            out->has_impact = true;
+        } else if (strcmp(arg, "--audio-out") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[BLOOM CLI] Missing path after --audio-out\n");
+                return false;
+            }
+            out->out_wav_path = argv[++i];
+            out->headless = true;
+        } else if (strcmp(arg, "--corner") == 0) {
+            out->set_corner = true;
+        } else if (strcmp(arg, "--inspect") == 0) {
+            out->inspect_cae = true;
+        } else if (strcmp(arg, "--section") == 0) {
+            if (i + 1 >= argc || !cli_parse_section_vec4(argv[++i], out->sec_norm_q16, &out->sec_dist_q16)) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --section (expected nx,ny,nz,d)\n");
+                return false;
+            }
+            out->set_section = true;
+        } else if (strcmp(arg, "--slab") == 0) {
+            const char *endp = NULL;
+            if (i + 1 >= argc || !cli_parse_q16(argv[++i], &out->slab_half_q16, &endp) ||
+                !endp || *endp != '\0' || out->slab_half_q16 <= 0) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --slab half-thickness\n");
+                return false;
+            }
+            out->set_slab = true;
         } else if (strcmp(arg, "--out") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "[BLOOM CLI] Missing path after --out\n");
@@ -187,6 +367,87 @@ static bool cli_load_bloom_file(const char *path, BloomEngineArena *out_arena) {
         return false;
     }
     return bloom_image_verify_arena(out_arena);
+}
+
+static bool cli_ends_with_ci(const char *s, const char *suf) {
+    if (!s || !suf) return false;
+    size_t sl = strlen(s), xl = strlen(suf);
+    if (sl < xl) return false;
+    for (size_t i = 0U; i < xl; ++i) {
+        char a = s[sl - xl + i], b = suf[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - ('A' - 'a'));
+        if (b >= 'A' && b <= 'Z') b = (char)(b - ('A' - 'a'));
+        if (a != b) return false;
+    }
+    return true;
+}
+
+static bool cli_load_input_asset(const char *path,
+                                 BloomEngineArena *out_arena,
+                                 BloomMeshArena *out_mesh,
+                                 bool *out_is_mesh) {
+    if (!path || !out_arena || !out_mesh || !out_is_mesh) return false;
+    *out_is_mesh = false;
+    if (cli_load_bloom_file(path, out_arena)) {
+        return true;
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size < 28 || (uint64_t)st.st_size > 16777216ULL) {
+        return false;
+    }
+    size_t fsize = (size_t)st.st_size;
+    uint8_t *raw = (uint8_t *)malloc(fsize);
+    if (!raw) return false;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        free(raw);
+        return false;
+    }
+    size_t nr = fread(raw, 1U, fsize, fp);
+    fclose(fp);
+    if (nr != fsize) {
+        free(raw);
+        return false;
+    }
+
+    bool is_glb = (fsize >= 12U && raw[0] == 'g' && raw[1] == 'l' && raw[2] == 'T' && raw[3] == 'F') ||
+                  cli_ends_with_ci(path, ".glb");
+    uint32_t tri_cnt = 0U;
+    bool parsed = false;
+    if (is_glb) {
+        parsed = bloom_glb_parse_to_mesh64(raw, fsize, BLOOM_MATTER_TITANIUM, true, out_mesh, &tri_cnt);
+    } else if (cli_ends_with_ci(path, ".stl") || (fsize >= 84U && ((fsize - 84U) % 50U) == 0U)) {
+        parsed = bloom_stl_parse_to_mesh64(raw, fsize, BLOOM_MATTER_TITANIUM, true, out_mesh, &tri_cnt);
+    }
+    free(raw);
+    if (!parsed || tri_cnt == 0U) {
+        return false;
+    }
+
+    bloom_arena_init_default(out_arena, 1280U, 720U);
+    out_arena->map.frame_hdr.flags |= BLOOM_FLAG_STUDIO_GI;
+    bloom_camera_init64(&out_arena->map.camera, 36000, 22000, 4 * BLOOM_Q16_ONE,
+                        35 * BLOOM_Q16_ONE, 183500);
+    for (uint32_t c = 0U; c < 4U; ++c) {
+        int32_t v = (c == 0U) ? out_arena->map.camera.orbit_yaw_q16
+                  : ((c == 1U) ? out_arena->map.camera.orbit_pitch_q16
+                  : out_arena->map.camera.orbit_dist_q16);
+        out_arena->map.flow_states[c][3] = (uint64_t)(int64_t)v;
+        out_arena->map.flow_states[c][4] = 0ULL;
+    }
+
+    BloomSectionSpec64 *sec = &out_arena->map.section_spec;
+    sec->mesh_tri_count = (uint16_t)tri_cnt;
+    sec->mesh_bvh_count = (uint16_t)bloom_bvh_build_from_tris64(
+        out_mesh->map.tris, tri_cnt, out_mesh->map.bvh_nodes, BLOOM_MAX_MESH_BVH_NODES);
+    sec->mesh_matter_style = (uint32_t)BLOOM_MATTER_TITANIUM | (4U << 16U);
+    sec->inspect_flags = BLOOM_INSPECT_ISOLINES | BLOOM_INSPECT_WALL_DFM |
+                         BLOOM_INSPECT_INTERFERENCE | BLOOM_INSPECT_TRIPLANAR |
+                         BLOOM_INSPECT_MESH_SOLID;
+    cli_stamp_mac(sec, 0x5EC70064ULL, &sec->mac_lo32, &sec->mac_hi32);
+    *out_is_mesh = true;
+    return true;
 }
 
 static char cli_ascii_upper(char c) {
@@ -301,6 +562,73 @@ static void cli_exec_text_command(BloomStudioRuntime *rt) {
         hdr->flags ^= BLOOM_FLAG_XRAY_ENABLED;
         hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
     }
+    if (cli_has_token_ci(buf, len, "RC")) {
+        hdr->flags ^= BLOOM_FLAG_RADIANCE_CASCADES;
+        hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    if (cli_has_token_ci(buf, len, "FIELD")) {
+        hdr->flags ^= BLOOM_FLAG_DIFF_FIELD;
+        hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    if (cli_has_token_ci(buf, len, "STRIKE")) {
+        uint32_t sidx = cli_resolve_target_inst_idx(arena);
+        if (sidx < BLOOM_MAX_INSTANCES) {
+            bloom_audio_excite_impact64(&rt->audio, arena, sidx, BLOOM_Q16_ONE * 4,
+                                        arena->map.instances[sidx].pos_q16[0] >> 2);
+        }
+        hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    if (cli_has_token_ci(buf, len, "CINE")) {
+        hdr->flags ^= BLOOM_FLAG_CINE_OPTICS;
+        arena->map.camera.aperture_fstop_q16 = 117964; /* f/1.8 */
+        hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    if (cli_has_token_ci(buf, len, "LENS")) {
+        hdr->flags ^= BLOOM_FLAG_METRIC_FIELD;
+        bloom_reg_bank_set_q16(&arena->map.reg_bank, BLOOM_REG_METRIC_PHI, 16384);
+        bloom_reg_bank_set_q16(&arena->map.reg_bank, BLOOM_REG_LORENTZ_BETA, 26214);
+        hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    if (cli_has_token_ci(buf, len, "SHELLS")) {
+        hdr->flags ^= BLOOM_FLAG_GAMEPLAY_SHELLS;
+        if (rt->gameplay.player_inst_id == 0U) {
+            bloom_gameplay_init64(&rt->gameplay, 1U, 16384, 32768, 65536);
+        }
+        hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    if (cli_has_token_ci(buf, len, "REWIND")) {
+        if (rt->rewind_ring && rt->rewind_ctrl.count > 1U) {
+            uint32_t back = (rt->rewind_ctrl.count > 30U) ? 30U : (rt->rewind_ctrl.count - 1U);
+            (void)bloom_rewind_restore(&rt->rewind_ctrl, rt->rewind_ring, back, arena, &rt->audio);
+            hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+        }
+    }
+    if (cli_has_token_ci(buf, len, "SECTION")) {
+        BloomSectionSpec64 *sec = &arena->map.section_spec;
+        uint32_t next_m = (sec->section_mode == BLOOM_SEC_MODE_OFF) ? BLOOM_SEC_MODE_PLANE : BLOOM_SEC_MODE_OFF;
+        bloom_section_init64(sec, next_m, sec->plane_norm_q16, hdr->xray_plane_q16,
+                             sec->slab_half_q16, sec->min_wall_q16, sec->iso_pitch_q16,
+                             sec->inspect_flags);
+        hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    if (cli_has_token_ci(buf, len, "SLAB")) {
+        BloomSectionSpec64 *sec = &arena->map.section_spec;
+        bloom_section_init64(sec, BLOOM_SEC_MODE_SLAB, sec->plane_norm_q16, hdr->xray_plane_q16,
+                             sec->slab_half_q16, sec->min_wall_q16, sec->iso_pitch_q16,
+                             sec->inspect_flags);
+        hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    if (cli_has_token_ci(buf, len, "CORNER")) {
+        BloomSectionSpec64 *sec = &arena->map.section_spec;
+        bloom_section_init64(sec, BLOOM_SEC_MODE_CORNER, sec->plane_norm_q16, hdr->xray_plane_q16,
+                             sec->slab_half_q16, sec->min_wall_q16, sec->iso_pitch_q16,
+                             sec->inspect_flags);
+        hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    if (cli_has_token_ci(buf, len, "STEP")) {
+        bloom_physics_step_arena64(arena, BLOOM_Q16_ONE);
+        hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
 
     if (cli_has_token_ci(buf, len, "REVERT")) {
         cli_apply_studio_action(rt, BLOOM_ACTION_PREFAB_REVERT);
@@ -356,7 +684,7 @@ static void cli_poll_hot_reload(BloomStudioRuntime *rt) {
     BloomDomState64 *dom = &arena->map.dom;
 
     time_t cur_mtime = 0;
-    if (rt->bloom_path && cli_stat_mtime(rt->bloom_path, &cur_mtime) &&
+    if (!rt->mesh_mode && rt->bloom_path && cli_stat_mtime(rt->bloom_path, &cur_mtime) &&
         cur_mtime != rt->last_bloom_mtime) {
         if (cli_load_bloom_file(rt->bloom_path, rt->staging)) {
             BloomCamera64 saved_cam = arena->map.camera;
@@ -446,10 +774,15 @@ static void cli_studio_step_cb(void *raw_ctx) {
             }
             if (action == BLOOM_ACTION_NONE && dom->hovered_node_id == 0U) {
                 BloomRaycastHit64 hit;
-                if (bloom_scene_raycast64(arena, win->pointer_x_q16, win->pointer_y_q16, &hit) &&
+                if (bloom_scene_raycast_ex64(arena, rt->mesh_mode ? rt->mesh : NULL,
+                                             win->pointer_x_q16, win->pointer_y_q16, &hit) &&
                     hit.hit_valid != 0U) {
                     hdr->selected_inst_id = hit.hit_inst_id;
                     bloom_reg_bank_set_q16(&arena->map.reg_bank, 2U, (int32_t)(hit.hit_inst_id * 100U));
+                    uint32_t sidx = (hit.hit_inst_id > 0U && hit.hit_inst_id <= BLOOM_MAX_INSTANCES)
+                        ? (hit.hit_inst_id - 1U) : 0U;
+                    bloom_audio_excite_impact64(&rt->audio, arena, sidx, BLOOM_Q16_ONE * 3,
+                                                hit.hit_pos_q16[0] >> 2);
                     hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
                 }
             }
@@ -487,7 +820,109 @@ static void cli_studio_step_cb(void *raw_ctx) {
     }
 
     (void)bloom_arena_step_dynamics(arena, rt->mode_word);
+    if ((arena->map.frame_hdr.flags & BLOOM_FLAG_GAMEPLAY_SHELLS) != 0U) {
+        (void)bloom_gameplay_step64(&rt->gameplay, arena, &rt->audio, NULL, false);
+    }
+    if ((arena->map.frame_hdr.flags & BLOOM_FLAG_CINE_OPTICS) != 0U) {
+        bloom_camera_step_cine64(&arena->map.camera, &arena->map.reg_bank, NULL, 8192, 0);
+    }
+    if (rt->rewind_ring && (arena->map.frame_hdr.flags & BLOOM_FLAG_IDLE_SLEEP) == 0U) {
+        bloom_rewind_push(&rt->rewind_ctrl, rt->rewind_ring, arena, &rt->audio);
+    }
+    {
+        int16_t pcm[1600];
+        (void)bloom_audio_step_frame64(&rt->audio, arena, pcm, 800U);
+        (void)bloom_gpu_push_audio_i16(rt->gpu, pcm, 800U);
+    }
     (void)bloom_gpu_render(rt->gpu, false);
+}
+
+static bool cli_buf_next_token(const uint8_t *buf, size_t len, size_t *io_pos, char *tok, size_t cap) {
+    size_t p = *io_pos;
+    while (p < len) {
+        uint8_t c = buf[p];
+        if (c == '#') {
+            while (p < len && buf[p] != '\n') ++p;
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            ++p;
+            continue;
+        }
+        break;
+    }
+    size_t i = 0U;
+    while (p < len) {
+        uint8_t c = buf[p];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            ++p;
+            break;
+        }
+        if (c == '#') {
+            while (p < len && buf[p] != '\n') ++p;
+            if (p < len) ++p;
+            break;
+        }
+        if (i + 1U < cap) tok[i++] = (char)c;
+        ++p;
+    }
+    tok[i] = '\0';
+    *io_pos = p;
+    return i > 0U;
+}
+
+static bool cli_import_mood_ppm(const char *ppm_path, BloomEngineArena *arena) {
+    if (!ppm_path || !arena) return false;
+    struct stat st;
+    if (stat(ppm_path, &st) != 0 || st.st_size < 11 || (uint64_t)st.st_size > 67108864ULL) {
+        return false;
+    }
+    size_t fsize = (size_t)st.st_size;
+    uint8_t *raw = (uint8_t *)malloc(fsize);
+    if (!raw) return false;
+    FILE *fp = fopen(ppm_path, "rb");
+    if (!fp) {
+        free(raw);
+        return false;
+    }
+    size_t nr = fread(raw, 1U, fsize, fp);
+    fclose(fp);
+    if (nr != fsize) {
+        free(raw);
+        return false;
+    }
+
+    size_t pos = 0U;
+    char tok[32];
+    uint32_t w = 0U, h = 0U, mv = 0U;
+    bool hdr_ok = cli_buf_next_token(raw, fsize, &pos, tok, sizeof(tok)) && strcmp(tok, "P6") == 0 &&
+                  cli_buf_next_token(raw, fsize, &pos, tok, sizeof(tok)) && cli_parse_u32(tok, &w) &&
+                  cli_buf_next_token(raw, fsize, &pos, tok, sizeof(tok)) && cli_parse_u32(tok, &h) &&
+                  cli_buf_next_token(raw, fsize, &pos, tok, sizeof(tok)) && cli_parse_u32(tok, &mv) &&
+                  mv == 255U && w >= 2U && h >= 2U && w <= 4096U && h <= 4096U;
+    size_t rgb_len = (size_t)w * (size_t)h * 3U;
+    if (!hdr_ok || pos > fsize || (fsize - pos) < rgb_len) {
+        free(raw);
+        return false;
+    }
+
+    BloomMoodboard64 mood;
+    bool extracted = bloom_moodboard_extract_rgb24(raw + pos, w, h, w * 3U, &mood);
+    free(raw);
+    if (!extracted) return false;
+
+    bloom_moodboard_compile_to_ssot64(&mood, 8U, 9U, &arena->map.styles[7], &arena->map.prefabs[8]);
+    if (arena->map.frame_hdr.inst_count > 0U) {
+        arena->map.instances[0].prefab_id = 9U;
+        bloom_prefab_override_inst(&arena->map.instances[0], 8U, mood.inferred_matter_id, 0);
+    } else {
+        const int32_t orig[3] = { 0, 0, 0 };
+        (void)bloom_prefab_spawn_inst(arena, 9U, orig, BLOOM_Q16_ONE);
+    }
+    arena->map.frame_hdr.flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    fprintf(stderr, "[BLOOM MOOD] %s -> matter=%u dom=#%06x acc=#%06x edge_q16=%d\n",
+            ppm_path, mood.inferred_matter_id, mood.dominant_rgb24, mood.accent_rgb24, mood.edge_density_q16);
+    return true;
 }
 
 int main(int argc, char **argv) {
@@ -506,6 +941,7 @@ int main(int argc, char **argv) {
 
     void *raw_arena = NULL;
     void *raw_staging = NULL;
+    void *raw_mesh = NULL;
     if (posix_memalign(&raw_arena, BLOOM_VM_PAGE_ALIGN, sizeof(BloomEngineArena)) != 0 || !raw_arena) {
         fprintf(stderr, "[BLOOM CLI] Failed to allocate 16KB page-aligned BloomEngineArena\n");
         return 1;
@@ -515,18 +951,96 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[BLOOM CLI] Failed to allocate hot-reload staging arena\n");
         return 1;
     }
+    if (posix_memalign(&raw_mesh, 64U, sizeof(BloomMeshArena)) != 0 || !raw_mesh) {
+        free(raw_staging);
+        free(raw_arena);
+        fprintf(stderr, "[BLOOM CLI] Failed to allocate 32KB BloomMeshArena\n");
+        return 1;
+    }
 
     BloomEngineArena *arena = (BloomEngineArena *)raw_arena;
     BloomEngineArena *staging = (BloomEngineArena *)raw_staging;
+    BloomMeshArena *mesh = (BloomMeshArena *)raw_mesh;
     memset(arena, 0, sizeof(*arena));
     memset(staging, 0, sizeof(*staging));
+    memset(mesh, 0, sizeof(*mesh));
 
-    if (!cli_load_bloom_file(args.bloom_path, arena)) {
-        fprintf(stderr, "[BLOOM CLI] Failed to load or verify 16,384-byte Merkle container: %s\n",
+    bool is_mesh_asset = false;
+    if (!cli_load_input_asset(args.bloom_path, arena, mesh, &is_mesh_asset)) {
+        fprintf(stderr, "[BLOOM CLI] Failed to load/verify .bloom, .stl, or .glb asset: %s\n",
                 args.bloom_path);
+        free(mesh);
         free(staging);
         free(arena);
         return 1;
+    }
+
+    if (args.set_section || args.set_slab || args.set_corner) {
+        BloomSectionSpec64 *sec = &arena->map.section_spec;
+        uint32_t smode = args.set_corner ? BLOOM_SEC_MODE_CORNER
+                       : (args.set_slab ? BLOOM_SEC_MODE_SLAB : BLOOM_SEC_MODE_PLANE);
+        uint32_t iflags = sec->inspect_flags |
+                          BLOOM_INSPECT_ISOLINES | BLOOM_INSPECT_WALL_DFM |
+                          BLOOM_INSPECT_INTERFERENCE | BLOOM_INSPECT_TRIPLANAR;
+        bloom_section_init64(sec, smode, args.sec_norm_q16, args.sec_dist_q16,
+                             args.slab_half_q16, sec->min_wall_q16 > 0 ? sec->min_wall_q16 : 11796,
+                             sec->iso_pitch_q16 > 0 ? sec->iso_pitch_q16 : 9830, iflags);
+        arena->map.frame_hdr.xray_plane_q16 = args.sec_dist_q16;
+    }
+
+    if (args.enable_rc) {
+        arena->map.frame_hdr.flags |= BLOOM_FLAG_RADIANCE_CASCADES;
+        arena->map.frame_hdr.flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    if (args.enable_field) {
+        arena->map.frame_hdr.flags |= BLOOM_FLAG_DIFF_FIELD;
+        arena->map.frame_hdr.flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    if (args.enable_cine) {
+        arena->map.frame_hdr.flags |= BLOOM_FLAG_CINE_OPTICS;
+        arena->map.camera.aperture_fstop_q16 = 117964; /* f/1.8 */
+        arena->map.camera.focal_mm_q16 = 45 * BLOOM_Q16_ONE;
+        arena->map.frame_hdr.flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    if (args.has_metric) {
+        BloomMetricScale64 mscale;
+        bloom_metric_eval_scale64(args.metric_beta_q16, args.metric_phi_q16, 0, NULL, NULL, &mscale);
+        bloom_reg_bank_set_q16(&arena->map.reg_bank, BLOOM_REG_METRIC_PHI, mscale.metric_potential_q16);
+        bloom_reg_bank_set_q16(&arena->map.reg_bank, BLOOM_REG_LORENTZ_BETA, mscale.lorentz_beta_q16);
+        bloom_reg_bank_set_q16(&arena->map.reg_bank, BLOOM_REG_FLUX_PRESSURE, mscale.flux_pressure_q16);
+        arena->map.frame_hdr.flags |= BLOOM_FLAG_METRIC_FIELD;
+        arena->map.frame_hdr.flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    BloomGameplayState64 cli_gp;
+    bloom_gameplay_init64(&cli_gp, 1U, 16384, 32768, 65536);
+    if (args.enable_shells) {
+        arena->map.frame_hdr.flags |= BLOOM_FLAG_GAMEPLAY_SHELLS;
+        bloom_reg_bank_set_q16(&arena->map.reg_bank, BLOOM_REG_GRAZE_SHELL, cli_gp.delta_graze_q16);
+        arena->map.frame_hdr.flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    if (args.import_mood_path) {
+        if (!cli_import_mood_ppm(args.import_mood_path, arena)) {
+            fprintf(stderr, "[BLOOM CLI] Failed to import moodboard PPM: %s\n", args.import_mood_path);
+            free(mesh);
+            free(staging);
+            free(arena);
+            return 1;
+        }
+    }
+    if (args.has_impact) {
+        arena->map.frame_hdr.flags |= BLOOM_FLAG_SUBFRAME_LOCK;
+        arena->map.frame_hdr.flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+        const int32_t pa[3] = { -144179 /* -2.20 */, 16384 /* +0.25 */, -104857 /* -1.60 */ };
+        const int32_t pb[3] = {   13107 /* +0.20 */, 16384 /* +0.25 */, -104857 /* -1.60 */ };
+        uint32_t ia = bloom_prefab_spawn_inst(arena, BLOOM_PREFAB_CRYSTAL_SPHERE, pa, BLOOM_Q16_ONE);
+        uint32_t ib = bloom_prefab_spawn_inst(arena, BLOOM_PREFAB_CRYSTAL_SPHERE, pb, BLOOM_Q16_ONE);
+        if (ia > 0U && ib > 0U) {
+            int32_t v_in[3] = { args.impact_vx_q16, 0, 0 };
+            arena->map.instances[ia - 1U].flags |= BLOOM_INST_FLAG_COLLIDABLE;
+            arena->map.instances[ib - 1U].flags |= BLOOM_INST_FLAG_COLLIDABLE;
+            bloom_prefab_override_inst(&arena->map.instances[ib - 1U], 4U, BLOOM_MATTER_TITANIUM, 0);
+            bloom_inst_set_vel_q16(&arena->map.instances[ia - 1U], v_in);
+        }
     }
 
     if (args.override_w > 0U) {
@@ -540,38 +1054,158 @@ int main(int argc, char **argv) {
         arena->map.window.fb_h_px = args.override_h;
     }
 
+    if (args.inspect_cae && !args.has_impact) {
+        bloom_physics_step_arena64(arena, BLOOM_Q16_ONE);
+        const BloomSectionSpec64 *sec = &arena->map.section_spec;
+        const BloomPhysicsSummary64 *ps = &arena->map.phys_summary;
+        printf("[BLOOM v%s CAE] inst=%u mesh_tris=%u mesh_bvh=%u sec_mode=%u inter_pairs=%u warn_pairs=%u ccd_hits=%u min_clr_q16=%d max_pen_q16=%d toi_q16=%d peak_K=%u pair=(%u,%u)\n",
+               BLOOM_VERSION_STRING,
+               arena->map.frame_hdr.inst_count,
+               (unsigned)sec->mesh_tri_count,
+               (unsigned)sec->mesh_bvh_count,
+               sec->section_mode,
+               (unsigned)ps->interference_pairs,
+               (unsigned)ps->clearance_warn_pairs,
+               (unsigned)ps->ccd_hit_count,
+               ps->min_clearance_q16,
+               ps->max_penetration_q16,
+               ps->earliest_toi_q16,
+               ps->peak_kelvin,
+               (unsigned)ps->pair_inst_a,
+               (unsigned)ps->pair_inst_b);
+    }
+
     BloomGpuCtx *gpu = bloom_gpu_init(arena, args.shader_path);
     if (!gpu) {
         fprintf(stderr, "[BLOOM CLI] Failed to initialize SDL3 GPU context (shader=%s)\n",
                 args.shader_path);
+        free(mesh);
+        free(staging);
+        free(arena);
+        return 1;
+    }
+    if (is_mesh_asset && !bloom_gpu_upload_mesh(gpu, mesh)) {
+        fprintf(stderr, "[BLOOM CLI] Failed to upload CAD mesh buffer to GPU\n");
+        bloom_gpu_destroy(gpu);
+        free(mesh);
         free(staging);
         free(arena);
         return 1;
     }
 
     int exit_code = 0;
-    if (args.headless) {
-        for (uint32_t s = 0U; s < args.steps; ++s) {
-            (void)bloom_arena_step_dynamics(arena, 0x0001U);
-        }
-        if (!bloom_gpu_render(gpu, true)) {
-            fprintf(stderr, "[BLOOM CLI] Headless GPU compute dispatch failed\n");
-            exit_code = 1;
-        } else {
-            uint64_t fnv = 0ULL;
-            uint32_t nonblack = 0U;
-            if (!bloom_gpu_write_ppm(gpu, args.out_ppm_path, &fnv, &nonblack)) {
-                fprintf(stderr, "[BLOOM CLI] Failed to export GPU framebuffer to %s\n",
-                        args.out_ppm_path ? args.out_ppm_path : "<memory>");
+    if (args.headless || args.inspect_cae) {
+        if (args.headless) {
+            uint32_t wav_steps = (args.steps > 0U) ? args.steps : 1U;
+            if (args.rewind_steps > 0U && wav_steps <= args.rewind_steps) {
+                wav_steps = args.rewind_steps + 2U;
+            }
+            uint32_t wav_frames = wav_steps * 800U;
+            int16_t *wav_buf = NULL;
+            BloomAudioRig audio_rig;
+            bloom_audio_init_rig(&audio_rig, BLOOM_AUDIO_SAMPLE_RATE);
+            BloomRewindCtrl64 rw_ctrl;
+            BloomSpacetimeSnap *rw_ring = NULL;
+            bloom_rewind_init64(&rw_ctrl, BLOOM_REWIND_RING_CAP);
+            if (args.rewind_steps > 0U) {
+                rw_ring = (BloomSpacetimeSnap *)calloc(BLOOM_REWIND_RING_CAP, sizeof(BloomSpacetimeSnap));
+            }
+            if (args.out_wav_path) {
+                wav_buf = (int16_t *)calloc((size_t)wav_frames * 2U, sizeof(int16_t));
+            }
+            uint32_t first_hit_s = 0xFFFFFFFFU;
+            int32_t max_pcm = 0;
+            for (uint32_t s = 0U; s < wav_steps; ++s) {
+                if (rw_ring) {
+                    bloom_rewind_push(&rw_ctrl, rw_ring, arena, &audio_rig);
+                }
+                (void)bloom_arena_step_dynamics(arena, 0x0001U);
+                if (args.enable_shells) {
+                    (void)bloom_gameplay_step64(&cli_gp, arena, &audio_rig, NULL, false);
+                } else if (args.has_impact) {
+                    bloom_physics_step_arena64(arena, 6554);
+                }
+                if (args.enable_cine) {
+                    bloom_camera_step_cine64(&arena->map.camera, &arena->map.reg_bank, NULL, 8192, 0);
+                }
+                int16_t scratch_pcm[1600];
+                int16_t *dst_pcm = wav_buf ? (wav_buf + (size_t)s * 1600U) : scratch_pcm;
+                uint32_t hs = bloom_audio_step_frame64(&audio_rig, arena, dst_pcm, 800U);
+                if (first_hit_s == 0xFFFFFFFFU && hs < 800U) {
+                    first_hit_s = s * 800U + hs;
+                }
+                if (audio_rig.hdr.peak_abs_pcm > max_pcm) {
+                    max_pcm = audio_rig.hdr.peak_abs_pcm;
+                }
+            }
+            if (rw_ring && args.rewind_steps > 0U) {
+                if (!bloom_rewind_restore(&rw_ctrl, rw_ring, args.rewind_steps, arena, &audio_rig)) {
+                    fprintf(stderr, "[BLOOM CLI] Rewind %u frames failed\n", args.rewind_steps);
+                    exit_code = 1;
+                } else {
+                    fprintf(stderr, "[BLOOM REWIND] Restored -%u frames (branch_epoch=%u, ring_count=%u)\n",
+                            args.rewind_steps, rw_ctrl.branch_epoch, rw_ctrl.count);
+                }
+            }
+            free(rw_ring);
+
+            if (args.out_wav_path) {
+                if (!wav_buf || !bloom_write_wav_i16(args.out_wav_path, wav_buf, wav_frames, BLOOM_AUDIO_SAMPLE_RATE)) {
+                    fprintf(stderr, "[BLOOM CLI] Failed to write WAV audio to %s\n", args.out_wav_path);
+                    exit_code = 1;
+                } else {
+                    fprintf(stderr, "[BLOOM AUDIO] Wrote %s (frames=%u, rate=%uHz, hit_sample=%u, peak_pcm=%d)\n",
+                            args.out_wav_path, wav_frames, BLOOM_AUDIO_SAMPLE_RATE,
+                            (first_hit_s == 0xFFFFFFFFU) ? 0U : first_hit_s, max_pcm);
+                }
+            }
+            free(wav_buf);
+
+            if (args.out_edl_path) {
+                uint32_t reel_f = (wav_steps >= 24U) ? wav_steps : 96U;
+                if (!bloom_write_cmx3600_edl(args.out_edl_path, "BLOOM_V9_STUDIO", reel_f, 24U)) {
+                    fprintf(stderr, "[BLOOM CLI] Failed to write CMX 3600 EDL to %s\n", args.out_edl_path);
+                    exit_code = 1;
+                } else {
+                    fprintf(stderr, "[BLOOM EDL] Wrote %s (frames=%u @ 24fps)\n", args.out_edl_path, reel_f);
+                }
+            }
+            if (args.export_html_path) {
+                if (!bloom_export_webgpu_html(args.export_html_path, arena, args.shader_path)) {
+                    fprintf(stderr, "[BLOOM CLI] Failed to export WebGPU HTML to %s\n", args.export_html_path);
+                    exit_code = 1;
+                } else {
+                    fprintf(stderr, "[BLOOM HTML] Exported standalone WebGPU bundle -> %s\n", args.export_html_path);
+                }
+            }
+
+            if (!bloom_gpu_render(gpu, true)) {
+                fprintf(stderr, "[BLOOM CLI] Headless GPU compute dispatch failed\n");
                 exit_code = 1;
             } else {
-                printf("[BLOOM] Rendered %ux%u -> %s (FNV1a=0x%016" PRIx64 ", nonblack=%u, GPU=%s)\n",
-                       arena->map.frame_hdr.width_px,
-                       arena->map.frame_hdr.height_px,
-                       args.out_ppm_path ? args.out_ppm_path : "<memory>",
-                       fnv,
-                       nonblack,
-                       bloom_gpu_device_name(gpu));
+                if (args.emit_kitty) {
+                    if (!bloom_gpu_write_kitty_tty(gpu, stdout, 160U)) {
+                        fprintf(stderr, "[BLOOM CLI] Failed to emit Kitty Graphics stream\n");
+                        exit_code = 1;
+                    }
+                }
+                if (args.out_ppm_path || (!args.out_wav_path && !args.export_html_path && !args.out_edl_path && !args.emit_kitty)) {
+                    uint64_t fnv = 0ULL;
+                    uint32_t nonblack = 0U;
+                    if (!bloom_gpu_write_ppm(gpu, args.out_ppm_path, &fnv, &nonblack)) {
+                        fprintf(stderr, "[BLOOM CLI] Failed to export GPU framebuffer to %s\n",
+                                args.out_ppm_path ? args.out_ppm_path : "<memory>");
+                        exit_code = 1;
+                    } else {
+                        printf("[BLOOM] Rendered %ux%u -> %s (FNV1a=0x%016" PRIx64 ", nonblack=%u, GPU=%s)\n",
+                               arena->map.frame_hdr.width_px,
+                               arena->map.frame_hdr.height_px,
+                               args.out_ppm_path ? args.out_ppm_path : "<memory>",
+                               fnv,
+                               nonblack,
+                               bloom_gpu_device_name(gpu));
+                    }
+                }
             }
         }
     } else {
@@ -579,22 +1213,30 @@ int main(int argc, char **argv) {
         memset(&rt, 0, sizeof(rt));
         rt.arena = arena;
         rt.staging = staging;
+        rt.mesh = mesh;
         rt.gpu = gpu;
+        bloom_audio_init_rig(&rt.audio, BLOOM_AUDIO_SAMPLE_RATE);
+        bloom_gameplay_init64(&rt.gameplay, 1U, 16384, 32768, 65536);
+        bloom_rewind_init64(&rt.rewind_ctrl, BLOOM_REWIND_RING_CAP);
+        rt.rewind_ring = (BloomSpacetimeSnap *)calloc(BLOOM_REWIND_RING_CAP, sizeof(BloomSpacetimeSnap));
         rt.bloom_path = args.bloom_path;
         rt.watch_svg_path = args.watch_svg_path;
         rt.matter_cursor = 1U;
         rt.mode_word = 0x0001U;
+        rt.mesh_mode = is_mesh_asset;
         (void)cli_stat_mtime(args.bloom_path, &rt.last_bloom_mtime);
         if (args.watch_svg_path) {
             (void)cli_stat_mtime(args.watch_svg_path, &rt.last_svg_mtime);
         }
         int wrc = bloom_gpu_run_window(gpu, arena, cli_studio_step_cb, &rt);
+        free(rt.rewind_ring);
         if (wrc != 0) {
             exit_code = 1;
         }
     }
 
     bloom_gpu_destroy(gpu);
+    free(mesh);
     free(staging);
     free(arena);
     return exit_code;
