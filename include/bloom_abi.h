@@ -50,7 +50,7 @@ extern "C" {
 
 #define BLOOM_FLOW_CHART_MASK 15ULL
 
-/* Dedicated FLOW v7.1.0 State Channel Assignments within [0..31] */
+/* Dedicated FLOW v8.0.0 State Channel Assignments within [0..31] */
 #define BLOOM_FLOW_CH_CAM_YAW     0U
 #define BLOOM_FLOW_CH_CAM_PITCH   1U
 #define BLOOM_FLOW_CH_CAM_DIST    2U

@@ -1,12 +1,12 @@
 # BLOOM v9.0.0 — Zero-Noise Radiance Cascades, 2-Jet Differential Field, Modal DSP, Concentric Shells, Time-Rewind & Geodesic Cinema Engine
 
-**AOT Lean 4 Formal Compiler & React-Native Flexbox DSL (`40` Theorems, `0 sorryAx`, `0 lean -c`, `0` External Test Files) → Sealed `16KB` `.bloom` Container (`BLM7` / `BLOMIMG7`) + Auxiliary `32KB` `BloomMeshArena` → Standalone Zero-Lean-Runtime Pure C17 Native Studio & CLI (`build/bloom`) + Pure-GPR / Zero-Float / Zero-Heap / Zero-`blr` C17 Core (`libbloom.a`) + 3-Pass Zero-Noise 3D Radiance Cascades GI (`524KB` `rc_buf`) + Zero-Texture 2-Jet Differential Geometry Field (`BloomFieldJet64`) + Zero-WAV 48 kHz Modal Physical-Modeling DSP (`BloomAudioRig`, `576B`) + Sub-Frame (`20.8 μs`) Swept-CCD & Huygens Shockwave + Concentric SDF Gameplay Shells / `-18dB` Hitstop Contrast (`BloomGameplayState64`) + $O(1)$ `16KB` Arena & `576B` AudioRig Circular Spacetime Rewind (`BloomSpacetimeSnap`, `16,960B`) + Relativistic Geodesic Lensing & Lorentz Doppler (`BloomMetricScale64`) + Anamorphic `2.39:1` `CineCamera` & CMX 3600 `.edl` Export + Pure-GPR Moodboard-to-SSOT Compiler (`BloomMoodboard64`) + Standalone WebGPU `.html` & Kitty TTY Egress + Symbiotic `SEARU × FLOW 2-Jet` + C++20 `64B` ABI Gate (`35` Cells) + Single-Source `WGSL` Compute Shader (`naga` → `SPIR-V` + `MSL 2.4`) & `176 / 176` (`100.0%`) Mach-O Binary Sabotage Audit atop [`FLOW v7.1.0`](https://github.com/hianova/FLOW).**
+**AOT Lean 4 Formal Compiler & React-Native Flexbox DSL (`40` Theorems, `0 sorryAx`, `0 lean -c`, `0` External Test Files) → Sealed `16KB` `.bloom` Container (`BLM7` / `BLOMIMG7`) + Auxiliary `32KB` `BloomMeshArena` → Standalone Zero-Lean-Runtime Pure C17 Native Studio & CLI (`build/bloom`) + Pure-GPR / Zero-Float / Zero-Heap / Zero-`blr` C17 Core (`libbloom.a`) + 3-Pass Zero-Noise 3D Radiance Cascades GI (`524KB` `rc_buf`) + Zero-Texture 2-Jet Differential Geometry Field (`BloomFieldJet64`) + Zero-WAV 48 kHz Modal Physical-Modeling DSP (`BloomAudioRig`, `576B`) + Sub-Frame (`20.8 μs`) Swept-CCD & Huygens Shockwave + Concentric SDF Gameplay Shells / `-18dB` Hitstop Contrast (`BloomGameplayState64`) + $O(1)$ `16KB` Arena & `576B` AudioRig Circular Spacetime Rewind (`BloomSpacetimeSnap`, `16,960B`) + Relativistic Geodesic Lensing & Lorentz Doppler (`BloomMetricScale64`) + Anamorphic `2.39:1` `CineCamera` & CMX 3600 `.edl` Export + Pure-GPR Moodboard-to-SSOT Compiler (`BloomMoodboard64`) + Standalone WebGPU `.html` & Kitty TTY Egress + Symbiotic `SEARU × FLOW 2-Jet` + C++20 `64B` ABI Gate (`35` Cells) + Single-Source `WGSL` Compute Shader (`naga` → `SPIR-V` + `MSL 2.4`) & `176 / 176` (`100.0%`) Mach-O Binary Sabotage Audit atop [`FLOW v8.0.0`](https://github.com/hianova/FLOW).**
 
 ---
 
 ## 1. Architectural Positioning: Post-Texture Sensory Engine, Time-Rewind Gameplay & AOT `.bloom` Decoupling
 
-Just as [`FLOW v7.1.0`](https://github.com/hianova/FLOW) uses `Flow.lean` strictly as an AOT `.flow` formal compiler and `build/flow` as a pure C runtime with self-synthesized [`flow_opt_params.h`](https://github.com/hianova/FLOW/blob/v7.1.0/flow_opt_params.h) constants, `BLOOM v9.0.0` pairs formal AOT verification with a full zero-texture differential-geometry & geodesic-lens renderer, zero-noise 3D Radiance Cascades GI, pure-GPR Doppler modal acoustic synthesis, concentric gameplay shells with $O(1)$ spacetime time-rewind, and a pure-GPR moodboard-to-SSOT compiler — verified end-to-end by `make verify` with **zero authored `.metal` / `.m` / `.mm` / `.swift` files**, **zero `lean -c` codegen**, **zero Lean runtime (`0 leanshared`) in `build/bloom`**, **zero external texture atlases**, **zero prerecorded `.wav` assets**, **zero fake software fallbacks**, and **zero external `.c` / `.lean` test files**:
+Just as [`FLOW v8.0.0`](https://github.com/hianova/FLOW) uses `Flow.lean` strictly as an AOT `.flow` formal compiler and `build/flow` as a pure C runtime with self-synthesized [`core/flow_opt_params.h`](https://github.com/hianova/FLOW/blob/main/core/flow_opt_params.h) constants, `BLOOM v9.0.0` pairs formal AOT verification with a full zero-texture differential-geometry & geodesic-lens renderer, zero-noise 3D Radiance Cascades GI, pure-GPR Doppler modal acoustic synthesis, concentric gameplay shells with $O(1)$ spacetime time-rewind, and a pure-GPR moodboard-to-SSOT compiler — verified end-to-end by `make verify` with **zero authored `.metal` / `.m` / `.mm` / `.swift` files**, **zero `lean -c` codegen**, **zero Lean runtime (`0 leanshared`) in `build/bloom`**, **zero external texture atlases**, **zero prerecorded `.wav` assets**, **zero fake software fallbacks**, and **zero external `.c` / `.lean` test files**:
 
 ```text
   ┌────────────────────────────────────────────────────────────────────────────┐
@@ -42,7 +42,7 @@ Just as [`FLOW v7.1.0`](https://github.com/hianova/FLOW) uses `Flow.lean` strict
   │        `SEARU_SOLVE_INLINE` glass-contrast solver, Pointer/IME, DFA LaTeX  │
   │      • Pillar 3 (`bloom_prefab.c`): Prefab SSOT, O(1) Revert, Swept-CCD    │
   │        Rebound, Concentric Shells + 6-Frame Buffer + Fulcrum + -18dB Hit,  │
-  │        16KB+576B Circular Rewind, Doppler Modal DSP, `FLOW v7.1.0` 2-Jet    │
+  │        16KB+576B Circular Rewind, Doppler Modal DSP, `FLOW v8.0.0` 2-Jet    │
   │    - Binary Sabotage (`tools/sabotage_check.py`): 176 / 176 (100.0%) killed│
   └─────────────────────────────────────┬──────────────────────────────────────┘
                                         │ `SDL3 GPU`: `@group(0) b(0)` 16KB Arena
@@ -63,7 +63,7 @@ Just as [`FLOW v7.1.0`](https://github.com/hianova/FLOW) uses `Flow.lean` strict
 ```
 
 ### Physical Memory, Sensory Breakthroughs & v9.0.0 Recovered Engines
-- **Zero-Parse `16,384B` `.bloom` Arena + `32,768B` `BloomMeshArena` + `524,288B` `rc_buf`**: [`Bloom.lean`](Bloom.lean) compiles the nested React-Native Flexbox UI tree, analytic SDF LaTeX cards, 3D Prefab instances, section/physics descriptors (`Slots 254..255`), and 16 `FLOW v7.1.0` Manifold Charts into a single `16,384-byte` (`256 × 64B`) `BloomEngineArena`, seals `Slot 249` (`BloomImageHeader64`, `"BLOMIMG7"`) with a 64-bit FNV-1a Merkle root over all non-superblock slots (`Slots != 249`), and writes `build/studio.bloom`.
+- **Zero-Parse `16,384B` `.bloom` Arena + `32,768B` `BloomMeshArena` + `524,288B` `rc_buf`**: [`Bloom.lean`](Bloom.lean) compiles the nested React-Native Flexbox UI tree, analytic SDF LaTeX cards, 3D Prefab instances, section/physics descriptors (`Slots 254..255`), and 16 `FLOW v8.0.0` Manifold Charts into a single `16,384-byte` (`256 × 64B`) `BloomEngineArena`, seals `Slot 249` (`BloomImageHeader64`, `"BLOMIMG7"`) with a 64-bit FNV-1a Merkle root over all non-superblock slots (`Slots != 249`), and writes `build/studio.bloom`.
 - **3-Pass Zero-Noise 3D Radiance Cascades GI**: [`shaders/bloom_core.wgsl`](shaders/bloom_core.wgsl) dispatches a hierarchical 3D octahedral probe cascade into `@group(1) @binding(1) rc_buf` (`32,768 × vec4<f32>` = `524,288B` / Metal `[[buffer(2)]]`) across `bloom_rc_cascade2` (`8×4×8 × 16`), `bloom_rc_cascade1` (`16×8×16 × 8`), and `bloom_rc_cascade0` (`16×8×16 × 6`), integrating indirect bounce and specular GI with zero Monte-Carlo temporal noise.
 - **Zero-Texture 2-Jet Differential Geometry & Continuous Field**: [`bloom_scene_eval_jet2_q16`](src/bloom_scene.c) (`BloomFieldJet64`) and [`eval_diff_jet2`](shaders/bloom_core.wgsl) extract Mean Curvature $H$, Gaussian Curvature $K$, anisotropy, and tangent principal direction $\mathbf{e}_1$ directly from the analytical SDF for burnished ridges, crevice patina, and flow-aligned micro-grooves.
 - **Zero-WAV Pure-GPR Modal DSP (`576B` `BloomAudioRig`) + Sub-Frame Swept-CCD (`20.8 μs`)**: [`bloom_audio_step_frame64`](src/bloom_prefab.c) locks modal excitation to `(earliest_toi_q16 * 800) >> 16` (**`0` pre-TOI sample leakage**) alongside [`bloom_physics_step_arena64`](src/bloom_prefab.c) piecewise `(toi, 1 - toi)` rebound and Huygens contact wavefronts.
@@ -97,8 +97,8 @@ Every ABI cell is strictly **`64 bytes` (`16 × u32` / `8 × u64`)** aligned to 
 | Arena `152..167` | `BloomUiNode64[16]` | Compiled React-Native Flexbox / `.svg` Liquid Glass buttons, sliders, `TextInput`, `LatexCard` & gauges |
 | Arena `168..183` | `BloomGlyph64[16]` | Vector `<path>` / `<line>` SDF icon glyphs (`Q8` normalized segment coordinates) |
 | Arena `184..199` | `BloomLatexBox64[16]` | Single-pass DFA compiled zero-font-atlas analytic SDF LaTeX formula boxes |
-| Arena `200..231` | `uint64_t flow_states[32][8]` | `FLOW v7.1.0` 2-Jet channels: Camera (`0..3`), UI Springs (`4..19`), X-Ray (`20`), Scroll (`21`), Prefabs (`22..31`) |
-| Arena `232..247` | `uint64_t flow_charts[16][8]` | `FLOW v7.1.0` Manifold Atlas (`UI_SPRING`, `UI_SCRUB`, `CAMERA_RIG`, `XRAY_SWEEP`, `800K/760K` `KanLock`) |
+| Arena `200..231` | `uint64_t flow_states[32][8]` | `FLOW v8.0.0` 2-Jet channels: Camera (`0..3`), UI Springs (`4..19`), X-Ray (`20`), Scroll (`21`), Prefabs (`22..31`) |
+| Arena `232..247` | `uint64_t flow_charts[16][8]` | `FLOW v8.0.0` Manifold Atlas (`UI_SPRING`, `UI_SCRUB`, `CAMERA_RIG`, `XRAY_SWEEP`, `800K/760K` `KanLock`) |
 | Arena `248` | `BloomRaycastHit64` | Deterministic CPU `Q16.16` 3D SDF/BVH/Mesh raycast pick hit position, normal & instance ID |
 | Arena `249` | `BloomImageHeader64` | `.bloom` (`"BLOMIMG7"`) zero-parse `mmap` superblock with 64-bit FNV-1a Merkle seal (`Slots != 249`) |
 | Arena `250..253` | `char ui_labels[16][16]` | Inline 16-byte `'\0'`-padded ASCII widget labels for `BloomUiNode64[0..15]` (vector SDF rendered) |
@@ -121,13 +121,13 @@ BLOOM/
 │   ├── bloom_abi.h            # 35 × 64B cache-line structs + 16KB Arena + 32KB Mesh + 576B AudioRig + 16,960B RewindSnap ABI
 │   ├── bloom_scene.h          # Pillar 1: CSG, .stl/.glb BVH, Section, DQ, Brick, 2-Jet, Metric, CineCamera, Moodboard
 │   ├── bloom_ui.h             # Pillar 2 (React Native): .svg, Flexbox, SEARU_SOLVE_INLINE UI, IME, LaTeX
-│   ├── bloom_prefab.h         # Pillar 3: Prefab SSOT, Swept-CCD, Gameplay Shells, 16KB Rewind, Modal DSP, FLOW v7.1.0
+│   ├── bloom_prefab.h         # Pillar 3: Prefab SSOT, Swept-CCD, Gameplay Shells, 16KB Rewind, Modal DSP, FLOW v8.0.0
 │   ├── bloom_host.h           # Single-track C17 SDL3 GPU (4-pipeline), WAV, CMX 3600 EDL, WebGPU HTML & Kitty TTY ABI
 │   └── bloom.h                # Umbrella SDK header (BLOOM v9.0.0)
 ├── src/
 │   ├── bloom_scene.c          # Pure C17 (-mgeneral-regs-only, -fsanitize-trap=all, 0 float, 0 heap, 0 blr)
 │   ├── bloom_ui.c             # Pure C17 streamed SVG DFA, Flexbox/Bento, SEARU_SOLVE_INLINE, IME & LaTeX
-│   ├── bloom_prefab.c         # Pure C17 Prefab SSOT, Swept-CCD, Gameplay Shells, Rewind, Modal DSP & FLOW v7.1.0
+│   ├── bloom_prefab.c         # Pure C17 Prefab SSOT, Swept-CCD, Gameplay Shells, Rewind, Modal DSP & FLOW v8.0.0
 │   ├── bloom_lean_jsi.c       # Lean 4 AOT JSI compiler bridge + 10 SEARU suites & GPU Dispatches 0..5 verifiers
 │   ├── bloom_gpu_host.c       # Pure C17 SDL3 GPU (RC C2/C1/C0 + Primary), WAV, EDL, WebGPU HTML & Kitty TTY egress
 │   └── bloom_cli.c            # Standalone zero-Lean-runtime C17 Studio & CLI (--cine/--metric/--shells/--rewind/--import-mood/--export-html/--edl-out/--kitty)
@@ -138,7 +138,7 @@ BLOOM/
 ├── tools/
 │   └── sabotage_check.py      # Zero-SDL3 Mach-O ARM64 binary sabotage & ISA purity audit (176/176 = 100.0%)
 ├── .github/workflows/
-│   └── ci.yml                 # Linux (Vulkan Lavapipe) + macOS (Metal) CI matrix pinned to FLOW v7.1.0
+│   └── ci.yml                 # Linux (Vulkan Lavapipe) + macOS (Metal) CI matrix pinned to FLOW v8.0.0
 ├── Bloom.lean                 # Pure FLOW-converged ArenaSchema (C17+WGSL) + React-Native Flexbox DSL + AOT studio.bloom export
 ├── Makefile                   # Single-track C++20 + C17 + Naga + Lean 4 AOT + Zero-Lean CLI + Sabotage
 ├── LICENSE                    # MIT License
@@ -150,7 +150,7 @@ BLOOM/
 ## 4. Implementation Details & Verified Metrics
 
 ### 4.1 Declarative React-Native Flexbox DSL & `FLOW v8.0.0` SSOT Convergence ([`Bloom.lean`](Bloom.lean))
-- **Zero-Local-Theorem SSOT Convergence ([`../FLOW/Flow/`](../FLOW/Flow/))**: All universal machine-word (`bv_decide` SAT), interval/BVH, discrete 2-Jet curvature, radiance cascade, modal damping, hysteresis, and spacetime rewind theorems now reside in domain-free `FLOW v8.0.0` modules (`0` local theorems in `Bloom.lean`).
+- **Zero-Local-Theorem SSOT Convergence ([`../FLOW/core/lean/Flow/`](../FLOW/core/lean/Flow/) & [`../FLOW/sdk/lean/Flow/`](../FLOW/sdk/lean/Flow/))**: All universal machine-word (`bv_decide` SAT), interval/BVH, discrete 2-Jet curvature, radiance cascade, modal damping, hysteresis, and spacetime rewind theorems now reside in domain-free `FLOW v8.0.0` modules (`0` local theorems in `Bloom.lean`).
 - **Full-512b C17 + WGSL `ArenaSpec` Co-Generation (`bloomArenaSchema`)**: Declares all `26` disjoint Arena slot regions (`0..255`) and `512`-bit `CellLayout64` specs (`frame_header`, `ui_node`, `section_spec`), verified at compile time by `by decide` to emit `build/bloom_schema_abi.h` (C17/C++20 static-assert checked against [`include/bloom_abi.h`](include/bloom_abi.h)) and zero-`u64`/`i64` `build/bloom_schema.wgsl` (`naga`-checked).
 - **Nested `<View>` Flexbox Tree (`UiElement` + `compileUiTree`)**: UI layouts are authored declaratively using arbitrary nested `.view (dir : FlexDir) (justify : Justify) (align : Align) (style : UiBoxStyle) (children : List UiElement)` containers alongside `.button`, `.slider`, `.textInput`, `.latexCard`, `.ringGauge`, and `.readout7Seg`. Pure layout `.view` wrappers (`drawBg == false`) consume **`0` `BloomUiNode64` slots**, while `.latexCard` measures and auto-scales formulas inside padded card bounds (`verifyLatexInCards` enforces zero horizontal/vertical overflow). `mountBlueprint` sets `"BLOOM 9.0"` and activates `FrameFlag.radianceCascades`, `FrameFlag.diffField`, `FrameFlag.subframeLock`, and `FrameFlag.cineOptics`.
 - **Elaboration-Time Hardware & AOT Export Gate (`compileTimeBoundaryGate`)**: Runs `10` pure-GPR verification suites (`verifySearuCore` #1..#10), `6` CPU/GPU parity dispatches (`verifyGpuAlignment` Dispatches `0..5` covering 8-Prefab, X-Ray, UI, Diagonal 3D Section + `A ∩ B` + DQ Joint + SDF Brick + STL Mesh BVH, 3-Pass Radiance Cascades Thermal GI + CSG Blocker Occlusion, and Geodesic Metric + `2.39:1` `CineCamera` Optics + Gameplay Shells), 256-trial dual-engine SplitMix64 determinism, `0-FPS` `IDLE_SLEEP` verification, and exports `build/studio.bloom` (`16,384` bytes).
@@ -180,7 +180,7 @@ BLOOM/
 ## 5. Toolchain Prerequisites & Build Flow
 
 ### Prerequisites
-- **Sibling Upstream**: [`FLOW`](https://github.com/hianova/FLOW) (`../FLOW` at `v7.1.0`, override via `FLOW_DIR=/path/to/FLOW`).
+- **Sibling Upstream**: [`FLOW`](https://github.com/hianova/FLOW) (`../FLOW` at `v8.0.0`, override via `FLOW_DIR=/path/to/FLOW`).
 - **macOS (Apple Silicon / Metal)**:
   ```sh
   brew install llvm naga-cli sdl3 pkg-config

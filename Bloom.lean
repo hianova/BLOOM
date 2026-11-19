@@ -2,7 +2,7 @@
   BLOOM v9.0.0 — Pure Config, Flexbox DSL & AOT Arena Image Compiler (`import Flow`)
   ================================================================================
   SSOT compliance: all formal machine-word, interval, convexity, SEARU, 2-Jet,
-  and full-512b C17+WGSL Schema compilers reside in domain-free `../FLOW/Flow/*.lean`.
+  and full-512b C17+WGSL Schema compilers reside in domain-free `../FLOW/{core,sdk}/lean/Flow/*.lean`.
   This file configures the 256-slot `16,384B` `bloomArenaSchema`, declares the
   React-Native `<View>` Flexbox `defaultStudioBlueprint`, executes elaboration-time
   SDL3 GPU/CPU parity gates (`compileTimeBoundaryGate`), and seals `build/studio.bloom`

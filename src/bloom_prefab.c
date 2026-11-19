@@ -10,7 +10,7 @@
  * ============================================================================
  * Pillar 3 ("Prefab SSOT"): Reusable 64B Blueprints, Live Non-Destructive
  * Overrides, Revert-to-SSOT, X-Ray Cutaway, Wave64 LOD, TRC Guard, Swept-CCD
- * & Coupled Thermal Physics + FLOW v7.1.0
+ * & Coupled Thermal Physics + FLOW v8.0.0
  * ============================================================================
  */
 

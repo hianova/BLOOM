@@ -103,7 +103,7 @@ uint32_t bloom_prefab_cull_wave64(const BloomPrefabInst64 *instances,
                                   BloomPrefabInst64 *out_compacted,
                                   uint64_t *out_active_mask);
 
-/* 6. FLOW v7.1.0 Arena Init, @swap Safe Chart Switch, SEARU Heal, Swept-CCD & Full Frame Step */
+/* 6. FLOW v8.0.0 Arena Init, @swap Safe Chart Switch, SEARU Heal, Swept-CCD & Full Frame Step */
 typedef struct {
     int64_t  db0_q16;
     int64_t  db1_q16;

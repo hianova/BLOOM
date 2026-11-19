@@ -1394,7 +1394,7 @@ LEAN_EXPORT lean_obj_res bloom_jsi_verify_searu_core(uint64_t seed) {
         (void)bloom_latex_eval_box_sdf_q16(&lboxes[0], INT32_MIN, INT32_MAX);
     }
 
-    /* 7. FLOW v7.1.0 Symbiotic SEARU x 2-Jet (`searu_heal_and_swap`, `SEARU_SOLVE_INLINE` & Ring-0) */
+    /* 7. FLOW v8.0.0 Symbiotic SEARU x 2-Jet (`searu_heal_and_swap`, `SEARU_SOLVE_INLINE` & Ring-0) */
     {
         BloomEngineArena *heal_arena = NULL;
         SEARU_REQ(posix_memalign((void **)&heal_arena, BLOOM_VM_PAGE_ALIGN, sizeof(BloomEngineArena)) == 0 && heal_arena != NULL,
