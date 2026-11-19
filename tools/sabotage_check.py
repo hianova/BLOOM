@@ -1798,7 +1798,7 @@ def main() -> int:
                 f"-I{root / 'include'}",
                 f"-I{root / 'build'}",
                 "-isystem",
-                str(flow_dir),
+                str(flow_dir / "core"),
                 "-c",
                 str(probe_c),
                 "-o",

@@ -43,10 +43,10 @@ STATIC_STAMP := $(BUILD_DIR)/.static.ok
 NOGPR_FLAG   := $(shell $(CC) -mgeneral-regs-only -x c -c /dev/null -o /dev/null 2>/dev/null && echo -mgeneral-regs-only)
 UBTRAP_FLAGS := $(shell $(CC) -fsanitize=signed-integer-overflow,shift-exponent,bounds,null,return,unreachable -fsanitize-trap=all -x c -c /dev/null -o /dev/null 2>/dev/null && echo "-fsanitize=signed-integer-overflow,shift-exponent,bounds,null,return,unreachable -fsanitize-trap=all")
 
-CORE_CFLAGS := -std=c17 -Wall -Wextra -Wpedantic -Werror $(NOGPR_FLAG) $(UBTRAP_FLAGS) -O2 -fPIC -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)"
-HOST_CFLAGS := -std=c17 -Wall -Wextra -Wpedantic -Werror $(UBTRAP_FLAGS) -O2 -fPIC -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)" $(SDL3_CFLAGS)
-CLI_CFLAGS  := -std=c17 -Wall -Wextra -Wpedantic -Werror $(UBTRAP_FLAGS) -O2 -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)"
-JSI_CFLAGS  := -std=c17 -Wall -Wextra -Werror $(UBTRAP_FLAGS) -O2 -fPIC -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)" -isystem "$(LEAN_SYSROOT)/include"
+CORE_CFLAGS := -std=c17 -Wall -Wextra -Wpedantic -Werror $(NOGPR_FLAG) $(UBTRAP_FLAGS) -O2 -fPIC -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core"
+HOST_CFLAGS := -std=c17 -Wall -Wextra -Wpedantic -Werror $(UBTRAP_FLAGS) -O2 -fPIC -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" $(SDL3_CFLAGS)
+CLI_CFLAGS  := -std=c17 -Wall -Wextra -Wpedantic -Werror $(UBTRAP_FLAGS) -O2 -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core"
+JSI_CFLAGS  := -std=c17 -Wall -Wextra -Werror $(UBTRAP_FLAGS) -O2 -fPIC -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -isystem "$(LEAN_SYSROOT)/include"
 
 ALL_C_SRCS := src/bloom_scene.c src/bloom_ui.c src/bloom_prefab.c src/bloom_lean_jsi.c src/bloom_gpu_host.c src/bloom_cli.c
 CORE_OBJS  := $(BUILD_DIR)/bloom_scene.o $(BUILD_DIR)/bloom_ui.o $(BUILD_DIR)/bloom_prefab.o
@@ -85,7 +85,7 @@ mutate-check: $(LIBBLOOM_A)
 
 cpp-gate: include/*.h $(SCHEMA_HDR) | $(BUILD_DIR)
 	@printf '#include "flow.h"\n#include "searu.h"\n#include "bloom.h"\n#include "bloom_abi.h"\n#include "bloom_scene.h"\n#include "bloom_ui.h"\n#include "bloom_prefab.h"\n#include "bloom_host.h"\nint bloom_cpp20_abi_probe(void) { return (int)(sizeof(BloomEngineArena) + alignof(BloomEngineArena) + alignof(BloomCell64)); }\n' | \
-		$(CXX) -x c++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)" -c - -o $(BUILD_DIR)/.cpp_gate.o
+		$(CXX) -x c++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -c - -o $(BUILD_DIR)/.cpp_gate.o
 	@rm -f $(BUILD_DIR)/.cpp_gate.o
 
 $(BUILD_DIR):
@@ -110,7 +110,7 @@ $(STATIC_STAMP): $(ALL_C_SRCS) include/*.h $(SCHEMA_HDR) | $(BUILD_DIR) upstream
 	$(CLANG_TIDY) -checks='-*,clang-analyzer-*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling' \
 		--header-filter='include/.*' -warnings-as-errors='*' \
 		$(ALL_C_SRCS) \
-		-- -std=c17 -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)" -isystem "$(LEAN_SYSROOT)/include" $(SDL3_CFLAGS)
+		-- -std=c17 -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -isystem "$(LEAN_SYSROOT)/include" $(SDL3_CFLAGS)
 	@touch $@
 
 $(LIBBLOOM_A): $(CORE_OBJS) $(STATIC_STAMP)
