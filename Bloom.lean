@@ -1,6 +1,6 @@
 /-
-  BLOOM v9.0.0 — Pure Config, Flexbox DSL & AOT Arena Image Compiler (`import Flow`)
-  ================================================================================
+  BLOOM v9.0.0 — Pure Config, Flexbox DSL & AOT Arena Image Compiler (`import Flow.Schema`)
+  =======================================================================================
   SSOT compliance: all formal machine-word, interval, convexity, SEARU, 2-Jet,
   and full-512b C17+WGSL Schema compilers reside in domain-free `../FLOW/{core,sdk}/lean/Flow/*.lean`.
   This file configures the 256-slot `16,384B` `bloomArenaSchema`, declares the
@@ -9,7 +9,7 @@
   with ZERO local theorems (`0 theorem`, `0 sorryAx`).
 -/
 
-import Flow
+import Flow.Schema
 
 namespace Bloom
 

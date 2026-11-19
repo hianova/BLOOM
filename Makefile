@@ -92,7 +92,7 @@ $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
 upstream-deps:
-	@test -f "$(FLOW_BUILD)/Flow.olean" && test -f "$(FLOW_BUILD)/Flow/Schema.olean" || $(MAKE) -C "$(FLOW_DIR)" build/lean/Flow.olean
+	$(MAKE) -C "$(FLOW_DIR)" build/lean/Flow.olean
 
 $(BUILD_DIR)/bloom_scene.o: src/bloom_scene.c include/bloom_abi.h include/bloom_scene.h $(SCHEMA_HDR) | $(BUILD_DIR)
 	$(CC) $(CORE_CFLAGS) -c $< -o $@
@@ -176,6 +176,7 @@ $(SCHEMA_HDR): $(BLOOM_OLEAN)
 	printf 'import Bloom\n#eval do if !(← Bloom.emitSchemaOnly) then IO.Process.exit 1\n' | \
 		LEAN_PATH="$(FLOW_BUILD):$(BUILD_DIR)" $(LEAN) -DwarningAsError=true --stdin
 	@test -s "$(SCHEMA_HDR)" && test -s "$(SCHEMA_WGSL)"
+	@! grep -Eq '(<string\.h>|memcpy)' "$(SCHEMA_HDR)" || (echo "ERROR: <string.h> or memcpy leaked into bloom_schema_abi.h!" >&2 && exit 1)
 	@! grep -Eq '\b(u64|i64)\b' "$(SCHEMA_WGSL)" || (echo "ERROR: 64-bit integer type leaked into bloom_schema.wgsl!" >&2 && exit 1)
 	$(NAGA) "$(SCHEMA_WGSL)" "$(BUILD_DIR)/.bloom_schema_check.spv" && rm -f "$(BUILD_DIR)/.bloom_schema_check.spv"
 
