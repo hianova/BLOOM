@@ -1,12 +1,20 @@
 export PATH := $(HOME)/.elan/bin:/opt/homebrew/opt/llvm/bin:/opt/homebrew/bin:/usr/local/bin:$(PATH)
 
+UNAME_S     := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+ifeq ($(origin CC),default)
+CC := clang
+endif
+ifeq ($(origin CXX),default)
+CXX := clang++
+endif
+endif
 CC          ?= clang
 CXX         ?= clang++
 AR          ?= ar
 LEAN        ?= lean
 LEANCHECKER ?= leanchecker
 NAGA        ?= naga
-UNAME_S     := $(shell uname -s)
 PREFIX      ?= /usr/local
 
 CLANG_TIDY := $(shell if [ -x /opt/homebrew/opt/llvm/bin/clang-tidy ]; then echo /opt/homebrew/opt/llvm/bin/clang-tidy; \

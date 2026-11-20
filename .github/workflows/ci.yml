@@ -76,5 +76,9 @@ jobs:
             export VK_ICD_FILENAMES="$LVP_ICD"
             export VK_DRIVER_FILES="$LVP_ICD"
           fi
-          make -C FLOW all
-          make -C BLOOM clean && make -C BLOOM verify
+          make -C FLOW all CC=clang CXX=clang++
+          if [ "$(uname -s)" = "Linux" ]; then
+            make -C BLOOM clean && make -C BLOOM verify CC=clang CXX=clang++
+          else
+            make -C BLOOM clean && make -C BLOOM verify
+          fi
