@@ -157,6 +157,19 @@ static int run_probe(uint64_t *out_digest) {
         CHECK(bloom_glb_parse_to_csg64(glb_ext, 80U, 3U, 1U, &op, &vcnt) && vcnt == 4U);
         mix_bytes(&op, sizeof(op));
 
+        /* Non-dyadic small finite floats (-24 <= shift <= -1) to cover rounding-bit carry paths */
+        uint8_t glb_round[80];
+        memcpy(glb_round, glb, 80U);
+        const uint32_t rnd_verts[12] = {
+            0xBF000080U, 0xBF000040U, 0xBEAAAAABU,
+            0x3F000080U, 0x3F000040U, 0x3EAAAAABU,
+            0x00000000U, 0x00000000U, 0x00000000U,
+            0x3A83126FU, 0xBA83126FU, 0x3F000080U
+        };
+        for (size_t k = 0U; k < 12U; ++k) put_u32_le(glb_round + 32U + k * 4U, rnd_verts[k]);
+        CHECK(bloom_glb_parse_to_csg64(glb_round, 80U, 6U, 1U, &op, &vcnt) && vcnt == 4U);
+        mix_bytes(&op, sizeof(op));
+
         uint8_t bad[80];
         memcpy(bad, glb, 80U);
         put_u32_le(bad + 12U, 0xFFFFFFFFU);
@@ -401,6 +414,22 @@ static int run_probe(uint64_t *out_digest) {
         mix_bytes(&flex, sizeof(flex));
         mix_bytes(fnodes, sizeof(fnodes));
 
+        static const uint16_t align_modes[3] = { BLOOM_ALIGN_START, BLOOM_ALIGN_END, BLOOM_ALIGN_CENTER };
+        static const uint16_t just_modes[3]  = { BLOOM_JUSTIFY_CENTER, BLOOM_JUSTIFY_END, BLOOM_JUSTIFY_START };
+        static const uint16_t dir_modes[3]   = { BLOOM_FLEX_COLUMN, BLOOM_FLEX_COLUMN, BLOOM_FLEX_ROW };
+        for (uint32_t am = 0U; am < 3U; ++am) {
+            memset(fnodes, 0, sizeof(fnodes));
+            for (uint32_t i = 0U; i < 4U; ++i) {
+                fnodes[i].half_w_q16 = 4096 + (int32_t)(i * 512U);
+                fnodes[i].half_h_q16 = 3072 + (int32_t)(i * 256U);
+            }
+            bloom_flex_init64(&flex, dir_modes[am], just_modes[am], align_modes[am],
+                              -16384, 8192, 24576, 32768, 2048, 1536);
+            bloom_flex_apply64(&flex, fnodes, 4U, 4096);
+            mix_bytes(&flex, sizeof(flex));
+            mix_bytes(fnodes, sizeof(fnodes));
+        }
+
         BloomRegBank64 bank;
         bloom_reg_bank_init64(&bank);
         bloom_reg_bank_set_q16(&bank, 1U, 55000);
@@ -429,7 +458,7 @@ static int run_probe(uint64_t *out_digest) {
         size_t gcnt = 0U;
         const char *svg =
             "<svg viewBox=\"  0 0 1280 720\" width=\"1280\" height=\"720\"><!-- inspector -->"
-            "<rect data-node-id=\"1\" data-prim=\"4\" data-glass=\" 2\" data-bind=\"0\" data-action=\"1\" data-init-q16=\" 49152\" x=\"  40.5\" y=\"40.25\" width=\"240\" height=\"60\" rx=\"12.5\" fill=\"#20D8FF\" fill-opacity=\"0.75\"/>"
+            "<rect data-node-id=\"1\" data-anchor=\"12\" data-prim=\"4\" data-glass=\" 2\" data-bind=\"0\" data-action=\"1\" data-init-q16=\" 49152\" x=\"  40.5\" y=\"40.25\" width=\"240\" height=\"60\" rx=\"12.5\" fill=\"#20D8FF\" fill-opacity=\"0.75\"/>"
             "<circle data-node-id=\"2\" data-prim=\"2\" data-bind=\"1\" cx=\"900\" cy=\"120\" r=\"42\" fill=\"#FFB020\" stroke-width=\"6\"/>"
             "<rect data-node-id=\"3\" data-prim=\"1\" data-action=\"2\" x=\"-10\" y=\"200\" width=\"120\" height=\"40\" rx=\"8\" fill=\"#3af\"/>"
             "<path data-glyph-id=\"1\" d=\"M 100 100 L 220 180 C 240 190 260 150 300 120 Z\" stroke=\"#FFFFFF\" stroke-width=\"3\"/>"
@@ -440,9 +469,21 @@ static int run_probe(uint64_t *out_digest) {
         mix_bytes(fnodes, 3U * sizeof(BloomUiNode64));
         mix_bytes(glyphs, gcnt * sizeof(BloomGlyph64));
 
+        const char *svg2 =
+            "<svg width=\"640\" height=\"360\">"
+            "<rect data-node-id=\"11\" data-anchor=\"12\" data-bind=\"10\" data-action=\"13\" data-glass=\"10\" data-init-q16=\"12345\" x=\"32\" y=\"48\" width=\"160\" height=\"64\" rx=\"10\" fill=\"#11AAFF\"/>"
+            "<path data-glyph-id=\"3\" d=\"M 10 20 H 120 V 90 L 40 60 Z\" stroke=\"#FF00AA\" stroke-width=\"12\"/>"
+            "</svg>";
+        size_t gcnt2 = 0U;
+        size_t sn2 = bloom_svg_compile_text(svg2, fnodes, 4U, glyphs, 16U, &gcnt2, &dom);
+        CHECK(sn2 == 1U && gcnt2 == 1U && fnodes[0].bind_channel == 10U);
+        mix_bytes(fnodes, sizeof(BloomUiNode64));
+        mix_bytes(glyphs, sizeof(BloomGlyph64));
+        mix_bytes(&dom, sizeof(dom));
+
         BloomLatexBox64 lboxes[16];
         int32_t lw = 0;
-        size_t ln = bloom_latex_compile_boxes64("\\int \\sum \\frac{\\sqrt{\\eta^2 + x_1}}{2\\pi}",
+        size_t ln = bloom_latex_compile_boxes64("\\\\int \\\\sum \\\\frac{\\\\sqrt{\\\\eta^2 + x_1}}{2\\\\pi}",
                                                 -16384, -32768, 4096, 0xFFD848U, lboxes, 16U, &lw);
         CHECK(ln >= 6U);
         mix_u64((uint64_t)(uint32_t)lw);
@@ -450,6 +491,20 @@ static int run_probe(uint64_t *out_digest) {
             mix_bytes(&lboxes[i], sizeof(BloomLatexBox64));
             mix_u64((uint64_t)(uint32_t)bloom_latex_eval_box_sdf_q16(&lboxes[i], lboxes[i].x_q16 + 512, lboxes[i].y_q16 - 512));
         }
+        BloomLatexBox64 lb_syn;
+        memset(&lb_syn, 0, sizeof(lb_syn));
+        lb_syn.box_kind = BLOOM_LATEX_SQRT_RAD;
+        lb_syn.half_w_q16 = 4096;
+        lb_syn.half_h_q16 = 2048;
+        lb_syn.stroke_q16 = 128;
+        mix_u64((uint64_t)(uint32_t)bloom_latex_eval_box_sdf_q16(&lb_syn, -3072, 1024));
+        mix_u64((uint64_t)(uint32_t)bloom_latex_eval_box_sdf_q16(&lb_syn, -1024, 0));
+        mix_u64((uint64_t)(uint32_t)bloom_latex_eval_box_sdf_q16(&lb_syn, 2048, -2048));
+        lb_syn.box_kind = BLOOM_LATEX_FRAC_BAR;
+        mix_u64((uint64_t)(uint32_t)bloom_latex_eval_box_sdf_q16(&lb_syn, 2048, 256));
+        lb_syn.half_w_q16 = 64;
+        lb_syn.half_h_q16 = 64;
+        mix_u64((uint64_t)(uint32_t)bloom_latex_eval_box_sdf_q16(&lb_syn, 128, 64));
     }
 
     /* --- 4. Prefab SSOT, Styles, Full Arena Dynamics, Pointer, Raycast & Merkle Seal --- */
@@ -543,8 +598,24 @@ static int run_probe(uint64_t *out_digest) {
             arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0][3] = (uint64_t)(int64_t)-0x5D3A9B71LL;
             (void)bloom_ui_step_pointer_arena(&arena, 0, 0, 0, false, false);
             mix_bytes(arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0], sizeof(arena.map.flow_states[0]));
+            uint64_t next_hi = ((uint64_t)ch_slot ^ 1ULL) & (uint64_t)BLOOM_FLOW_CHART_MASK;
+            uint64_t next_lo = ((uint64_t)ch_slot ^ 2ULL) & (uint64_t)BLOOM_FLOW_CHART_MASK;
+            memcpy(arena.map.flow_charts[ch_slot], saved_ch, sizeof(saved_ch));
+            arena.map.flow_charts[ch_slot][3] =
+                ((uint64_t)(uint32_t)(int32_t)(-65536) << 32U) | (uint64_t)(uint32_t)(int32_t)(32768);
+            arena.map.flow_charts[ch_slot][5] = (next_lo << 24U) | (next_hi << 16U);
+            arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0][3] = (uint64_t)65536ULL;
+            arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0][5] = ((uint64_t)ch_slot << 16U);
+            (void)bloom_ui_step_pointer_arena(&arena, 0, 0, 0, false, false);
+            CHECK(((arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0][5] >> 16U) & BLOOM_FLOW_CHART_MASK) == next_hi);
+            mix_bytes(arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0], sizeof(arena.map.flow_states[0]));
+            arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0][3] = 0ULL;
+            arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0][5] = ((uint64_t)ch_slot << 16U);
+            (void)bloom_ui_step_pointer_arena(&arena, 0, 0, 0, false, false);
+            mix_bytes(arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0], sizeof(arena.map.flow_states[0]));
             memcpy(arena.map.flow_charts[ch_slot], saved_ch, sizeof(saved_ch));
             arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0][3] = (uint64_t)BLOOM_Q16_ONE;
+            arena.map.flow_states[BLOOM_FLOW_CH_UI_NODE0][5] = ((uint64_t)ch_slot << 16U);
         }
         (void)bloom_ui_step_pointer_arena(&arena, 0, 0, 0, false, false);
 
@@ -865,6 +936,23 @@ static int run_probe(uint64_t *out_digest) {
         CHECK(mesh_big.map.tris[0].v1_q16[1] < 1024);
         mix_bytes(&mesh_big.map.tris[0], sizeof(BloomTri64));
 
+        uint8_t glb_round_m[32 + 36];
+        memcpy(glb_round_m, glb_big, sizeof(glb_round_m));
+        put_u32_le(glb_round_m + 32U + 0U,  0x3F000080U);
+        put_u32_le(glb_round_m + 32U + 4U,  0xBF000080U);
+        put_u32_le(glb_round_m + 32U + 8U,  0x3F000040U);
+        put_u32_le(glb_round_m + 32U + 12U, 0x3F800000U);
+        put_u32_le(glb_round_m + 32U + 16U, 0x00000000U);
+        put_u32_le(glb_round_m + 32U + 20U, 0x00000000U);
+        put_u32_le(glb_round_m + 32U + 24U, 0x00000000U);
+        put_u32_le(glb_round_m + 32U + 28U, 0x3F800000U);
+        put_u32_le(glb_round_m + 32U + 32U, 0x3F000080U);
+        CHECK(bloom_glb_parse_to_mesh64(glb_round_m, sizeof(glb_round_m), 1U, false, &mesh_big, &bcnt) && bcnt == 1U);
+        CHECK(mesh_big.map.tris[0].v0_q16[0] == 32769 && mesh_big.map.tris[0].v0_q16[1] == -32769 && mesh_big.map.tris[0].v0_q16[2] == 32768);
+        mix_bytes(&mesh_big.map.tris[0], sizeof(BloomTri64));
+        CHECK(bloom_glb_parse_to_mesh64(glb_round_m, sizeof(glb_round_m), 1U, true, &mesh_big, &bcnt) && bcnt == 1U);
+        mix_bytes(&mesh_big.map.tris[0], sizeof(BloomTri64));
+
         /* Multi-triangle GLB ingestion */
         uint8_t glb_m[32 + 4 * 36];
         memset(glb_m, 0, sizeof(glb_m));
@@ -1113,6 +1201,14 @@ static int run_probe(uint64_t *out_digest) {
         uint32_t hs = bloom_audio_step_frame64(&rig, &v8a, pcm, 800U);
         CHECK(rig.hdr.peak_abs_pcm > 0);
         mix_u64((uint64_t)hs ^ (uint64_t)(uint32_t)rig.hdr.peak_abs_pcm);
+        mix_bytes(pcm, sizeof(pcm));
+
+        v8a.map.phys_summary.step_epoch = rig.hdr.last_phys_epoch + 1U;
+        v8a.map.phys_summary.phys_flags |= BLOOM_PHYS_FLAG_CCD_HIT;
+        v8a.map.phys_summary.earliest_toi_q16 = 32768;
+        uint32_t hs_toi = bloom_audio_step_frame64(&rig, &v8a, pcm, 800U);
+        CHECK(rig.hdr.last_subframe_sample == 400U);
+        mix_u64((uint64_t)hs_toi ^ (uint64_t)rig.hdr.last_subframe_sample);
         mix_bytes(pcm, sizeof(pcm));
 
         /* Targeted modal energy-gate & skipped-mode branch probe on quiet clean arena (no CCD/scrub override) */

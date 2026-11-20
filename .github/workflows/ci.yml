@@ -20,16 +20,22 @@ jobs:
         os: [ ubuntu-latest, macos-latest ]
     steps:
       - name: Checkout FLOW (main)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: hianova/FLOW
           ref: main
           path: FLOW
 
       - name: Checkout BLOOM
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: BLOOM
+
+      - name: Cache Lean 4 Toolchain
+        uses: actions/cache@v5
+        with:
+          path: ~/.elan
+          key: ${{ runner.os }}-${{ runner.arch }}-elan-lean-4.36.0
 
       - name: Install Toolchain & Vulkan Lavapipe + SDL3 GPU (Linux)
         if: runner.os == 'Linux'
@@ -52,7 +58,6 @@ jobs:
             -DSDL_TESTS=OFF
           sudo cmake --build /tmp/sdl3/build --target install
           sudo ldconfig
-          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain leanprover/lean4:v4.36.0
 
       - name: Install W3C WebGPU Naga Compiler (Linux)
         if: runner.os == 'Linux'
@@ -64,7 +69,15 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install llvm naga-cli sdl3 pkg-config
-          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain leanprover/lean4:v4.36.0
+
+      - name: Install Lean 4 Toolchain
+        run: |
+          set -euo pipefail
+          if ! "$HOME/.elan/bin/lean" --version >/dev/null 2>&1; then
+            curl --retry 5 -sSfL https://elan.lean-lang.org/elan-init.sh -o /tmp/elan-init.sh
+            sh /tmp/elan-init.sh -y --default-toolchain leanprover/lean4:v4.36.0
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
       - name: Build FLOW & Compile BLOOM (Single-Track WGSL + SDL3 GPU Gate)
         run: |
