@@ -5,6 +5,7 @@
 #include "flow_sha256_io.h"
 #include "searu.h"
 
+#include <dirent.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,12 +44,19 @@ typedef struct {
     const char *aot_shader_path;
     const char *compile_fir_in;
     const char *compile_wgsl_out;
+    const char *faultsim_fir_path;
+    const char *equiv_fir_a;
+    const char *equiv_fir_b;
+    const char *gpu_ncd_dirs;
     const char *searu_cnf_path;
     uint32_t    hunt_trials;
     uint32_t    hunt_mode;
     uint32_t    hunt_vary_mask;
     uint64_t    hunt_seed;
     uint64_t    hunt_target;
+    uint32_t    ncd_thr;
+    uint32_t    ncd_top;
+    bool        trials_explicit;
     bool        hunt_prng;
     bool        hunt_bitslice;
     bool        verify_cpu;
@@ -240,6 +248,11 @@ static void cli_print_usage(const char *prog) {
     printf("  --bitslice             Use 32-way SIMT bit-sliced netlist accelerator (gtid ^ seed)\n");
     printf("  --compile-fir-wgsl <in.fir> <out.wgsl>  Compile FLOW FIR1 circuit to straight-line WGSL\n");
     printf("  --aot-shader <path>    Execute compiled straight-line AOT FIR1 shader (base/.metal/.spv)\n");
+    printf("  --faultsim-fir <f.fir> GPU stuck-at-0/1 ATPG fault simulation across all signal wires\n");
+    printf("  --equiv-fir <a.fir> <b.fir>  GPU bit-exact formal hardware equivalence miter\n");
+    printf("  --gpu-ncd <d1[,d2..]>  GPU all-pairs b-bit MinHash / NCD similarity matrix\n");
+    printf("  --ncd-thr <0..64>      Match threshold out of 64 buckets (default: 36)\n");
+    printf("  --top <K>              Top clone pairs to print for --gpu-ncd (default: 10)\n");
     printf("  --searu-cnf <in.cnf>   Solve DIMACS 3-SAT file using GPU Parallel SEARU (<=256v, <=8192c)\n");
     printf("  --searu-bench-3sat V,C Planted random 3-SAT GPU vs CPU benchmark\n");
     printf("  --searu-bench-color N,K Planted dense K-coloring GPU vs CPU benchmark\n");
@@ -277,6 +290,8 @@ static bool cli_parse_args(int argc, char **argv, BloomCliArgs *out) {
     out->searu_universes = 4096U;
     out->searu_iters = 256U;
     out->searu_rounds = 4U;
+    out->ncd_thr = 36U;
+    out->ncd_top = 10U;
     out->sec_norm_q16[0] = BLOOM_Q16_ONE;
     out->slab_half_q16 = 16384;
 
@@ -353,6 +368,7 @@ static bool cli_parse_args(int argc, char **argv, BloomCliArgs *out) {
                 fprintf(stderr, "[BLOOM CLI] Invalid --trials (expected 1..1073741824)\n");
                 return false;
             }
+            out->trials_explicit = true;
         } else if (strcmp(arg, "--hunt-seed") == 0) {
             if (i + 1 >= argc || !cli_parse_u64(argv[++i], &out->hunt_seed)) {
                 fprintf(stderr, "[BLOOM CLI] Invalid --hunt-seed\n");
@@ -402,6 +418,39 @@ static bool cli_parse_args(int argc, char **argv, BloomCliArgs *out) {
             out->compile_fir_in = argv[++i];
             out->compile_wgsl_out = argv[++i];
             out->headless = true;
+        } else if (strcmp(arg, "--faultsim-fir") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[BLOOM CLI] Missing path after --faultsim-fir\n");
+                return false;
+            }
+            out->faultsim_fir_path = argv[++i];
+            out->headless = true;
+        } else if (strcmp(arg, "--equiv-fir") == 0) {
+            if (i + 2 >= argc) {
+                fprintf(stderr, "[BLOOM CLI] Expected <spec.fir> <impl.fir> after --equiv-fir\n");
+                return false;
+            }
+            out->equiv_fir_a = argv[++i];
+            out->equiv_fir_b = argv[++i];
+            out->headless = true;
+        } else if (strcmp(arg, "--gpu-ncd") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[BLOOM CLI] Missing directories after --gpu-ncd\n");
+                return false;
+            }
+            out->gpu_ncd_dirs = argv[++i];
+            out->headless = true;
+        } else if (strcmp(arg, "--ncd-thr") == 0) {
+            if (i + 1 >= argc || !cli_parse_u32(argv[++i], &out->ncd_thr) || out->ncd_thr > 64U) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --ncd-thr (expected 0..64)\n");
+                return false;
+            }
+        } else if (strcmp(arg, "--top") == 0) {
+            if (i + 1 >= argc || !cli_parse_u32(argv[++i], &out->ncd_top) ||
+                out->ncd_top == 0U || out->ncd_top > 64U) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --top (expected 1..64)\n");
+                return false;
+            }
         } else if (strcmp(arg, "--searu-cnf") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "[BLOOM CLI] Missing path after --searu-cnf\n");
@@ -1614,6 +1663,297 @@ static int cli_run_searu_cnf(const BloomCliArgs *args, BloomEngineArena *arena) 
     return (gpu_ok && gres.cpu_verified) ? 0 : 1;
 }
 
+static int cli_run_faultsim_command(const BloomCliArgs *args, BloomEngineArena *arena) {
+    size_t fir_len = 0U;
+    uint8_t *fir_buf = cli_read_fir_file(args->faultsim_fir_path, &fir_len);
+    if (!fir_buf) return 1;
+
+    arena->map.frame_hdr.width_px = 64U;
+    arena->map.frame_hdr.height_px = 64U;
+    BloomGpuCtx *gpu = bloom_gpu_init(arena, args->shader_path);
+    if (!gpu) {
+        free(fir_buf);
+        return 1;
+    }
+
+    BloomFir1FaultSimResult res;
+    bool ok = bloom_gpu_faultsim_fir1(gpu, fir_buf, fir_len, args->hunt_trials, args->hunt_seed, &res);
+    double cov = (res.total_faults > 0U)
+                     ? (100.0 * (double)res.detected_faults / (double)res.total_faults)
+                     : 100.0;
+    double mfevals = (res.elapsed_us > 0ULL)
+                         ? ((double)res.total_fault_evals / (double)res.elapsed_us)
+                         : 0.0;
+    printf("[BLOOM GPU-FAULTSIM] file=%s wires=%u gates=%u faults=%u detected=%u undetected=%u cov=%.2f%% trials/fault=%u total_evals=%" PRIu64 " time=%.2fms (%.2f M_fevals/s) cpu_verified=%s GPU=%s\n",
+           args->faultsim_fir_path, res.total_wires, res.total_gates, res.total_faults,
+           res.detected_faults, res.undetected_faults, cov, res.trials_per_fault,
+           res.total_fault_evals, (double)res.elapsed_us / 1000.0, mfevals,
+           res.cpu_verified ? "EXACT" : "FAIL", bloom_gpu_device_name(gpu));
+    if (res.sample_atpg_vec != 0xFFFFFFFFU) {
+        printf("  sample_atpg: wire=w%u SA%u detected_by=0x%08x\n",
+               res.sample_fault_wire, res.sample_stuck_val, res.sample_atpg_vec);
+    }
+
+    bloom_gpu_destroy(gpu);
+    free(fir_buf);
+    return (ok && res.cpu_verified) ? 0 : 1;
+}
+
+static int cli_run_equiv_command(const BloomCliArgs *args, BloomEngineArena *arena) {
+    size_t len_a = 0U, len_b = 0U;
+    uint8_t *buf_a = cli_read_fir_file(args->equiv_fir_a, &len_a);
+    uint8_t *buf_b = cli_read_fir_file(args->equiv_fir_b, &len_b);
+    if (!buf_a || !buf_b) {
+        free(buf_b);
+        free(buf_a);
+        return 1;
+    }
+
+    arena->map.frame_hdr.width_px = 64U;
+    arena->map.frame_hdr.height_px = 64U;
+    BloomGpuCtx *gpu = bloom_gpu_init(arena, args->shader_path);
+    if (!gpu) {
+        free(buf_b);
+        free(buf_a);
+        return 1;
+    }
+
+    BloomFir1EquivResult res;
+    uint32_t trials = args->trials_explicit ? args->hunt_trials : 0U;
+    bool ok = bloom_gpu_equiv_fir1(gpu, buf_a, len_a, buf_b, len_b, trials, args->hunt_seed, &res);
+    double mevals = (res.elapsed_us > 0ULL)
+                        ? ((double)res.trials_evaluated / (double)res.elapsed_us)
+                        : 0.0;
+    printf("[BLOOM GPU-EQUIV] spec=%s impl=%s in_bits=%u miter_gates=%u trials=%u exhaustive=%s mismatches=%u verdict=%s time=%.2fms (%.2f M_evals/s) cpu_verified=%s GPU=%s\n",
+           args->equiv_fir_a, args->equiv_fir_b, res.total_in_bits, res.miter_gates,
+           res.trials_evaluated, res.exhaustive ? "YES" : "BOUNDED", res.mismatch_count,
+           res.equivalent ? "EQUIVALENT" : "NONEQUIVALENT",
+           (double)res.elapsed_us / 1000.0, mevals,
+           res.cpu_verified ? "EXACT" : "FAIL", bloom_gpu_device_name(gpu));
+    if (!res.equivalent && res.cpu_verified) {
+        printf("  counterexample[trial=%u]: in0=0x%" PRIx64 " spec_out0=0x%" PRIx64 " impl_out0=0x%" PRIx64 "\n",
+               res.first_mismatch_trial, res.cex_inputs[0], res.cex_out_a[0], res.cex_out_b[0]);
+    }
+
+    bloom_gpu_destroy(gpu);
+    free(buf_b);
+    free(buf_a);
+    return (ok && res.cpu_verified && res.equivalent) ? 0 : 1;
+}
+
+typedef struct {
+    char     path[512];
+    uint32_t sig[8];
+    uint32_t size_bytes;
+} CliNcdFile;
+
+typedef struct {
+    uint32_t i;
+    uint32_t j;
+    uint32_t matches;
+} CliNcdPair;
+
+static bool cli_ncd_has_ext(const char *name) {
+    static const char *const exts[8] = { ".c", ".h", ".lean", ".wgsl", ".py", ".md", ".v", ".sv" };
+    size_t nlen = strlen(name);
+    for (size_t k = 0U; k < 8U; ++k) {
+        size_t elen = strlen(exts[k]);
+        if (nlen > elen && strcmp(name + (nlen - elen), exts[k]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cli_ncd_skip_dir(const char *name) {
+    return (strcmp(name, ".") == 0) || (strcmp(name, "..") == 0) ||
+           (strcmp(name, ".git") == 0) || (strcmp(name, "build") == 0) ||
+           (strcmp(name, "__pycache__") == 0) || (strcmp(name, "node_modules") == 0) ||
+           (strcmp(name, ".lake") == 0) || (strcmp(name, ".elan") == 0);
+}
+
+static void cli_ncd_walk(const char *dir_path,
+                         CliNcdFile *files,
+                         uint32_t *io_count,
+                         uint32_t max_files) {
+    if (*io_count >= max_files) return;
+    DIR *d = opendir(dir_path);
+    if (!d) return;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL && *io_count < max_files) {
+        if (cli_ncd_skip_dir(ent->d_name)) continue;
+        char full[512];
+        int n = snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name);
+        if (n <= 0 || (size_t)n >= sizeof(full)) continue;
+
+        struct stat st;
+        if (lstat(full, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            cli_ncd_walk(full, files, io_count, max_files);
+        } else if (S_ISREG(st.st_mode) && cli_ncd_has_ext(ent->d_name) &&
+                   st.st_size >= 32 && st.st_size <= 4194304) {
+            FILE *fp = fopen(full, "rb");
+            if (!fp) continue;
+            size_t sz = (size_t)st.st_size;
+            uint8_t *buf = (uint8_t *)malloc(sz);
+            if (buf && fread(buf, 1U, sz, fp) == sz) {
+                CliNcdFile *dst = &files[*io_count];
+                snprintf(dst->path, sizeof(dst->path), "%s", full);
+                dst->size_bytes = (uint32_t)sz;
+                bloom_info_sketch_bytes(buf, sz, dst->sig);
+                (*io_count)++;
+            }
+            free(buf);
+            fclose(fp);
+        }
+    }
+    closedir(d);
+}
+
+static uint32_t cli_ncd_sig_eq(const uint32_t a[8], const uint32_t b[8]) {
+    uint32_t tot = 0U;
+    for (uint32_t w = 0U; w < 8U; ++w) {
+        uint32_t x = a[w] ^ b[w];
+        uint32_t nz = (x | (x >> 1U) | (x >> 2U) | (x >> 3U)) & UINT32_C(0x11111111);
+        for (uint32_t k = 0U; k < 8U; ++k) {
+            if (((nz >> (k * 4U)) & 1U) == 0U) {
+                tot++;
+            }
+        }
+    }
+    return tot;
+}
+
+static int cli_run_gpu_ncd_command(const BloomCliArgs *args, BloomEngineArena *arena) {
+    const uint32_t max_files = 8192U;
+    CliNcdFile *files = (CliNcdFile *)calloc(max_files, sizeof(CliNcdFile));
+    if (!files) return 1;
+
+    uint32_t n_files = 0U;
+    char *dirs_copy = (char *)malloc(strlen(args->gpu_ncd_dirs) + 1U);
+    if (!dirs_copy) {
+        free(files);
+        return 1;
+    }
+    memcpy(dirs_copy, args->gpu_ncd_dirs, strlen(args->gpu_ncd_dirs) + 1U);
+
+    char *tok = dirs_copy;
+    while (tok && *tok != '\0' && n_files < max_files) {
+        char *comma = strchr(tok, ',');
+        if (comma) *comma = '\0';
+        if (tok[0] != '\0') {
+            cli_ncd_walk(tok, files, &n_files, max_files);
+        }
+        tok = comma ? (comma + 1) : NULL;
+    }
+    free(dirs_copy);
+
+    if (n_files < 2U) {
+        fprintf(stderr, "[BLOOM GPU-NCD] Need >= 2 files to compute similarity matrix (found %u)\n", n_files);
+        free(files);
+        return (n_files == 1U) ? 0 : 1;
+    }
+
+    uint32_t *sigs = (uint32_t *)calloc((size_t)n_files * 8U, sizeof(uint32_t));
+    BloomInfoSimRow *rows = (BloomInfoSimRow *)calloc(n_files, sizeof(BloomInfoSimRow));
+    if (!sigs || !rows) {
+        free(rows);
+        free(sigs);
+        free(files);
+        return 1;
+    }
+    for (uint32_t i = 0U; i < n_files; ++i) {
+        memcpy(&sigs[i * 8U], files[i].sig, 8U * sizeof(uint32_t));
+    }
+
+    arena->map.frame_hdr.width_px = 64U;
+    arena->map.frame_hdr.height_px = 64U;
+    BloomGpuCtx *gpu = bloom_gpu_init(arena, args->shader_path);
+    if (!gpu) {
+        free(rows);
+        free(sigs);
+        free(files);
+        return 1;
+    }
+
+    BloomInfoSimResult sum;
+    bool ok = bloom_gpu_info_sim_matrix(gpu, sigs, n_files, args->ncd_thr, rows, &sum);
+
+    bool cpu_full_ok = sum.cpu_verified;
+    if (args->verify_cpu && n_files <= 512U && ok) {
+        for (uint32_t i = 0U; i < n_files && cpu_full_ok; ++i) {
+            uint32_t bj = i, bm = 0U, nc = 0U, ec = 0U;
+            for (uint32_t j = 0U; j < n_files; ++j) {
+                if (j == i) continue;
+                uint32_t m = cli_ncd_sig_eq(files[i].sig, files[j].sig);
+                if (m > bm || (bj == i && m == 0U)) { bm = m; bj = j; }
+                if (m >= args->ncd_thr) nc++;
+                if (m == 64U) ec++;
+            }
+            if (bj != rows[i].best_match_idx || bm != rows[i].best_matches ||
+                nc != rows[i].near_dup_count || ec != rows[i].exact_dup_count) {
+                cpu_full_ok = false;
+            }
+        }
+    }
+
+    double mpairs = (sum.elapsed_us > 0ULL)
+                        ? ((double)sum.total_pairs_eval / (double)sum.elapsed_us)
+                        : 0.0;
+    printf("[BLOOM GPU-NCD] files=%u pairs=%" PRIu64 " thr=%u/64 near_dup_files=%u exact_dup_pairs=%u time=%.2fms (%.2f M_pairs/s) cpu_verified=%s GPU=%s\n",
+           sum.num_files, sum.total_pairs_eval, args->ncd_thr,
+           sum.files_with_near_dup, sum.exact_dup_pairs,
+           (double)sum.elapsed_us / 1000.0, mpairs,
+           cpu_full_ok ? "EXACT" : "FAIL", bloom_gpu_device_name(gpu));
+
+    CliNcdPair top[64];
+    memset(top, 0, sizeof(top));
+    uint32_t top_n = 0U;
+    uint32_t k_lim = (args->ncd_top <= 64U) ? args->ncd_top : 64U;
+    for (uint32_t i = 0U; i < n_files; ++i) {
+        uint32_t j = rows[i].best_match_idx;
+        if (j >= n_files || j == i) continue;
+        uint32_t lo = (i < j) ? i : j;
+        uint32_t hi = (i < j) ? j : i;
+        uint32_t m = rows[i].best_matches;
+        bool dup = false;
+        for (uint32_t t = 0U; t < top_n; ++t) {
+            if (top[t].i == lo && top[t].j == hi) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        if (top_n < k_lim || m > top[top_n - 1U].matches) {
+            uint32_t pos = (top_n < k_lim) ? top_n++ : (k_lim - 1U);
+            while (pos > 0U && m > top[pos - 1U].matches) {
+                top[pos] = top[pos - 1U];
+                pos--;
+            }
+            top[pos].i = lo;
+            top[pos].j = hi;
+            top[pos].matches = m;
+        }
+    }
+    for (uint32_t t = 0U; t < top_n; ++t) {
+        double p_match = (double)top[t].matches / 64.0;
+        double est_j = (p_match - (1.0 / 16.0)) / (15.0 / 16.0);
+        if (est_j < 0.0) est_j = 0.0;
+        if (est_j > 1.0) est_j = 1.0;
+        printf("  top[%u]: %2u/64 (est_J=%.3f est_NCD=%.3f)  %s (%uB)  <->  %s (%uB)\n",
+               t + 1U, top[t].matches, est_j, 1.0 - est_j,
+               files[top[t].i].path, files[top[t].i].size_bytes,
+               files[top[t].j].path, files[top[t].j].size_bytes);
+    }
+
+    bloom_gpu_destroy(gpu);
+    free(rows);
+    free(sigs);
+    free(files);
+    return (ok && cpu_full_ok) ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     BloomCliArgs args;
     if (!cli_parse_args(argc, argv, &args)) {
@@ -1684,6 +2024,30 @@ int main(int argc, char **argv) {
         free(staging);
         free(arena);
         return c_rc;
+    }
+
+    if (args.faultsim_fir_path != NULL) {
+        int fs_rc = cli_run_faultsim_command(&args, arena);
+        free(mesh);
+        free(staging);
+        free(arena);
+        return fs_rc;
+    }
+
+    if (args.equiv_fir_a != NULL) {
+        int eq_rc = cli_run_equiv_command(&args, arena);
+        free(mesh);
+        free(staging);
+        free(arena);
+        return eq_rc;
+    }
+
+    if (args.gpu_ncd_dirs != NULL) {
+        int ncd_rc = cli_run_gpu_ncd_command(&args, arena);
+        free(mesh);
+        free(staging);
+        free(arena);
+        return ncd_rc;
     }
 
     if (args.searu_cnf_path != NULL) {

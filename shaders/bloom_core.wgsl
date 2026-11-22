@@ -3817,3 +3817,202 @@ fn bloom_searu_solve(@builtin(global_invocation_id) gid : vec3<u32>) {
     rc_buf[rbase + 1u] = vec4<f32>(bitcast<f32>(best[0]), bitcast<f32>(best[1]), bitcast<f32>(best[2]), bitcast<f32>(best[3]));
     rc_buf[rbase + 2u] = vec4<f32>(bitcast<f32>(best[4]), bitcast<f32>(best[5]), bitcast<f32>(best[6]), bitcast<f32>(best[7]));
 }
+
+// ============================================================================
+// 8. Warp-Scale RTL Stuck-at-0/1 Fault Simulator (32 Vectors / Thread-Lane)
+// ============================================================================
+
+@compute @workgroup_size(64, 1, 1)
+fn bloom_fir1_faultsim(@builtin(global_invocation_id) gid : vec3<u32>) {
+    if (gid.x == 0xFFFFFFFFu) { textureStore(out_tex, vec2<i32>(0, 0), vec4<f32>(0.0)); }
+    let tid = gid.x;
+    let h0 = arena[0].q0;
+    let h1 = arena[0].q1;
+    let h2 = arena[0].q2;
+    let h3 = arena[0].q3;
+
+    let num_wires    = min(h0.y, 512u);
+    let num_in_bits  = min(h0.z, 256u);
+    let out0_w       = min(h0.w, 64u);
+    let num_gates    = min(h1.x, 2048u);
+    let total_packs  = h1.y;
+    let total_trials = h1.z;
+    let num_faults   = h1.w;
+    let seed_lo      = h2.x;
+    let seed_hi      = h2.y;
+    let pack_base    = h3.w;
+
+    if (h0.x != 0x46495246u || tid >= num_faults || num_wires < 3u) {
+        return;
+    }
+
+    let fault_wire = 2u + (tid >> 1u);
+    let stuck_val  = select(0u, 0xFFFFFFFFu, (tid & 1u) != 0u);
+
+    var first_vec  : u32 = 0xFFFFFFFFu;
+    var detect_acc : u32 = 0u;
+    var wires      : array<u32, 512>;
+    var g_out      : array<u32, 64>;
+
+    for (var local_pack : u32 = 0u; local_pack < total_packs; local_pack = local_pack + 1u) {
+        let gpack = pack_base + local_pack;
+        let rem = total_trials - local_pack * 32u;
+        let valid_mask = select((1u << min(rem, 31u)) - 1u, 0xFFFFFFFFu, rem >= 32u);
+
+        // Pass A: Golden circuit evaluation
+        wires[0] = 0u;
+        wires[1] = 0xFFFFFFFFu;
+        for (var k : u32 = 0u; k < num_in_bits; k = k + 1u) {
+            let spec = arena_read_u32(1u, k);
+            let dst = (spec >> 16u) & 0x1FFu;
+            let src_bit = spec & 0xFFu;
+            if ((spec & 0x80000000u) != 0u) {
+                wires[dst] = bs_input_plane(src_bit, gpack, seed_lo, seed_hi);
+            } else {
+                wires[dst] = select(0u, 0xFFFFFFFFu, (src_bit & 1u) != 0u);
+            }
+        }
+        for (var g : u32 = 0u; g < num_gates; g = g + 1u) {
+            let gt = mesh_read_vec4(g);
+            let kind = gt.x & 0xFFFFu;
+            let ow = (gt.x >> 16u) & 0x1FFu;
+            let a = wires[gt.y & 0x1FFu];
+            let b = wires[gt.z & 0x1FFu];
+            let c = wires[gt.w & 0x1FFu];
+            var r : u32 = 0u;
+            if (kind == 1u) { r = a & b; }
+            else if (kind == 2u) { r = a | b; }
+            else if (kind == 3u) { r = a ^ b; }
+            else if (kind == 4u) { r = ~a; }
+            else if (kind == 5u) { r = (a & c) | ((~a) & b); }
+            wires[ow] = r;
+        }
+        for (var b : u32 = 0u; b < out0_w; b = b + 1u) {
+            let ow_id = min(arena_read_u32(17u, b), 511u);
+            g_out[b] = wires[ow_id];
+        }
+
+        // Pass B: Stuck-at-(0|1) fault injection at fault_wire
+        wires[0] = 0u;
+        wires[1] = 0xFFFFFFFFu;
+        for (var k : u32 = 0u; k < num_in_bits; k = k + 1u) {
+            let spec = arena_read_u32(1u, k);
+            let dst = (spec >> 16u) & 0x1FFu;
+            let src_bit = spec & 0xFFu;
+            var wv : u32 = 0u;
+            if ((spec & 0x80000000u) != 0u) {
+                wv = bs_input_plane(src_bit, gpack, seed_lo, seed_hi);
+            } else {
+                wv = select(0u, 0xFFFFFFFFu, (src_bit & 1u) != 0u);
+            }
+            if (dst == fault_wire) { wv = stuck_val; }
+            wires[dst] = wv;
+        }
+        for (var g : u32 = 0u; g < num_gates; g = g + 1u) {
+            let gt = mesh_read_vec4(g);
+            let kind = gt.x & 0xFFFFu;
+            let ow = (gt.x >> 16u) & 0x1FFu;
+            let a = wires[gt.y & 0x1FFu];
+            let b = wires[gt.z & 0x1FFu];
+            let c = wires[gt.w & 0x1FFu];
+            var r : u32 = 0u;
+            if (kind == 1u) { r = a & b; }
+            else if (kind == 2u) { r = a | b; }
+            else if (kind == 3u) { r = a ^ b; }
+            else if (kind == 4u) { r = ~a; }
+            else if (kind == 5u) { r = (a & c) | ((~a) & b); }
+            if (ow == fault_wire) { r = stuck_val; }
+            wires[ow] = r;
+        }
+
+        var diff_mask : u32 = 0u;
+        for (var b : u32 = 0u; b < out0_w; b = b + 1u) {
+            let ow_id = min(arena_read_u32(17u, b), 511u);
+            diff_mask = diff_mask | (wires[ow_id] ^ g_out[b]);
+        }
+        diff_mask = diff_mask & valid_mask;
+        if (diff_mask != 0u) {
+            detect_acc = detect_acc + countOneBits(diff_mask);
+            let cand = local_pack * 32u + countTrailingZeros(diff_mask);
+            if (cand < first_vec) {
+                first_vec = cand;
+            }
+        }
+    }
+
+    rc_buf[tid] = vec4<f32>(
+        bitcast<f32>(first_vec),
+        bitcast<f32>(detect_acc),
+        bitcast<f32>(fault_wire),
+        bitcast<f32>(tid & 1u)
+    );
+}
+
+// ============================================================================
+// 9. GPU All-Pairs 4-Bit x 64-Perm Structural Similarity / NCD Matrix
+// ============================================================================
+
+fn rc_read_vec4_u32(idx : u32) -> vec4<u32> {
+    let f = rc_buf[idx];
+    return vec4<u32>(bitcast<u32>(f.x), bitcast<u32>(f.y), bitcast<u32>(f.z), bitcast<u32>(f.w));
+}
+
+fn swar_nibble_eq(a : u32, b : u32) -> u32 {
+    let x = a ^ b;
+    let nz = (x | (x >> 1u) | (x >> 2u) | (x >> 3u)) & 0x11111111u;
+    return 8u - countOneBits(nz);
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn bloom_info_sim_matrix(@builtin(global_invocation_id) gid : vec3<u32>) {
+    if (gid.x == 0xFFFFFFFFu) { textureStore(out_tex, vec2<i32>(0, 0), vec4<f32>(0.0)); }
+    let i = gid.x;
+    let h0 = arena[0].q0;
+    let num_files   = min(h0.y, 8192u);
+    let thr_matches = min(h0.z, 64u);
+
+    if (h0.x != 0x494E4653u || i >= num_files) {
+        return;
+    }
+
+    let a_lo = rc_read_vec4_u32(i * 2u + 0u);
+    let a_hi = rc_read_vec4_u32(i * 2u + 1u);
+
+    var best_j    : u32 = i;
+    var best_m    : u32 = 0u;
+    var near_cnt  : u32 = 0u;
+    var exact_cnt : u32 = 0u;
+
+    for (var j : u32 = 0u; j < num_files; j = j + 1u) {
+        if (j == i) { continue; }
+        let b_lo = rc_read_vec4_u32(j * 2u + 0u);
+        let b_hi = rc_read_vec4_u32(j * 2u + 1u);
+
+        let m = swar_nibble_eq(a_lo.x, b_lo.x) +
+                swar_nibble_eq(a_lo.y, b_lo.y) +
+                swar_nibble_eq(a_lo.z, b_lo.z) +
+                swar_nibble_eq(a_lo.w, b_lo.w) +
+                swar_nibble_eq(a_hi.x, b_hi.x) +
+                swar_nibble_eq(a_hi.y, b_hi.y) +
+                swar_nibble_eq(a_hi.z, b_hi.z) +
+                swar_nibble_eq(a_hi.w, b_hi.w);
+
+        if (m > best_m || (best_j == i && m == 0u)) {
+            best_m = m;
+            best_j = j;
+        }
+        if (m >= thr_matches) {
+            near_cnt = near_cnt + 1u;
+        }
+        if (m == 64u) {
+            exact_cnt = exact_cnt + 1u;
+        }
+    }
+
+    rc_buf[24576u + i] = vec4<f32>(
+        bitcast<f32>(best_j),
+        bitcast<f32>(best_m),
+        bitcast<f32>(near_cnt),
+        bitcast<f32>(exact_cnt)
+    );
+}

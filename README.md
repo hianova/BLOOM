@@ -1,6 +1,6 @@
 # BLOOM v9.0.0 — Zero-Noise Radiance Cascades, 2-Jet Differential Field, Modal DSP, Concentric Shells, Time-Rewind & Geodesic Cinema Engine
 
-**AOT Lean 4 Formal Compiler & React-Native Flexbox DSL (`0` Local Theorems / Upstream [`FLOW v9.0.0`](https://github.com/hianova/FLOW), `0 sorryAx`, `0 lean -c`, `0` External Test Files) → Sealed `16KB` `.bloom` Container (`BLM7` / `BLOMIMG7`) + Auxiliary `32KB` `BloomMeshArena` → Standalone Zero-Lean-Runtime Pure C17 Native Studio & CLI (`build/bloom`) + Pure-GPR / Zero-Float / Zero-Heap / Zero-`blr` C17 Core (`libbloom.a`) + 3-Pass Zero-Noise 3D Radiance Cascades GI (`524KB` `rc_buf` + Temporal Scene-Dirty Cache) + Warp-Scale `FIR1` GPU Witness Hunter, 32-Way Bit-Sliced Accelerator & AOT `.fir → Straight-Line WGSL` Compiler (up to `34.34 B_evals/s` on `chisholm.fir` / `192.22 B_evals/s` on `contract-loophole.fir`, Apple M1) + GPU Parallel `SEARU` Multi-Universe Solver (`8,192` universes, WalkSAT/Min-Conflicts + CLZ Lévy-Flight + Replica Exchange) + Zero-Texture 2-Jet Differential Geometry Field (`BloomFieldJet64`) + Zero-WAV 48 kHz Modal Physical-Modeling DSP (`BloomAudioRig`, `576B`) + Sub-Frame (`20.8 μs`) Swept-CCD & Huygens Shockwave + Concentric SDF Gameplay Shells / `-18dB` Hitstop Contrast (`BloomGameplayState64`) + $O(1)$ `16KB` Arena & `576B` AudioRig Circular Spacetime Rewind (`BloomSpacetimeSnap`, `16,960B`) + Relativistic Geodesic Lensing & Lorentz Doppler (`BloomMetricScale64`) + Anamorphic `2.39:1` `CineCamera` & CMX 3600 `.edl` Export + Pure-GPR Moodboard-to-SSOT Compiler (`BloomMoodboard64`) + Standalone WebGPU `.html` & Kitty TTY Egress + Symbiotic `SEARU × FLOW 2-Jet` + C++20 `64B` ABI Gate (`35` Cells) + 7-Entrypoint `WGSL` Compute Shader (`naga` → `SPIR-V` + `MSL 2.4`) & `36 / 36` (`100.0%`) `FLOW v9.0.0` Shared C17 Source-Level Sabotage Audit.**
+**AOT Lean 4 Formal Compiler & React-Native Flexbox DSL (`0` Local Theorems / Upstream [`FLOW v9.0.0`](https://github.com/hianova/FLOW), `0 sorryAx`, `0 lean -c`, `0` External Test Files) → Sealed `16KB` `.bloom` Container (`BLM7` / `BLOMIMG7`) + Auxiliary `32KB` `BloomMeshArena` → Standalone Zero-Lean-Runtime Pure C17 Native Studio & CLI (`build/bloom`) + Pure-GPR / Zero-Float / Zero-Heap / Zero-`blr` C17 Core (`libbloom.a`) + 3-Pass Zero-Noise 3D Radiance Cascades GI (`524KB` `rc_buf` + Temporal Scene-Dirty Cache) + Warp-Scale `FIR1` GPU Witness Hunter, 32-Way Bit-Sliced Accelerator & AOT `.fir → Straight-Line WGSL` Compiler (up to `34.34 B_evals/s` on `chisholm.fir` / `192.22 B_evals/s` on `contract-loophole.fir`, Apple M1) + GPU Parallel `SEARU` Multi-Universe Solver (`8,192` universes, WalkSAT/Min-Conflicts + CLZ Lévy-Flight + Replica Exchange) + GPU Stuck-at-0/1 RTL Fault Simulator & Formal Equivalence Miter (`ELE` AES GF(256)/LUT5 `100.00%` fault coverage & exhaustive equivalence in `2.5–5.5ms`) + GPU All-Pairs `4-bit × 64-Perm` b-bit MinHash / NCD Matrix (`942.54 M_pairs/s`, `3,721` files / `6.92M` pairs in `7.34ms`) + Zero-Texture 2-Jet Differential Geometry Field (`BloomFieldJet64`) + Zero-WAV 48 kHz Modal Physical-Modeling DSP (`BloomAudioRig`, `576B`) + Sub-Frame (`20.8 μs`) Swept-CCD & Huygens Shockwave + Concentric SDF Gameplay Shells / `-18dB` Hitstop Contrast (`BloomGameplayState64`) + $O(1)$ `16KB` Arena & `576B` AudioRig Circular Spacetime Rewind (`BloomSpacetimeSnap`, `16,960B`) + Relativistic Geodesic Lensing & Lorentz Doppler (`BloomMetricScale64`) + Anamorphic `2.39:1` `CineCamera` & CMX 3600 `.edl` Export + Pure-GPR Moodboard-to-SSOT Compiler (`BloomMoodboard64`) + Standalone WebGPU `.html` & Kitty TTY Egress + Symbiotic `SEARU × FLOW 2-Jet` + C++20 `64B` ABI Gate (`35` Cells) + 9-Entrypoint `WGSL` Compute Shader (`naga` → `SPIR-V` + `MSL 2.4`) & `36 / 36` (`100.0%`) `FLOW v9.0.0` Shared C17 Source-Level Sabotage Audit.**
 
 ---
 
@@ -34,8 +34,9 @@ Just as [`FLOW v9.0.0`](https://github.com/hianova/FLOW) uses `Flow.lean` strict
   │      • `.bloom`/`.stl`/`.glb` + `--cine`, `--metric phi,beta`, `--shells`, │
   │        `--rewind N`, `--import-mood`, `--export-html`, `--edl-out`, `--kitty│
   │      • `--emit-fir` / `--hunt-fir` / `--bitslice` / `--compile-fir-wgsl` /   │
-  │        `--aot-shader` (`FIR1` GPU witness hunter) + `--verify-cpu`         │
+  │        `--aot-shader` / `--faultsim-fir` / `--equiv-fir` + `--verify-cpu`  │
   │      • `--searu-cnf` / `--searu-bench-3sat` / `--searu-bench-color`        │
+  │      • `--gpu-ncd <dirs>` (all-pairs MinHash/NCD clone & drift radar)      │
   │    - `libbloom.a` (`-mgeneral-regs-only -fsanitize-trap=all`, 0 float/heap,│
   │      `0` `blr` indirect calls, `clang-tidy` 0 warnings across 6 C files):  │
   │      • Pillar 1 (`bloom_scene.c`): CSG, `.stl`/`.glb` BVH, DQ skeleton,    │
@@ -51,7 +52,7 @@ Just as [`FLOW v9.0.0`](https://github.com/hianova/FLOW) uses `Flow.lean` strict
                                         │ `SDL3 GPU`: `@group(0) b(0)` 16KB Arena
                                         │ + `b(1)` 32KB Mesh + `@group(1) b(1)` 524KB RC
   ┌─────────────────────────────────────▼──────────────────────────────────────┐
-  │ 3. 7-Entrypoint GPU Compute, 48kHz Audio, HTML & TTY Host (WGSL + C17)     │
+  │ 3. 9-Entrypoint GPU Compute, 48kHz Audio, HTML & TTY Host (WGSL + C17)     │
   │    - `shaders/bloom_core.wgsl`: Sole authored shader SSOT (`0` u64/i64)    │
   │      • Pass 1..3: `bloom_rc_cascade2` (8×4×8×16) -> `bloom_rc_cascade1`    │
   │        (16×8×16×8) -> `bloom_rc_cascade0` (16×8×16×6) octahedral 3D GI     │
@@ -64,11 +65,12 @@ Just as [`FLOW v9.0.0`](https://github.com/hianova/FLOW) uses `Flow.lean` strict
   │      • Entrypoint 6: `bloom_fir1_bitslice` (32-way SIMT bit-sliced netlist)│
   │      • Entrypoint 7: `bloom_searu_solve` (8,192-universe Parallel Tempering│
   │        WalkSAT/Min-Conflicts + CLZ Levy-Flight + Replica Exchange solver)  │
+  │      • Entrypoint 8: `bloom_fir1_faultsim` (RTL Stuck-at-0/1 ATPG sim)     │
+  │      • Entrypoint 9: `bloom_info_sim_matrix` (SWAR 64-perm all-pairs NCD)  │
   │      ├─ `naga` build-time -> `build/bloom_core.spv`   (Vulkan SPIR-V)      │
   │      └─ `naga` build-time -> `build/bloom_core.metal` (Metal MSL 2.4)      │
-  │    - `src/bloom_gpu_host.c`: 7-pipeline `SDL3 GPU` + AOT `.fir -> WGSL`    │
-  │      compiler (`bloom_fir1_aot`) + `SDL_AudioStream`/WAV, CMX 3600 `.edl`, │
-  │      standalone zero-dep WebGPU `.html` & Kitty APC TTY                    │
+  │    - `src/bloom_gpu_host.c`: 9-pipeline `SDL3 GPU` + AOT `.fir -> WGSL`    │
+  │      compiler + Formal Equiv Miter + `SDL_AudioStream`/WAV, EDL, HTML, TTY │
   └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -83,6 +85,12 @@ Just as [`FLOW v9.0.0`](https://github.com/hianova/FLOW) uses `Flow.lean` strict
 - **GPU Parallel `SEARU` Multi-Universe Combinatorial Solver ([`bloom_searu_solve`](shaders/bloom_core.wgsl), [`bloom_gpu_searu_solve_3sat`](src/bloom_gpu_host.c), [`bloom_gpu_searu_solve_graph_color`](src/bloom_gpu_host.c))**: Executes up to `8,192` Parallel Tempering universes simultaneously with 1-pass WalkSAT/Min-Conflicts, CLZ Lévy-Flight Black Swan jumps, Kan-pin locking, and cross-round top-16 elite replica exchange, with **zero-trust Pure-GPR CPU certification** via `FLOW`'s `searu_eval_3sat` / `searu_eval_graph_color`. Measured on Apple M1 (`SDL3-GPU/metal`):
   - Planted dense 4-coloring (`64` nodes, `4` colors, `1,036` edges, Kan-pinned): single-core CPU `searu_solve_graph_color` (`20,000` iters) stalled at **`best_e=49 (UNSOLVED)`**; GPU `bloom_searu_solve` (`4,096` universes, Round 1) found **`best_e=0 (SOLVED)` in `320.34ms`** (`3.04 M_steps/s`, `cpu_verified=EXACT`).
   - Critical-ratio 3-SAT (`250` vars, `1,065` clauses, ratio `4.26`, Kan-pinned): GPU `4,096` universes solved in Round 1 (`best_e=0, 262.65ms, 3.99 M_steps/s, cpu_verified=EXACT`; up to **`7.31 M_steps/s`** on `100` vars / `426` clauses vs CPU `328–642 k_steps/s`).
+- **GPU RTL Stuck-at-0/1 Fault Simulator & Formal Hardware Equivalence Miter ([`bloom_fir1_faultsim`](shaders/bloom_core.wgsl), [`bloom_gpu_faultsim_fir1`](src/bloom_gpu_host.c), [`bloom_gpu_equiv_fir1`](src/bloom_gpu_host.c))**: Simulates stuck-at-0/1 faults across every non-constant wire in parallel on 32 vectors/lane, and fuses `(spec.fir, impl.fir)` into a constant-folded XOR-OR miter for exhaustive/bounded equivalence verification with zero-trust CPU ATPG vector certification. Verified on real [`ELE`](../ELE) hardware & [`SOUND`](../SOUND) circuits (Apple M1 `SDL3-GPU/metal`):
+  - `ELE` AES S-Box equivalence `gf256_tower_a32.fir` vs `gf256_tower_d4.fir` (`332` miter gates, `256` exhaustive trials): **`EQUIVALENT` in `2.69ms`** (`cpu_verified=EXACT`); `lut5_bijection_spec.fir` (`32`-entry `LUT_ROM`) vs `lut5_bijection_opt.fir` (`97` miter gates, `32` exhaustive trials): **`EQUIVALENT` in `2.54ms`** (`cpu_verified=EXACT`).
+  - `ELE` Stuck-at-0/1 coverage: `gf256_tower_a32.fir` (`334` faults, `85,504` fault-evals) **`334/334 = 100.00%`** in `5.51ms` (`15.52 M_fevals/s`); `gf256_tower_d4.fir` **`332/332 = 100.00%`** in `5.28ms`; `lut5_bijection_opt.fir` **`72/72 = 100.00%`** in `2.21ms`; `SOUND` `chisholm.fir` (`65,536` vectors × `126` faults = `8.26M` fault-evals) **`46.64 M_fevals/s`** (`177.04ms`), all **`cpu_verified=EXACT`**.
+- **GPU All-Pairs `4-Bit × 64-Perm` b-bit MinHash / NCD Similarity Matrix ([`bloom_info_sim_matrix`](shaders/bloom_core.wgsl), [`bloom_gpu_info_sim_matrix`](src/bloom_gpu_host.c))**: Sketches each file via 5-byte OPH + Shrivastava densification into `256`-bit (`64 × 4-bit` uniform nibble) signatures and evaluates all $N(N-1)/2$ pairs via SWAR nibble equality (`--gpu-ncd`) in one GPU dispatch (`<= 8,192` files). Measured on Apple M1:
+  - **10-repo full workspace scan (`3,721` files / `6,921,060` pairs)**: **`7.34ms` (`942.54 M_pairs/s`)**, `cpu_verified=EXACT` (surfacing `168` vendored exact duplicates in `.venv`).
+  - **Authored core source scan across 10 repos (`161` files / `12,880` pairs)**: **`0.54ms` (`23.68 M_pairs/s`)**, **`0` clones above `36/64`** (`near_dup_files=0, exact_dup_pairs=0`), `cpu_verified=EXACT`.
 - **Zero-Texture 2-Jet Differential Geometry & Continuous Field**: [`bloom_scene_eval_jet2_q16`](src/bloom_scene.c) (`BloomFieldJet64`) and [`eval_diff_jet2`](shaders/bloom_core.wgsl) extract Mean Curvature $H$, Gaussian Curvature $K$, anisotropy, and tangent principal direction $\mathbf{e}_1$ directly from the analytical SDF for burnished ridges, crevice patina, and flow-aligned micro-grooves.
 - **Zero-WAV Pure-GPR Modal DSP (`576B` `BloomAudioRig`) + Sub-Frame Swept-CCD (`20.8 μs`)**: [`bloom_audio_step_frame64`](src/bloom_prefab.c) locks modal excitation to `(earliest_toi_q16 * 800) >> 16` (**`0` pre-TOI sample leakage**) alongside [`bloom_physics_step_arena64`](src/bloom_prefab.c) piecewise `(toi, 1 - toi)` rebound and Huygens contact wavefronts.
 - **v9.0.0 Concentric SDF Gameplay Shells, `-18dB` Hitstop Contrast & $O(1)$ Spacetime Rewind**: [`bloom_gameplay_step64`](src/bloom_prefab.c) (`BloomGameplayState64`) evaluates ordered `hurt < 0 < graze <= hit` shells, dual-threshold graze hysteresis (`hyst_enter <= hyst_exit`) for zero chatter, 6-frame input buffering with equal-and-opposite fulcrum momentum conservation, `-18dB` (`8231 / 65536`) hitstop silence before catharsis release (`4x` peak boom), and circular `64`-slot `BloomSpacetimeSnap` (`16,960B`) rewind via [`bloom_rewind_push`](src/bloom_prefab.c) / [`bloom_rewind_restore`](src/bloom_prefab.c).
@@ -140,17 +148,17 @@ BLOOM/
 │   ├── bloom_scene.h          # Pillar 1: CSG, .stl/.glb BVH, Section, DQ, Brick, 2-Jet, Metric, CineCamera, Moodboard
 │   ├── bloom_ui.h             # Pillar 2 (React Native): .svg, Flexbox, SEARU_SOLVE_INLINE UI, IME, LaTeX
 │   ├── bloom_prefab.h         # Pillar 3: Prefab SSOT, Swept-CCD, Gameplay Shells, 16KB Rewind, Modal DSP, FLOW v9.0.0
-│   ├── bloom_host.h           # Single-track C17 SDL3 GPU (7-pipeline + AOT FIR1 + GPU SEARU), WAV, EDL, HTML & Kitty ABI
+│   ├── bloom_host.h           # Single-track C17 SDL3 GPU (9-pipeline + AOT FIR1 + SEARU + FaultSim/Equiv + NCD), WAV, EDL, HTML & TTY ABI
 │   └── bloom.h                # Umbrella SDK header (BLOOM v9.0.0)
 ├── src/
 │   ├── bloom_scene.c          # Pure C17 (-mgeneral-regs-only, -fsanitize-trap=all, 0 float, 0 heap, 0 blr)
 │   ├── bloom_ui.c             # Pure C17 streamed SVG DFA, Flexbox/Bento, SEARU_SOLVE_INLINE, IME & LaTeX
 │   ├── bloom_prefab.c         # Pure C17 Prefab SSOT, Swept-CCD, Gameplay Shells, Rewind, Modal DSP & FLOW v9.0.0 IR/2-Jet
 │   ├── bloom_lean_jsi.c       # Lean 4 AOT JSI compiler bridge + 10 SEARU suites & GPU Dispatches 0..5 verifiers
-│   ├── bloom_gpu_host.c       # Pure C17 SDL3 GPU (RC C2/C1/C0 + Dirty Cache + Primary + FIR1 + BitSlice/AOT + SEARU)
-│   └── bloom_cli.c            # Standalone zero-Lean-runtime C17 Studio & CLI (--hunt-fir/--bitslice/--compile-fir-wgsl/--searu-*)
+│   ├── bloom_gpu_host.c       # Pure C17 SDL3 GPU (RC C2/C1/C0 + Dirty Cache + Primary + FIR1 + BitSlice/AOT + SEARU + FaultSim/Equiv + NCD)
+│   └── bloom_cli.c            # Standalone zero-Lean-runtime C17 Studio & CLI (--hunt-fir/--faultsim-fir/--equiv-fir/--searu-*/--gpu-ncd)
 ├── shaders/
-│   └── bloom_core.wgsl        # Sole authored WGSL compute kernel (7 entrypoints, 0 u64/i64 extensions, 0 workgroup globals)
+│   └── bloom_core.wgsl        # Sole authored WGSL compute kernel (9 entrypoints, 0 u64/i64 extensions, 0 workgroup globals)
 ├── specs/
 │   └── studio_inspector.svg   # Browser-previewable W3C .svg Studio UI blueprint (optional --watch-svg)
 ├── tools/
@@ -192,12 +200,15 @@ BLOOM/
   ./build/bloom --hunt-fir studio.fir --aot-shader studio_aot.wgsl --trials 1073741824 --hunt-mode neq --hunt-target 0
   ./build/bloom --searu-bench-3sat 250,1065 --universes 4096 --searu-iters 256 --searu-rounds 4 --verify-cpu
   ./build/bloom --searu-bench-color 64,4 --universes 4096 --searu-iters 256 --searu-rounds 4 --verify-cpu
+  ./build/bloom --equiv-fir ../ELE/build/gf256_tower_a32.fir ../ELE/build/gf256_tower_d4.fir --verify-cpu
+  ./build/bloom --faultsim-fir ../ELE/build/gf256_tower_a32.fir --trials 256 --verify-cpu
+  ./build/bloom --gpu-ncd src,include,../FLOW/core,../FLOW/sdk --top 10 --verify-cpu
   ```
 
 ### 4.3 Pure-GPR / Zero-Float / Zero-Heap / Zero-`blr` Core (`libbloom.a`) & `36 / 36` Sabotage Gate
 - **Hardware Trap & Pure-GPR ISA Purity (`libbloom.a`)**: [`src/bloom_scene.c`](src/bloom_scene.c), [`src/bloom_ui.c`](src/bloom_ui.c), and [`src/bloom_prefab.c`](src/bloom_prefab.c) compile with `-mgeneral-regs-only -fsanitize=signed-integer-overflow,shift-exponent,bounds,null,return,unreachable -fsanitize-trap=all`, audited by `Makefile` and [`tools/sabotage_check.py`](tools/sabotage_check.py) to contain **`0` FPU/SIMD instructions, `0` `blr` indirect branch-and-link calls, and `0` heap allocations**.
 - **Shared `FLOW v9.0.0` C17 Source-Level Sabotage (`36 / 36 = 100.0%`)**: Powered by `FLOW/sdk/tools/flow_sabotage_runner.py`, executes `36` single-fault source mutations across `bloom_scene.c` (`12/12`: `scene_algebra`, `scene_mesh_bvh`, `scene_cholesky_sdd`, `scene_metric_mood`), `bloom_ui.c` (`12/12`: `ui_flex_layout`, `ui_glass_searu`, `ui_latex_sdf`, `ui_utf8_ime`), and `bloom_prefab.c` (`12/12`: `prefab_flow_v9_sdk`, `prefab_ssot_trc`, `prefab_ccd_dsp`, `prefab_game_rewind`), achieving **`36 / 36` (`100.0%`)** kill rate with zero SDL3/GPU overhead.
-- **Single-Source 7-Entrypoint `WGSL` Compute Kernel ([`shaders/bloom_core.wgsl`](shaders/bloom_core.wgsl))**: Compiles via `naga` into both Vulkan `SPIR-V` (`build/bloom_core.spv`) and Apple Metal `MSL 2.4` (`build/bloom_core.metal`) with **zero** `u64`/`i64` tokens and **zero** `var<workgroup>` globals, uniting 3-pass Radiance Cascades GI (`bloom_rc_cascade2`/`1`/`0`), 2-Jet `eval_diff_jet2` curvature, relativistic geodesic lensing & photon ring, `2.39:1` thin-lens CoC DoF & blue anamorphic streak, concentric Graze/Hitstop HUD, CSG/BVH/DQ-Joint/SDF-Brick/Morton-Mesh SDF, 3D cross-sections, Huygens shockwave, vector SDF ASCII HUD, analytic LaTeX overlays, the 18-opcode Warp-Scale `"FIR1"` Witness Hunter (`bloom_fir1_hunt`), the 32-way SIMT Bit-Sliced Netlist Accelerator (`bloom_fir1_bitslice`), and the `8,192`-universe Parallel Tempering `SEARU` Solver (`bloom_searu_solve`).
+- **Single-Source 9-Entrypoint `WGSL` Compute Kernel ([`shaders/bloom_core.wgsl`](shaders/bloom_core.wgsl))**: Compiles via `naga` into both Vulkan `SPIR-V` (`build/bloom_core.spv`) and Apple Metal `MSL 2.4` (`build/bloom_core.metal`) with **zero** `u64`/`i64` tokens and **zero** `var<workgroup>` globals, uniting 3-pass Radiance Cascades GI (`bloom_rc_cascade2`/`1`/`0`), 2-Jet `eval_diff_jet2` curvature, relativistic geodesic lensing & photon ring, `2.39:1` thin-lens CoC DoF & blue anamorphic streak, concentric Graze/Hitstop HUD, CSG/BVH/DQ-Joint/SDF-Brick/Morton-Mesh SDF, 3D cross-sections, Huygens shockwave, vector SDF ASCII HUD, analytic LaTeX overlays, the 18-opcode Warp-Scale `"FIR1"` Witness Hunter (`bloom_fir1_hunt`), the 32-way SIMT Bit-Sliced Netlist Accelerator (`bloom_fir1_bitslice`), the `8,192`-universe Parallel Tempering `SEARU` Solver (`bloom_searu_solve`), the RTL Stuck-at-0/1 Fault Simulator (`bloom_fir1_faultsim`), and the All-Pairs MinHash / NCD Similarity Matrix (`bloom_info_sim_matrix`).
 
 ---
 

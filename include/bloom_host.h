@@ -136,6 +136,79 @@ bool bloom_gpu_searu_solve_graph_color(BloomGpuCtx *ctx,
                                        const BloomSearuGpuConfig *cfg,
                                        BloomSearuGpuResult *out);
 
+/* GPU Warp-Scale RTL Stuck-at-0/1 Fault Simulator & Equivalence Miter */
+typedef struct {
+    uint32_t total_wires;
+    uint32_t total_gates;
+    uint32_t total_faults;     /* 2 * (num_wires - 2): SA0 and SA1 per signal wire */
+    uint32_t detected_faults;
+    uint32_t undetected_faults;
+    uint32_t trials_per_fault;
+    uint64_t total_fault_evals;
+    uint64_t elapsed_us;
+    uint32_t sample_fault_wire;
+    uint32_t sample_stuck_val;
+    uint32_t sample_atpg_vec;
+    bool     cpu_verified;
+} BloomFir1FaultSimResult;
+
+bool bloom_gpu_faultsim_fir1(BloomGpuCtx *ctx,
+                             const uint8_t *fir_bytes,
+                             size_t fir_len,
+                             uint32_t num_trials,
+                             uint64_t seed,
+                             BloomFir1FaultSimResult *out);
+
+typedef struct {
+    uint32_t trials_evaluated;
+    uint32_t mismatch_count;
+    uint32_t first_mismatch_trial;
+    uint32_t miter_gates;
+    uint32_t total_in_bits;
+    uint64_t elapsed_us;
+    uint64_t cex_inputs[32];
+    uint64_t cex_out_a[32];
+    uint64_t cex_out_b[32];
+    bool     equivalent;
+    bool     exhaustive;
+    bool     cpu_verified;
+} BloomFir1EquivResult;
+
+bool bloom_gpu_equiv_fir1(BloomGpuCtx *ctx,
+                          const uint8_t *fir_a,
+                          size_t len_a,
+                          const uint8_t *fir_b,
+                          size_t len_b,
+                          uint32_t num_trials, /* 0 = auto exhaustive up to 2^24 */
+                          uint64_t seed,
+                          BloomFir1EquivResult *out);
+
+/* GPU All-Pairs 4-Bit x 64-Perm b-bit MinHash / Structural Similarity Matrix */
+typedef struct {
+    uint32_t best_match_idx;
+    uint32_t best_matches;   /* 0..64 matching 4-bit MinHash buckets */
+    uint32_t near_dup_count;
+    uint32_t exact_dup_count;
+} BloomInfoSimRow;
+
+typedef struct {
+    uint32_t num_files;
+    uint64_t total_pairs_eval;
+    uint32_t files_with_near_dup;
+    uint32_t exact_dup_pairs;
+    uint64_t elapsed_us;
+    bool     cpu_verified;
+} BloomInfoSimResult;
+
+void bloom_info_sketch_bytes(const uint8_t *data, size_t len, uint32_t out_sig8[8]);
+
+bool bloom_gpu_info_sim_matrix(BloomGpuCtx *ctx,
+                               const uint32_t *sigs_8xu32,
+                               uint32_t num_files,    /* 2..8192 */
+                               uint32_t thr_matches,  /* e.g. 36 (~53% Jaccard) */
+                               BloomInfoSimRow *out_rows,
+                               BloomInfoSimResult *out_summary);
+
 /* Dispatches GPU compute if !BLOOM_FLAG_IDLE_SLEEP or force_render == true */
 bool bloom_gpu_render(BloomGpuCtx *ctx, bool force_render);
 
