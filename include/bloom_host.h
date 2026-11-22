@@ -36,6 +36,46 @@ const char *bloom_gpu_device_name(const BloomGpuCtx *ctx);
 const char *bloom_gpu_driver_name(const BloomGpuCtx *ctx);
 uint32_t bloom_gpu_dispatch_count(const BloomGpuCtx *ctx);
 uint32_t bloom_gpu_idle_skip_count(const BloomGpuCtx *ctx);
+uint32_t bloom_gpu_rc_cache_hits(const BloomGpuCtx *ctx);
+
+/* Warp-scale FLOW "FIR1" parallel witness hunter & sweep engine */
+typedef enum {
+    BLOOM_FIR_HUNT_EQ = 0U,
+    BLOOM_FIR_HUNT_NEQ = 1U,
+    BLOOM_FIR_HUNT_SWEEP = 2U
+} BloomFir1HuntMode;
+
+typedef struct {
+    uint32_t num_trials;
+    uint32_t target_mode;
+    uint32_t sweep_mode; /* 0 = sequential, 1 = deterministic fmix32 PRNG */
+    uint32_t vary_input_mask;
+    uint32_t seed_lo;
+    uint32_t seed_hi;
+    uint32_t target_lo;
+    uint32_t target_hi;
+    uint64_t base_inputs[32];
+} BloomFir1HuntConfig;
+
+typedef struct {
+    uint32_t trials_evaluated;
+    uint32_t hit_count;
+    uint32_t first_hit_trial;
+    uint32_t num_inputs;
+    uint32_t num_outputs;
+    bool     found;
+    bool     cpu_verified;
+    uint64_t out0_xor_checksum;
+    uint64_t elapsed_us;
+    uint64_t witness_inputs[32];
+    uint64_t witness_outputs[32];
+} BloomFir1HuntResult;
+
+bool bloom_gpu_hunt_fir1(BloomGpuCtx *ctx,
+                         const uint8_t *fir_bytes,
+                         size_t fir_len,
+                         const BloomFir1HuntConfig *cfg,
+                         BloomFir1HuntResult *out);
 
 /* Dispatches GPU compute if !BLOOM_FLAG_IDLE_SLEEP or force_render == true */
 bool bloom_gpu_render(BloomGpuCtx *ctx, bool force_render);

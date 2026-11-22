@@ -1,5 +1,6 @@
 #include "bloom_scene.h"
 #include "bloom_prefab.h"
+#include "flow_cholesky_sdd.h"
 
 #include <limits.h>
 #include <string.h>
@@ -2269,16 +2270,16 @@ static int64_t sc_hess_proj_q16(const int32_t a[3],
                       -1024LL * BLOOM_Q16_ONE, 1024LL * BLOOM_Q16_ONE);
 }
 
-void bloom_scene_eval_jet2_q16(const BloomEngineArena *arena,
-                               const BloomMeshArena *opt_mesh,
-                               int64_t px_q16,
-                               int64_t py_q16,
-                               int64_t pz_q16,
-                               BloomFieldJet64 *out_jet) {
-    if (!out_jet) return;
-    memset(out_jet, 0, sizeof(*out_jet));
-    if (!arena) return;
-
+static void sc_eval_hessian3_q16(const BloomEngineArena *arena,
+                                 const BloomMeshArena *opt_mesh,
+                                 int64_t px_q16,
+                                 int64_t py_q16,
+                                 int64_t pz_q16,
+                                 int64_t *out_f0,
+                                 int64_t *out_glen,
+                                 int32_t out_n[3],
+                                 uint32_t *out_mid,
+                                 int64_t out_hmat[3][3]) {
     int64_t cx = sc_clamp64(px_q16, -SC_MAX_COORD_Q16 + 16384LL, SC_MAX_COORD_Q16 - 16384LL);
     int64_t cy = sc_clamp64(py_q16, -SC_MAX_COORD_Q16 + 16384LL, SC_MAX_COORD_Q16 - 16384LL);
     int64_t cz = sc_clamp64(pz_q16, -SC_MAX_COORD_Q16 + 16384LL, SC_MAX_COORD_Q16 - 16384LL);
@@ -2311,10 +2312,10 @@ void bloom_scene_eval_jet2_q16(const BloomEngineArena *arena,
     int64_t gx = (f_px - f_mx) * 8LL;
     int64_t gy = (f_py - f_my) * 8LL;
     int64_t gz = (f_pz - f_mz) * 8LL;
-    int64_t glen = sc_max64(sc_len3_q16(gx, gy, gz), 4096LL);
-
-    int32_t n[3];
-    sc_vec3_norm_q16(gx, gy, gz, n);
+    *out_f0 = f0;
+    *out_glen = sc_max64(sc_len3_q16(gx, gy, gz), 4096LL);
+    *out_mid = mid;
+    sc_vec3_norm_q16(gx, gy, gz, out_n);
 
     int64_t d2x = sc_clamp64(f_px - 2LL * f0 + f_mx, -0x0FFFFFFFLL, 0x0FFFFFFFLL);
     int64_t d2y = sc_clamp64(f_py - 2LL * f0 + f_my, -0x0FFFFFFFLL, 0x0FFFFFFFLL);
@@ -2330,11 +2331,28 @@ void bloom_scene_eval_jet2_q16(const BloomEngineArena *arena,
     int64_t hyz = sc_clamp64(dyz * 64LL, -BLOOM_MAX_Q16, BLOOM_MAX_Q16);
     int64_t hxz = sc_clamp64(dxz * 64LL, -BLOOM_MAX_Q16, BLOOM_MAX_Q16);
 
-    int64_t hmat[3][3] = {
-        { hxx, hxy, hxz },
-        { hxy, hyy, hyz },
-        { hxz, hyz, hzz }
-    };
+    out_hmat[0][0] = hxx; out_hmat[0][1] = hxy; out_hmat[0][2] = hxz;
+    out_hmat[1][0] = hxy; out_hmat[1][1] = hyy; out_hmat[1][2] = hyz;
+    out_hmat[2][0] = hxz; out_hmat[2][1] = hyz; out_hmat[2][2] = hzz;
+}
+
+void bloom_scene_eval_jet2_q16(const BloomEngineArena *arena,
+                               const BloomMeshArena *opt_mesh,
+                               int64_t px_q16,
+                               int64_t py_q16,
+                               int64_t pz_q16,
+                               BloomFieldJet64 *out_jet) {
+    if (!out_jet) return;
+    memset(out_jet, 0, sizeof(*out_jet));
+    if (!arena) return;
+
+    int64_t f0 = 0LL;
+    int64_t glen = 4096LL;
+    int32_t n[3] = { 0, BLOOM_Q16_ONE, 0 };
+    uint32_t mid = 0U;
+    int64_t hmat[3][3];
+    sc_eval_hessian3_q16(arena, opt_mesh, px_q16, py_q16, pz_q16,
+                         &f0, &glen, n, &mid, hmat);
 
     int32_t up_ref[3];
     if (sc_abs64((int64_t)n[1]) < 52000LL) {
@@ -2382,9 +2400,9 @@ void bloom_scene_eval_jet2_q16(const BloomEngineArena *arena,
     out_jet->grad_q16[0] = n[0];
     out_jet->grad_q16[1] = n[1];
     out_jet->grad_q16[2] = n[2];
-    out_jet->hess_diag_q16[0] = (int32_t)hxx;
-    out_jet->hess_diag_q16[1] = (int32_t)hyy;
-    out_jet->hess_diag_q16[2] = (int32_t)hzz;
+    out_jet->hess_diag_q16[0] = (int32_t)hmat[0][0];
+    out_jet->hess_diag_q16[1] = (int32_t)hmat[1][1];
+    out_jet->hess_diag_q16[2] = (int32_t)hmat[2][2];
     out_jet->mean_curv_q16 = sc_clamp64_to_i32((s11 + s22) / 2LL);
     out_jet->gauss_curv_q16 = sc_clamp64_to_i32(((s11 * s22) - (s12 * s12)) >> 16);
     out_jet->prin_dir_q16[0] = e1[0];
@@ -2393,6 +2411,75 @@ void bloom_scene_eval_jet2_q16(const BloomEngineArena *arena,
     out_jet->anisotropy_q16 = sc_clamp64_to_i32(aniso);
     out_jet->matter_id = mid;
     sc_stamp_mac(out_jet, 0x4E720064ULL, &out_jet->mac_lo32, &out_jet->mac_hi32);
+}
+
+bool bloom_scene_certify_hessian_psd_q16(const BloomEngineArena *arena,
+                                         const BloomMeshArena *opt_mesh,
+                                         int64_t px_q16,
+                                         int64_t py_q16,
+                                         int64_t pz_q16,
+                                         int64_t reg_diag_q16,
+                                         int64_t *out_mu_psd_q32) {
+    if (out_mu_psd_q32) {
+        *out_mu_psd_q32 = -1LL;
+    }
+    if (!arena) return false;
+
+    int64_t f0 = 0LL;
+    int64_t glen = 4096LL;
+    int32_t n[3] = { 0, BLOOM_Q16_ONE, 0 };
+    uint32_t mid = 0U;
+    int64_t hmat[3][3];
+    sc_eval_hessian3_q16(arena, opt_mesh, px_q16, py_q16, pz_q16,
+                         &f0, &glen, n, &mid, hmat);
+
+    const int64_t bound_q16 = 1024LL * BLOOM_Q16_ONE;
+    int64_t reg = sc_clamp64(reg_diag_q16, -bound_q16, bound_q16);
+    int64_t A[9];
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            int64_t hij = sc_clamp64(hmat[i][j], -bound_q16, bound_q16);
+            int64_t aij_q16 = sc_clamp64(hij + ((i == j) ? reg : 0LL), -2LL * bound_q16, 2LL * bound_q16);
+            A[i * 3 + j] = aij_q16 * 65536LL;
+        }
+    }
+
+    int64_t L[9];
+    memset(L, 0, sizeof(L));
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j <= i; ++j) {
+            flow_i128 acc = (flow_i128)A[i * 3 + j];
+            for (int k = 0; k < j; ++k) {
+                acc -= (flow_i128)L[i * 3 + k] * (flow_i128)L[j * 3 + k];
+            }
+            if (i == j) {
+                if (acc > 0) {
+                    uint64_t r = flow_isqrt_round_u128((flow_u128)acc);
+                    if (r > 0ULL && ((flow_u128)r * (flow_u128)r) > (flow_u128)acc) {
+                        --r;
+                    }
+                    L[i * 3 + i] = (int64_t)r;
+                } else {
+                    L[i * 3 + i] = 0LL;
+                }
+            } else if (L[j * 3 + j] > 0LL) {
+                int64_t s64 = (acc > (flow_i128)INT64_MAX) ? INT64_MAX
+                            : (acc < (flow_i128)INT64_MIN) ? INT64_MIN
+                            : (int64_t)acc;
+                L[i * 3 + j] = s64 / L[j * 3 + j];
+            }
+        }
+    }
+
+    int64_t mu_floor = 0LL;
+    if (flow_cholesky_sdd_floor_i64(3, 3, A, L, &mu_floor) != 0 ||
+        flow_verify_cholesky_sdd_i64(3, 3, A, L, mu_floor) != 0) {
+        return false;
+    }
+    if (out_mu_psd_q32) {
+        *out_mu_psd_q32 = mu_floor;
+    }
+    return mu_floor >= 0LL;
 }
 
 bool bloom_scene_raycast_ex64(BloomEngineArena *arena,

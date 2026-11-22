@@ -6,6 +6,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#if !defined(FLOW_VERSION_MAJOR) || (FLOW_VERSION_MAJOR < 9)
+#error "BLOOM requires FLOW v9.0.0 or newer (FLOW_VERSION_MAJOR >= 9)"
+#endif
+FLOW_SCHEMA_STATIC_ASSERT(FLOW_VERSION_MAJOR >= 9U,
+                          "BLOOM requires FLOW v9.0.0+ substrate");
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -50,7 +56,7 @@ extern "C" {
 
 #define BLOOM_FLOW_CHART_MASK 15ULL
 
-/* Dedicated FLOW v8.0.0 State Channel Assignments within [0..31] */
+/* Dedicated FLOW v9.0.0 State Channel Assignments within [0..31] */
 #define BLOOM_FLOW_CH_CAM_YAW     0U
 #define BLOOM_FLOW_CH_CAM_PITCH   1U
 #define BLOOM_FLOW_CH_CAM_DIST    2U
@@ -60,7 +66,7 @@ extern "C" {
 #define BLOOM_FLOW_CH_SCROLL      21U
 #define BLOOM_FLOW_CH_PREFAB0     22U /* 22..31: Prefab / App Dynamical States */
 
-/* Dedicated FLOW v7.0.1 Chart Indices within [0..15] */
+/* Dedicated FLOW v9.0.0 Chart Indices within [0..15] */
 #define BLOOM_CHART_UI_SPRING     0U
 #define BLOOM_CHART_UI_SCRUB      1U
 #define BLOOM_CHART_CAMERA_RIG    2U

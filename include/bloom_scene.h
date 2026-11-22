@@ -228,7 +228,7 @@ void bloom_matter_eval_radiance_q16(const BloomMatter64 *matter,
 void bloom_matter_format_hex128(const BloomMatter64 *matter, char out_hex129[129]);
 bool bloom_matter_parse_hex128(const char *hex128, BloomMatter64 *out_matter);
 
-/* 6. Thin-Lens Physical Orbit Camera (FLOW v7.0.1 Driven) & 3D Raycaster */
+/* 6. Thin-Lens Physical Orbit Camera (FLOW v9.0.0 Driven) & 3D Raycaster */
 void bloom_camera_init64(BloomCamera64 *cam,
                          int32_t yaw_q16,
                          int32_t pitch_q16,
@@ -257,6 +257,15 @@ void bloom_scene_eval_jet2_q16(const BloomEngineArena *arena,
                                int64_t py_q16,
                                int64_t pz_q16,
                                BloomFieldJet64 *out_jet);
+
+/* 2-Jet 3x3 SDF Hessian Cholesky+SDD Positive-Semidefinite Certificate (FLOW v9.0.0) */
+bool bloom_scene_certify_hessian_psd_q16(const BloomEngineArena *arena,
+                                         const BloomMeshArena *opt_mesh,
+                                         int64_t px_q16,
+                                         int64_t py_q16,
+                                         int64_t pz_q16,
+                                         int64_t reg_diag_q16,
+                                         int64_t *out_mu_psd_q32);
 
 /* 7. Dimensionless Relativistic Metric, CineCamera Composer & Moodboard SSOT Compiler */
 void bloom_metric_eval_scale64(int32_t beta_q16,

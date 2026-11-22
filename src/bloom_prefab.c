@@ -1,6 +1,7 @@
 #include "bloom_prefab.h"
 #include "bloom_scene.h"
 #include "bloom_ui.h"
+#include "flow_sha256.h"
 #include "searu.h"
 
 #include <limits.h>
@@ -10,7 +11,7 @@
  * ============================================================================
  * Pillar 3 ("Prefab SSOT"): Reusable 64B Blueprints, Live Non-Destructive
  * Overrides, Revert-to-SSOT, X-Ray Cutaway, Wave64 LOD, TRC Guard, Swept-CCD
- * & Coupled Thermal Physics + FLOW v8.0.0
+ * & Coupled Thermal Physics + FLOW v9.0.0
  * ============================================================================
  */
 
@@ -457,7 +458,7 @@ void bloom_arena_init_default(BloomEngineArena *arena, uint32_t width_px, uint32
         flow_arena_publish_bound(charts, c, BLOOM_FLOW_CHART_MASK, 1U, tmp);
     }
 
-    /* Initialize 32 FLOW v7.0.1 State Channels */
+    /* Initialize 32 FLOW v9.0.0 State Channels */
     const BloomCamera64 *cam = &arena->cells[BLOOM_SLOT_CAMERA].camera;
     pf_pack_flow_state(arena->cells[BLOOM_SLOT_FLOW_STATE_BASE + BLOOM_FLOW_CH_CAM_YAW].u64,
                        cam->orbit_yaw_q16, BLOOM_CHART_CAMERA_RIG, 0U);
@@ -1355,6 +1356,84 @@ bool bloom_image_verify_arena(const BloomEngineArena *arena) {
     uint64_t mk = pf_merkle_arena(arena);
     return (im->merkle_lo32 == (uint32_t)(mk & 0xFFFFFFFFULL)) &&
            (im->merkle_hi32 == (uint32_t)(mk >> 32ULL));
+}
+
+void bloom_arena_sha256_hex(const BloomEngineArena *arena, char out_hex65[65]) {
+    if (!out_hex65) return;
+    if (!arena) {
+        out_hex65[0] = '\0';
+        return;
+    }
+    flow_sha256_bytes_hex(arena, sizeof(*arena), out_hex65);
+}
+
+void bloom_mesh_sha256_hex(const BloomMeshArena *mesh, char out_hex65[65]) {
+    if (!out_hex65) return;
+    if (!mesh) {
+        out_hex65[0] = '\0';
+        return;
+    }
+    flow_sha256_bytes_hex(mesh, sizeof(*mesh), out_hex65);
+}
+
+static void pf_set_ir_input(flow_ir_prog_t *p, uint32_t idx, uint16_t width, const char *name) {
+    p->inputs[idx] = idx;
+    p->vals[idx].width = width;
+    p->vals[idx].is_classical = 0U;
+    for (size_t i = 0U; i < 24U; ++i) {
+        p->vals[idx].name[i] = '\0';
+    }
+    for (size_t i = 0U; i < 23U && name[i] != '\0'; ++i) {
+        p->vals[idx].name[i] = name[i];
+    }
+}
+
+bool bloom_fir_certify_arena_contracts(flow_ir_builder_ws_t *ws,
+                                       uint32_t *out_mult_bits,
+                                       uint32_t *out_mult_depth,
+                                       size_t *out_wire_len) {
+    if (!ws) return false;
+    flow_ir_builder_init(ws, "bloom_arena_qtt");
+    flow_ir_prog_t *p = &ws->ir_prog;
+    p->num_inputs = 4U;
+    p->num_vals = 4U;
+    pf_set_ir_input(p, 0U, 16U, "slot");
+    pf_set_ir_input(p, 1U, 16U, "mode_cur");
+    pf_set_ir_input(p, 2U, 16U, "mode_req");
+    pf_set_ir_input(p, 3U, 1U, "kan_pin");
+
+    uint32_t c_slot_mask = flow_ir_emit_const(p, 16U, UINT64_C(0x00FF), "c_slot_mask");
+    uint32_t slot_safe   = flow_ir_emit_op2(p, FLOW_IR_OP_AND_VEC, 16U, 0U, c_slot_mask, "slot_safe");
+    uint32_t c_hi_u8     = flow_ir_emit_const(p, 16U, UINT64_C(0xFF00), "c_hi_u8");
+    uint32_t slot_hi     = flow_ir_emit_op2(p, FLOW_IR_OP_AND_VEC, 16U, slot_safe, c_hi_u8, "slot_hi");
+    uint32_t slot_ok     = flow_ir_emit_op1(p, FLOW_IR_OP_EQ_ZERO, 1U, slot_hi, 0ULL, "slot_ok");
+
+    uint32_t c_one     = flow_ir_emit_const(p, 16U, UINT64_C(1), "c_one");
+    uint32_t c_hi_mode = flow_ir_emit_const(p, 16U, UINT64_C(0xFFFE), "c_hi_mode");
+    uint32_t cur_b0    = flow_ir_emit_op2(p, FLOW_IR_OP_AND_VEC, 16U, 1U, c_one, "cur_b0");
+    uint32_t req_b0    = flow_ir_emit_op2(p, FLOW_IR_OP_AND_VEC, 16U, 2U, c_one, "req_b0");
+    uint32_t req_hi    = flow_ir_emit_op2(p, FLOW_IR_OP_AND_VEC, 16U, 2U, c_hi_mode, "req_hi");
+    uint32_t pin_b0    = flow_ir_emit_op1(p, FLOW_IR_OP_SLICE, 1U, 3U, 0ULL, "pin_b0");
+    uint32_t next_b0   = flow_ir_emit_sel(p, 16U, pin_b0, req_b0, cur_b0, "next_b0");
+    uint32_t next_mode = flow_ir_emit_op2(p, FLOW_IR_OP_XOR_VEC, 16U, req_hi, next_b0, "next_mode");
+
+    if (slot_ok == UINT32_MAX || next_mode == UINT32_MAX) {
+        return false;
+    }
+    p->outputs[0] = slot_safe;
+    p->outputs[1] = next_mode;
+    p->outputs[2] = slot_ok;
+    p->num_outputs = 3U;
+
+    if (!flow_ir_builder_seal(ws)) {
+        return false;
+    }
+
+    ws->ir_eval_ok = ws->ir_linear_ok && ws->ir_unitary_ok;
+    if (out_mult_bits) *out_mult_bits = ws->mult_bits;
+    if (out_mult_depth) *out_mult_depth = ws->mult_depth;
+    if (out_wire_len) *out_wire_len = ws->wire_len;
+    return ws->ir_eval_ok;
 }
 
 void bloom_gameplay_init64(BloomGameplayState64 *gp,

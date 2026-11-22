@@ -11,7 +11,7 @@
  * ============================================================================
  * Pillar 2 ("React Native"): Declarative SVG Compiler, Zero-VDOM Flexbox /
  * Auto-Bento Layout, Wave64 Dual-Culling, Pointer Capture, IME & LaTeX SDF
- * Zero FloatOps | Zero Heap Allocations | FLOW v7.0.1 + SEARU Native Physics
+ * Zero FloatOps | Zero Heap Allocations | FLOW v9.0.0 + SEARU Native Physics
  * ============================================================================
  */
 
@@ -708,7 +708,7 @@ int32_t bloom_ui_eval_glass_transmittance_q16(uint32_t fill_rgb24, int32_t bevel
     return ui_clamp32(BLOOM_Q16_ONE - (int32_t)atten, 4096, BLOOM_Q16_ONE);
 }
 
-/* 5. Wave64 Hit-Testing, Pointer Capture, Zero-BLR SEARU Solver & FLOW v7.0.1 Tactile Springs */
+/* 5. Wave64 Hit-Testing, Pointer Capture, Zero-BLR SEARU Solver & FLOW v9.0.0 Tactile Springs */
 uint32_t bloom_ui_step_pointer_arena(BloomEngineArena *arena,
                                      int32_t cursor_x_q16,
                                      int32_t cursor_y_q16,
@@ -806,7 +806,7 @@ uint32_t bloom_ui_step_pointer_arena(BloomEngineArena *arena,
             }
         }
 
-        /* Drive UI Node's 2-Jet tactile spring via FLOW v7.0.1 flow_step_atlas!
+        /* Drive UI Node's 2-Jet tactile spring via FLOW v9.0.0 flow_step_atlas!
            Target equilibrium: normal=65536 (1.0x), hovered=72089 (1.10x), active=60293 (0.92x) */
         int64_t target_scale = BLOOM_Q16_ONE;
         if ((nd->style_and_state & BLOOM_UI_STATE_ACTIVE_BIT) != 0U) {

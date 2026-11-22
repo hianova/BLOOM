@@ -2,6 +2,7 @@
 #define BLOOM_PREFAB_H
 
 #include "bloom_abi.h"
+#include "flow_ir_builder.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -103,7 +104,7 @@ uint32_t bloom_prefab_cull_wave64(const BloomPrefabInst64 *instances,
                                   BloomPrefabInst64 *out_compacted,
                                   uint64_t *out_active_mask);
 
-/* 6. FLOW v8.0.0 Arena Init, @swap Safe Chart Switch, SEARU Heal, Swept-CCD & Full Frame Step */
+/* 6. FLOW v9.0.0 Arena Init, @swap Safe Chart Switch, SEARU Heal, Swept-CCD & Full Frame Step */
 typedef struct {
     int64_t  db0_q16;
     int64_t  db1_q16;
@@ -188,9 +189,17 @@ bool bloom_rewind_restore(BloomRewindCtrl64 *ctrl,
                           BloomEngineArena *out_arena,
                           BloomAudioRig *out_audio);
 
-/* 7. Unified .bloom 64B Container Export / Validate (Zero-Parse Mmap Ready) */
+/* 7. Unified .bloom 64B Container Export / Validate (Zero-Parse Mmap Ready) & FLOW v9.0.0 SHA-256 / FIR */
 void bloom_image_seal_arena(BloomEngineArena *arena);
 bool bloom_image_verify_arena(const BloomEngineArena *arena);
+
+void bloom_arena_sha256_hex(const BloomEngineArena *arena, char out_hex65[65]);
+void bloom_mesh_sha256_hex(const BloomMeshArena *mesh, char out_hex65[65]);
+
+bool bloom_fir_certify_arena_contracts(flow_ir_builder_ws_t *ws,
+                                       uint32_t *out_mult_bits,
+                                       uint32_t *out_mult_depth,
+                                       size_t *out_wire_len);
 
 #ifdef __cplusplus
 }

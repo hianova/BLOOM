@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "bloom.h"
+#include "flow_ir_io.h"
+#include "flow_sha256_io.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -34,6 +36,15 @@ typedef struct {
     const char *import_mood_path;
     const char *export_html_path;
     const char *out_edl_path;
+    const char *out_fir_path;
+    const char *hunt_fir_path;
+    uint32_t    hunt_trials;
+    uint32_t    hunt_mode;
+    uint32_t    hunt_vary_mask;
+    uint64_t    hunt_seed;
+    uint64_t    hunt_target;
+    bool        hunt_prng;
+    bool        verify_cpu;
     uint32_t    override_w;
     uint32_t    override_h;
     uint32_t    steps;
@@ -48,6 +59,7 @@ typedef struct {
     bool        set_slab;
     bool        set_corner;
     bool        inspect_cae;
+    bool        emit_sha256;
     bool        enable_rc;
     bool        enable_field;
     bool        enable_cine;
@@ -90,6 +102,15 @@ static void cli_stamp_mac(void *block64, uint64_t seed, uint32_t *out_lo, uint32
     uint64_t mac = bloom_hash56_fnv1a(block64, seed);
     *out_lo = (uint32_t)(mac & 0xFFFFFFFFULL);
     *out_hi = (uint32_t)(mac >> 32ULL);
+}
+
+static bool cli_parse_u64(const char *s, uint64_t *out_val) {
+    if (!s || s[0] == '\0' || !out_val) return false;
+    char *endp = NULL;
+    unsigned long long v = strtoull(s, &endp, 0);
+    if (!endp || *endp != '\0') return false;
+    *out_val = (uint64_t)v;
+    return true;
 }
 
 static bool cli_parse_u32(const char *s, uint32_t *out_val) {
@@ -176,6 +197,16 @@ static void cli_print_usage(const char *prog) {
     printf("  --import-mood <in.ppm> Compile P6 PPM moodboard into 64B Style & Prefab SSOT\n");
     printf("  --export-html <out.html> Bundle 16KB Arena + WGSL into single-file WebGPU HTML\n");
     printf("  --edl-out <out.edl>    Write 24fps CMX 3600 storyboard EDL reel\n");
+    printf("  --emit-fir <out.fir>   Certify and export QTT Linear/Unitary FLOW v9.0.0 .fir witness\n");
+    printf("  --hunt-fir <in.fir>    Run GPU warp-scale FLOW FIR1 evaluator & witness hunter\n");
+    printf("  --trials <N>           Number of GPU FIR1 trials to evaluate (default: 65536)\n");
+    printf("  --hunt-seed <u64>      Initial 64-bit sweep/PRNG seed for --hunt-fir\n");
+    printf("  --hunt-mode <m>        Witness predicate: eq | neq | sweep (default: sweep)\n");
+    printf("  --hunt-target <u64>    64-bit output target for eq / neq hunt modes\n");
+    printf("  --hunt-vary <mask32>   Bitmask of varying input slots (default: 0xFFFFFFFF)\n");
+    printf("  --hunt-prng            Use fmix32 PRNG input generator instead of linear counter\n");
+    printf("  --verify-cpu           Cross-check GPU hit/checksum bit-for-bit on CPU\n");
+    printf("  --sha256               Print/verify Pure-GPR SHA-256 digest of loaded asset/arena\n");
     printf("  --kitty                Emit Kitty Graphics APC terminal image payload\n");
     printf("  --impact <vx>          Launch deterministic sub-frame Swept-CCD sphere impact\n");
     printf("  --audio-out <out.wav>  Render 48kHz stereo physical-modeling modal DSP WAV\n");
@@ -199,6 +230,9 @@ static bool cli_parse_args(int argc, char **argv, BloomCliArgs *out) {
     out->bloom_path = "build/studio.bloom";
     out->shader_path = "shaders/bloom_core.wgsl";
     out->steps = 60U;
+    out->hunt_trials = 65536U;
+    out->hunt_mode = BLOOM_FIR_HUNT_SWEEP;
+    out->hunt_vary_mask = 0xFFFFFFFFU;
     out->sec_norm_q16[0] = BLOOM_Q16_ONE;
     out->slab_half_q16 = 16384;
 
@@ -254,6 +288,64 @@ static bool cli_parse_args(int argc, char **argv, BloomCliArgs *out) {
                 return false;
             }
             out->out_edl_path = argv[++i];
+            out->headless = true;
+        } else if (strcmp(arg, "--emit-fir") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[BLOOM CLI] Missing path after --emit-fir\n");
+                return false;
+            }
+            out->out_fir_path = argv[++i];
+            out->headless = true;
+        } else if (strcmp(arg, "--hunt-fir") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[BLOOM CLI] Missing path after --hunt-fir\n");
+                return false;
+            }
+            out->hunt_fir_path = argv[++i];
+            out->headless = true;
+        } else if (strcmp(arg, "--trials") == 0) {
+            if (i + 1 >= argc || !cli_parse_u32(argv[++i], &out->hunt_trials) ||
+                out->hunt_trials == 0U || out->hunt_trials > 268435456U) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --trials (expected 1..268435456)\n");
+                return false;
+            }
+        } else if (strcmp(arg, "--hunt-seed") == 0) {
+            if (i + 1 >= argc || !cli_parse_u64(argv[++i], &out->hunt_seed)) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --hunt-seed\n");
+                return false;
+            }
+        } else if (strcmp(arg, "--hunt-target") == 0) {
+            if (i + 1 >= argc || !cli_parse_u64(argv[++i], &out->hunt_target)) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --hunt-target\n");
+                return false;
+            }
+        } else if (strcmp(arg, "--hunt-vary") == 0) {
+            if (i + 1 >= argc || !cli_parse_u32(argv[++i], &out->hunt_vary_mask)) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --hunt-vary\n");
+                return false;
+            }
+        } else if (strcmp(arg, "--hunt-mode") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[BLOOM CLI] Missing mode after --hunt-mode\n");
+                return false;
+            }
+            const char *hm = argv[++i];
+            if (strcmp(hm, "eq") == 0) {
+                out->hunt_mode = BLOOM_FIR_HUNT_EQ;
+            } else if (strcmp(hm, "neq") == 0) {
+                out->hunt_mode = BLOOM_FIR_HUNT_NEQ;
+            } else if (strcmp(hm, "sweep") == 0) {
+                out->hunt_mode = BLOOM_FIR_HUNT_SWEEP;
+            } else {
+                fprintf(stderr, "[BLOOM CLI] Unknown --hunt-mode: %s (expected eq|neq|sweep)\n", hm);
+                return false;
+            }
+        } else if (strcmp(arg, "--hunt-prng") == 0) {
+            out->hunt_prng = true;
+        } else if (strcmp(arg, "--verify-cpu") == 0) {
+            out->verify_cpu = true;
+        } else if (strcmp(arg, "--sha256") == 0) {
+            out->emit_sha256 = true;
             out->headless = true;
         } else if (strcmp(arg, "--kitty") == 0) {
             out->emit_kitty = true;
@@ -366,7 +458,16 @@ static bool cli_load_bloom_file(const char *path, BloomEngineArena *out_arena) {
         out_arena->map.frame_hdr.version != BLOOM_VERSION_U32) {
         return false;
     }
-    return bloom_image_verify_arena(out_arena);
+    if (!bloom_image_verify_arena(out_arena)) {
+        return false;
+    }
+    char file_sha[65];
+    char mem_sha[65];
+    if (flow_sha256_file_hex(path, file_sha) != 0) {
+        return false;
+    }
+    bloom_arena_sha256_hex(out_arena, mem_sha);
+    return memcmp(file_sha, mem_sha, 64U) == 0;
 }
 
 static bool cli_ends_with_ci(const char *s, const char *suf) {
@@ -925,6 +1026,150 @@ static bool cli_import_mood_ppm(const char *ppm_path, BloomEngineArena *arena) {
     return true;
 }
 
+static uint32_t cli_fir_fmix32(uint32_t h) {
+    h ^= h >> 16U;
+    h *= UINT32_C(0x85EBCA6B);
+    h ^= h >> 13U;
+    h *= UINT32_C(0xC2B2AE35);
+    h ^= h >> 16U;
+    return h;
+}
+
+static int cli_run_gpu_hunt_command(const BloomCliArgs *args, BloomEngineArena *arena) {
+    FILE *fp = fopen(args->hunt_fir_path, "rb");
+    if (!fp) {
+        fprintf(stderr, "[BLOOM GPU-HUNT] Cannot open .fir file: %s\n", args->hunt_fir_path);
+        return 1;
+    }
+    uint8_t *fir_buf = (uint8_t *)malloc(FLOW_IR_MAX_FILE_BYTES + 1U);
+    if (!fir_buf) {
+        fclose(fp);
+        return 1;
+    }
+    size_t fir_len = fread(fir_buf, 1U, FLOW_IR_MAX_FILE_BYTES + 1U, fp);
+    fclose(fp);
+    if (fir_len < FLOW_IR_HEADER_BYTES + 8U || fir_len > FLOW_IR_MAX_FILE_BYTES) {
+        fprintf(stderr, "[BLOOM GPU-HUNT] Invalid .fir file size (%zuB): %s\n", fir_len, args->hunt_fir_path);
+        free(fir_buf);
+        return 1;
+    }
+
+    arena->map.frame_hdr.width_px = 64U;
+    arena->map.frame_hdr.height_px = 64U;
+    BloomGpuCtx *gpu = bloom_gpu_init(arena, args->shader_path);
+    if (!gpu) {
+        free(fir_buf);
+        return 1;
+    }
+
+    BloomFir1HuntConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.num_trials = args->hunt_trials;
+    cfg.target_mode = args->hunt_mode;
+    cfg.sweep_mode = args->hunt_prng ? 1U : 0U;
+    cfg.vary_input_mask = args->hunt_vary_mask;
+    cfg.seed_lo = (uint32_t)(args->hunt_seed & UINT64_C(0xFFFFFFFF));
+    cfg.seed_hi = (uint32_t)(args->hunt_seed >> 32U);
+    cfg.target_lo = (uint32_t)(args->hunt_target & UINT64_C(0xFFFFFFFF));
+    cfg.target_hi = (uint32_t)(args->hunt_target >> 32U);
+
+    BloomFir1HuntResult res;
+    if (!bloom_gpu_hunt_fir1(gpu, fir_buf, fir_len, &cfg, &res)) {
+        fprintf(stderr, "[BLOOM GPU-HUNT] Failed on %s (circuit may exceed 128 vals / 512 ops / 64b width or witness mismatch)\n",
+                args->hunt_fir_path);
+        bloom_gpu_destroy(gpu);
+        free(fir_buf);
+        return 1;
+    }
+
+    int rc = 0;
+    bool cpu_parity = res.found ? res.cpu_verified : true;
+    if (args->verify_cpu) {
+        flow_ir_prog_t *prog = (flow_ir_prog_t *)calloc(1U, sizeof(flow_ir_prog_t));
+        if (!prog || !flow_ir_load_bytes(prog, fir_buf, fir_len)) {
+            free(prog);
+            bloom_gpu_destroy(gpu);
+            free(fir_buf);
+            return 1;
+        }
+        uint32_t cpu_hits = 0U;
+        uint32_t cpu_first = 0xFFFFFFFFU;
+        bool cpu_found = false;
+        uint64_t cpu_xor = 0ULL;
+        for (uint32_t tid = 0U; tid < cfg.num_trials; ++tid) {
+            uint64_t ins[FLOW_IR_MAX_IO];
+            uint64_t outs[FLOW_IR_MAX_IO];
+            memset(ins, 0, sizeof(ins));
+            memset(outs, 0, sizeof(outs));
+            for (uint32_t i = 0U; i < prog->num_inputs; ++i) {
+                uint64_t wm = flow_ir_mask_u64(prog->vals[i].width);
+                uint64_t iv = cfg.base_inputs[i];
+                uint32_t sh = (i < 31U) ? i : 31U;
+                if (((cfg.vary_input_mask >> sh) & 1U) != 0U) {
+                    if (cfg.sweep_mode == 1U) {
+                        uint32_t h0 = cli_fir_fmix32(cfg.seed_lo ^ tid ^ (i * UINT32_C(0x9E3779B9)));
+                        uint32_t h1 = cli_fir_fmix32(cfg.seed_hi ^ (tid * UINT32_C(0x85EBCA6B)) ^
+                                                     (i * UINT32_C(0xC2B2AE35)) ^ h0);
+                        iv = ((uint64_t)h1 << 32U) | (uint64_t)h0;
+                    } else if (i == 0U) {
+                        iv += args->hunt_seed + (uint64_t)tid;
+                    } else {
+                        iv += (uint64_t)(tid ^ (i * UINT32_C(0x9E3779B9)));
+                    }
+                }
+                ins[i] = iv & wm;
+            }
+            if (!flow_ir_eval_u64(prog, ins, outs)) {
+                cpu_parity = false;
+                break;
+            }
+            uint64_t out0 = (prog->num_outputs > 0U) ? outs[0] : 0ULL;
+            cpu_xor ^= out0;
+            bool m = (cfg.target_mode == BLOOM_FIR_HUNT_EQ) ? (out0 == args->hunt_target) :
+                     ((cfg.target_mode == BLOOM_FIR_HUNT_NEQ) ? (out0 != args->hunt_target) : true);
+            if (m) {
+                cpu_hits++;
+                if (!cpu_found) {
+                    cpu_found = true;
+                    cpu_first = tid;
+                }
+            }
+        }
+        if (cpu_hits != res.hit_count || cpu_first != res.first_hit_trial ||
+            cpu_xor != res.out0_xor_checksum) {
+            cpu_parity = false;
+            rc = 1;
+            fprintf(stderr,
+                    "[BLOOM GPU-HUNT MISMATCH] GPU(hits=%u first=%u xor=0x%016" PRIx64
+                    ") != CPU(hits=%u first=%u xor=0x%016" PRIx64 ")\n",
+                    res.hit_count, res.first_hit_trial, res.out0_xor_checksum,
+                    cpu_hits, cpu_first, cpu_xor);
+        }
+        free(prog);
+    }
+
+    double mevals = (double)res.trials_evaluated / (double)res.elapsed_us;
+    printf("[BLOOM GPU-HUNT] file=%s trials=%u hits=%u first_hit=%s xor=0x%016" PRIx64
+           " time=%.2fms (%.2f M_evals/s) cpu_parity=%s GPU=%s\n",
+           args->hunt_fir_path,
+           res.trials_evaluated,
+           res.hit_count,
+           res.found ? "FOUND" : "NONE",
+           res.out0_xor_checksum,
+           (double)res.elapsed_us / 1000.0,
+           mevals,
+           cpu_parity ? "EXACT" : "FAIL",
+           bloom_gpu_device_name(gpu));
+    if (res.found && res.num_inputs > 0U && res.num_outputs > 0U) {
+        printf("  witness[trial=%u]: in0=0x%016" PRIx64 " -> out0=0x%016" PRIx64 "\n",
+               res.first_hit_trial, res.witness_inputs[0], res.witness_outputs[0]);
+    }
+
+    bloom_gpu_destroy(gpu);
+    free(fir_buf);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     BloomCliArgs args;
     if (!cli_parse_args(argc, argv, &args)) {
@@ -935,7 +1180,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (args.show_version) {
-        printf("bloom %s\n", BLOOM_VERSION_STRING);
+        printf("bloom %s (FLOW %s)\n", BLOOM_VERSION_STRING, FLOW_VERSION_STRING);
         return 0;
     }
 
@@ -964,6 +1209,14 @@ int main(int argc, char **argv) {
     memset(arena, 0, sizeof(*arena));
     memset(staging, 0, sizeof(*staging));
     memset(mesh, 0, sizeof(*mesh));
+
+    if (args.hunt_fir_path != NULL) {
+        int hunt_rc = cli_run_gpu_hunt_command(&args, arena);
+        free(mesh);
+        free(staging);
+        free(arena);
+        return hunt_rc;
+    }
 
     bool is_mesh_asset = false;
     if (!cli_load_input_asset(args.bloom_path, arena, mesh, &is_mesh_asset)) {
@@ -1054,11 +1307,26 @@ int main(int argc, char **argv) {
         arena->map.window.fb_h_px = args.override_h;
     }
 
+    if (args.emit_sha256) {
+        char arena_sha[65];
+        char file_sha[65];
+        bloom_arena_sha256_hex(arena, arena_sha);
+        if (flow_sha256_file_hex(args.bloom_path, file_sha) != 0) {
+            file_sha[0] = '\0';
+        }
+        printf("[BLOOM SHA256] arena=%s file=%s\n", arena_sha, file_sha);
+    }
+
     if (args.inspect_cae && !args.has_impact) {
         bloom_physics_step_arena64(arena, BLOOM_Q16_ONE);
+        int64_t hess_mu_q32 = 0LL;
+        bool hess_psd = bloom_scene_certify_hessian_psd_q16(
+            arena, is_mesh_asset ? mesh : NULL, 0LL, 0LL, 0LL, 8LL * BLOOM_Q16_ONE, &hess_mu_q32);
+        char arena_sha[65];
+        bloom_arena_sha256_hex(arena, arena_sha);
         const BloomSectionSpec64 *sec = &arena->map.section_spec;
         const BloomPhysicsSummary64 *ps = &arena->map.phys_summary;
-        printf("[BLOOM v%s CAE] inst=%u mesh_tris=%u mesh_bvh=%u sec_mode=%u inter_pairs=%u warn_pairs=%u ccd_hits=%u min_clr_q16=%d max_pen_q16=%d toi_q16=%d peak_K=%u pair=(%u,%u)\n",
+        printf("[BLOOM v%s CAE] inst=%u mesh_tris=%u mesh_bvh=%u sec_mode=%u inter_pairs=%u warn_pairs=%u ccd_hits=%u min_clr_q16=%d max_pen_q16=%d toi_q16=%d peak_K=%u pair=(%u,%u) hess_psd=%d hess_mu_q32=%" PRId64 " sha256=%.16s\n",
                BLOOM_VERSION_STRING,
                arena->map.frame_hdr.inst_count,
                (unsigned)sec->mesh_tri_count,
@@ -1072,7 +1340,10 @@ int main(int argc, char **argv) {
                ps->earliest_toi_q16,
                ps->peak_kelvin,
                (unsigned)ps->pair_inst_a,
-               (unsigned)ps->pair_inst_b);
+               (unsigned)ps->pair_inst_b,
+               hess_psd ? 1 : 0,
+               hess_mu_q32,
+               arena_sha);
     }
 
     BloomGpuCtx *gpu = bloom_gpu_init(arena, args.shader_path);
@@ -1170,6 +1441,23 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "[BLOOM EDL] Wrote %s (frames=%u @ 24fps)\n", args.out_edl_path, reel_f);
                 }
             }
+            if (args.out_fir_path) {
+                flow_ir_builder_ws_t *fir_ws =
+                    (flow_ir_builder_ws_t *)calloc(1U, sizeof(flow_ir_builder_ws_t));
+                uint32_t mbits = 0U, mdepth = 0U;
+                size_t wlen = 0U;
+                bool fir_ok = (fir_ws != NULL) &&
+                              bloom_fir_certify_arena_contracts(fir_ws, &mbits, &mdepth, &wlen) &&
+                              flow_ir_write_bytes_file(args.out_fir_path, fir_ws->wire_buf, wlen);
+                free(fir_ws);
+                if (!fir_ok) {
+                    fprintf(stderr, "[BLOOM CLI] Failed to certify/write FIR1 witness to %s\n", args.out_fir_path);
+                    exit_code = 1;
+                } else {
+                    fprintf(stderr, "[BLOOM FIR] Certified & wrote %s (%zuB, mult_bits=%u, mult_depth=%u)\n",
+                            args.out_fir_path, wlen, mbits, mdepth);
+                }
+            }
             if (args.export_html_path) {
                 if (!bloom_export_webgpu_html(args.export_html_path, arena, args.shader_path)) {
                     fprintf(stderr, "[BLOOM CLI] Failed to export WebGPU HTML to %s\n", args.export_html_path);
@@ -1189,7 +1477,7 @@ int main(int argc, char **argv) {
                         exit_code = 1;
                     }
                 }
-                if (args.out_ppm_path || (!args.out_wav_path && !args.export_html_path && !args.out_edl_path && !args.emit_kitty)) {
+                if (args.out_ppm_path || (!args.out_wav_path && !args.export_html_path && !args.out_edl_path && !args.out_fir_path && !args.emit_sha256 && !args.emit_kitty)) {
                     uint64_t fnv = 0ULL;
                     uint32_t nonblack = 0U;
                     if (!bloom_gpu_write_ppm(gpu, args.out_ppm_path, &fnv, &nonblack)) {

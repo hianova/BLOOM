@@ -402,7 +402,7 @@ namespace FrameFlag
   def gameplayShells   : UInt32 := 1024
 end FrameFlag
 
-/-! ### FLOW v7.0.1 Canonical Manifold Chart Indices (`Slots 232..247`) -/
+/-! ### FLOW v9.0.0 Canonical Manifold Chart Indices (`Slots 232..247`) -/
 namespace Chart
   def uiSpring     : UInt32 := 0
   def uiScrub      : UInt32 := 1
@@ -556,6 +556,12 @@ opaque verifySearuCore (seed : UInt64) : IO Bool
 
 @[extern "bloom_jsi_verify_gpu_alignment"]
 opaque verifyGpuAlignment (eng : @& Engine) : IO Bool
+
+@[extern "bloom_jsi_arena_sha256"]
+opaque arenaSha256 (eng : @& Engine) : IO String
+
+@[extern "bloom_jsi_file_sha256"]
+opaque fileSha256 (path : @& String) : IO String
 
 /-! ## Part 3: React-Native Style Nested Flexbox DSL & AOT Scene Compiler -/
 
@@ -1155,10 +1161,10 @@ private def requireContract (label : String) (cond : Bool) : IO Unit := do
 def compileTimeBoundaryGate : IO Unit := do
   -- 0. Emit Checked Full-512b C17/C++20 & WGSL Arena Schema + Pure-CPU FLOW SEARU Gate
   let schemaOk ← emitSchemaOnly
-  requireContract "FLOW v8.0.0 Full-512b ArenaSpec C17+WGSL Schema emission" schemaOk
+  requireContract "FLOW v9.0.0 Full-512b ArenaSpec C17+WGSL Schema emission" schemaOk
 
   let searuOk ← verifySearuCore 0xB100A60020265EA4
-  requireContract "FLOW v7.0.1 SEARU (heal_and_swap + SOLVE_INLINE) + BVH==CSG 0-ULP + UTF-8/IME" searuOk
+  requireContract "FLOW v9.0.0 SEARU + CholeskySDD + SHA-256 + FIR1 + BVH==CSG 0-ULP + UTF-8/IME" searuOk
 
   -- 1. Pure Lean 4 Nested React-Native Flexbox Layout Compiler Invariants
   let studioLayout := compileUiTree 1280 720 defaultStudioBlueprint.uiTree
@@ -1284,7 +1290,7 @@ def compileTimeBoundaryGate : IO Unit := do
   for _ in [0:512] do
     convergedA ← stepAndRender engA 0x0001 false
     convergedB ← stepAndRender engB 0x0001 false
-  requireContract "FLOW v7.0.1 Lyapunov convergence to 0-FPS Idle Sleep" (convergedA && convergedB)
+  requireContract "FLOW v9.0.0 Lyapunov convergence to 0-FPS Idle Sleep" (convergedA && convergedB)
 
   let statsBefore ← getDispatchStats engA
   for _ in [0:16] do
@@ -1327,5 +1333,9 @@ def compileTimeBoundaryGate : IO Unit := do
   requireContract "AOT build/studio.bloom Merkle seal & write succeeded" savedOk
   let imgBytes ← IO.FS.readBinFile defaultStudioImagePath
   requireContract "AOT build/studio.bloom is exact 16,384-byte VM page" (imgBytes.size == arenaBytes)
+  let memSha ← arenaSha256 engStudio
+  let fileSha ← fileSha256 defaultStudioImagePath
+  requireContract "FLOW v9.0.0 Pure-GPR SHA-256 parity across Arena memory & build/studio.bloom"
+    (memSha.length == 64 && memSha == fileSha)
 
 end Bloom

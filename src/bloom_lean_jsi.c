@@ -7,11 +7,13 @@
 #include <string.h>
 
 #include "bloom.h"
+#include "flow_ir_io.h"
+#include "flow_sha256_io.h"
 #include "searu.h"
 
 /*
  * ============================================================================
- * BLOOM v7.0.1 — Zero-Copy Lean 4 Dynamic Plugin JSI Bridge (0 `lean -c`)
+ * BLOOM v9.0.0 — Zero-Copy Lean 4 Dynamic Plugin JSI Bridge (0 `lean -c`)
  * ============================================================================
  * Exports both direct C symbols (`bloom_jsi_*`) AND Lean 4 VM interpreter
  * boxed symbols (`l_Bloom_*___boxed`), enabling pure `lean --load-dynlib=...`
@@ -835,7 +837,7 @@ LEAN_EXPORT lean_obj_res bloom_jsi_run_window(b_lean_obj_arg eng, lean_obj_arg o
 }
 
 /* ============================================================================
- * Compile-Time FLOW v7.0.1 SEARU Torture + CPU Q16.16 vs GPU WGSL f32 Gates
+ * Compile-Time FLOW v9.0.0 SEARU Torture + CPU Q16.16 vs GPU WGSL f32 Gates
  * ============================================================================ */
 
 static int64_t searu_levy_coord_q16(uint64_t *rng) {
@@ -1394,7 +1396,7 @@ LEAN_EXPORT lean_obj_res bloom_jsi_verify_searu_core(uint64_t seed) {
         (void)bloom_latex_eval_box_sdf_q16(&lboxes[0], INT32_MIN, INT32_MAX);
     }
 
-    /* 7. FLOW v8.0.0 Symbiotic SEARU x 2-Jet (`searu_heal_and_swap`, `SEARU_SOLVE_INLINE` & Ring-0) */
+    /* 7. FLOW v9.0.0 Symbiotic SEARU x 2-Jet (`searu_heal_and_swap`, `SEARU_SOLVE_INLINE` & Ring-0) */
     {
         BloomEngineArena *heal_arena = NULL;
         SEARU_REQ(posix_memalign((void **)&heal_arena, BLOOM_VM_PAGE_ALIGN, sizeof(BloomEngineArena)) == 0 && heal_arena != NULL,
@@ -1766,6 +1768,53 @@ LEAN_EXPORT lean_obj_res bloom_jsi_verify_searu_core(uint64_t seed) {
         SEARU_REQ(cine_cam.target_q16[0] > 0 &&
                   bloom_reg_bank_get_q16(&gp_arena->map.reg_bank, BLOOM_REG_CINE_TRAUMA) == 32768,
                   "CineCamera deadzone follow & trauma envelope exact");
+
+        /* 10. FLOW v9.0.0 Core/SDK Gates: Cholesky+SDD Hessian PSD, Pure-GPR SHA-256 & QTT .fir Builder */
+        {
+            SEARU_REQ(FLOW_VERSION_MAJOR >= 9, "FLOW_VERSION_MAJOR >= 9");
+            int64_t mu_pos = -1LL;
+            int64_t mu_neg = 0LL;
+            SEARU_REQ(bloom_scene_certify_hessian_psd_q16(gp_arena, NULL, 0LL, 0LL, 0LL, 16LL * BLOOM_Q16_ONE, &mu_pos) &&
+                      mu_pos >= 0LL,
+                      "FLOW v9.0.0 Cholesky+SDD certified regularized 2-Jet Hessian PSD");
+            SEARU_REQ(!bloom_scene_certify_hessian_psd_q16(gp_arena, NULL, 0LL, 0LL, 0LL, -512LL * BLOOM_Q16_ONE, &mu_neg) &&
+                      mu_neg < 0LL,
+                      "FLOW v9.0.0 Cholesky+SDD rejected negative-definite Hessian");
+
+            char sha_a[65], sha_b[65];
+            bloom_image_seal_arena(gp_arena);
+            bloom_arena_sha256_hex(gp_arena, sha_a);
+            gp_arena->map.reg_bank.epoch ^= 1U;
+            bloom_arena_sha256_hex(gp_arena, sha_b);
+            SEARU_REQ(strlen(sha_a) == 64U && strlen(sha_b) == 64U && memcmp(sha_a, sha_b, 64U) != 0,
+                      "FLOW v9.0.0 Pure-GPR flow_sha256 avalanche over 16KB BloomEngineArena");
+
+            flow_ir_builder_ws_t *fir_ws =
+                (flow_ir_builder_ws_t *)calloc(1U, sizeof(flow_ir_builder_ws_t));
+            uint32_t mbits = 0U, mdepth = 0U;
+            size_t wlen = 0U;
+            bool fir_ok = (fir_ws != NULL) &&
+                          bloom_fir_certify_arena_contracts(fir_ws, &mbits, &mdepth, &wlen) &&
+                          fir_ws->ir_linear_ok && fir_ws->ir_unitary_ok && wlen > 64U;
+            if (fir_ok) {
+                static const uint64_t k_vecs[3][4] = {
+                    { UINT64_C(0x1234), UINT64_C(0x0003), UINT64_C(0xABCD), UINT64_C(1) },
+                    { UINT64_C(0x1234), UINT64_C(0x0003), UINT64_C(0xABCC), UINT64_C(1) },
+                    { UINT64_C(0x00F9), UINT64_C(0x0003), UINT64_C(0xABCC), UINT64_C(0) }
+                };
+                for (size_t i = 0U; i < 3U && fir_ok; ++i) {
+                    uint64_t outv[3] = { 0ULL, 0ULL, 0ULL };
+                    uint64_t exp_slot = k_vecs[i][0] & UINT64_C(0xFF);
+                    uint64_t exp_b0 = (k_vecs[i][3] != 0ULL) ? (k_vecs[i][1] & UINT64_C(1))
+                                                             : (k_vecs[i][2] & UINT64_C(1));
+                    uint64_t exp_mode = (k_vecs[i][2] & UINT64_C(0xFFFE)) | exp_b0;
+                    fir_ok = flow_ir_eval_u64(&fir_ws->ir_reloaded, k_vecs[i], outv) &&
+                             outv[0] == exp_slot && outv[1] == exp_mode && outv[2] == UINT64_C(1);
+                }
+            }
+            free(fir_ws);
+            SEARU_REQ(fir_ok, "FLOW v9.0.0 flow_ir_builder QTT Linear/Unitary FIR1 witness certified");
+        }
 
         free(gp_pcm);
         free(rw_ring);
@@ -2644,6 +2693,36 @@ LEAN_EXPORT lean_obj_res l_Bloom_saveArenaImage___boxed(lean_obj_arg eng, lean_o
     lean_obj_res r = bloom_jsi_save_image(eng, opath);
     lean_dec(eng);
     lean_dec(opath);
+    return r;
+}
+
+LEAN_EXPORT lean_obj_res bloom_jsi_arena_sha256(b_lean_obj_arg eng) {
+    BloomJsiHandle *h = bloom_jsi_unwrap(eng);
+    char hex[65];
+    bloom_arena_sha256_hex(h->arena, hex);
+    return lean_io_result_mk_ok(lean_mk_string(hex));
+}
+
+LEAN_EXPORT lean_obj_res bloom_jsi_file_sha256(b_lean_obj_arg path) {
+    const char *p = lean_string_cstr(path);
+    char hex[65];
+    if (!p || flow_sha256_file_hex(p, hex) != 0) {
+        hex[0] = '\0';
+    }
+    return lean_io_result_mk_ok(lean_mk_string(hex));
+}
+
+LEAN_EXPORT lean_obj_res l_Bloom_arenaSha256___boxed(lean_obj_arg eng, lean_obj_arg world) {
+    (void)world;
+    lean_obj_res r = bloom_jsi_arena_sha256(eng);
+    lean_dec(eng);
+    return r;
+}
+
+LEAN_EXPORT lean_obj_res l_Bloom_fileSha256___boxed(lean_obj_arg path, lean_obj_arg world) {
+    (void)world;
+    lean_obj_res r = bloom_jsi_file_sha256(path);
+    lean_dec(path);
     return r;
 }
 

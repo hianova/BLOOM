@@ -147,7 +147,7 @@ void bloom_ui_bind_reg_bank64(BloomUiNode64 *nodes,
 
 int32_t bloom_ui_eval_glass_transmittance_q16(uint32_t fill_rgb24, int32_t bevel_q16);
 
-/* 5. Wave64 Hit-Testing, Pointer Capture, Zero-BLR SEARU Solver & FLOW v7.0.1 Tactile Springs */
+/* 5. Wave64 Hit-Testing, Pointer Capture, Zero-BLR SEARU Solver & FLOW v9.0.0 Tactile Springs */
 uint32_t bloom_ui_step_pointer_arena(BloomEngineArena *arena,
                                      int32_t cursor_x_q16,
                                      int32_t cursor_y_q16,

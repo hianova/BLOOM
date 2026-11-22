@@ -2884,3 +2884,338 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
     col = pow(max(col, vec3<f32>(1e-6)), vec3<f32>(1.0 / 2.2));
     textureStore(out_tex, vec2<i32>(gid.xy), vec4<f32>(col, 1.0));
 }
+
+// ============================================================================
+// 5. Warp-Scale FLOW "FIR1" Evaluator & Parallel Witness Hunter (Zero 64-bit Ext)
+// ============================================================================
+
+fn w64_mask(w : u32) -> vec2<u32> {
+    if (w == 0u) { return vec2<u32>(0u, 0u); }
+    if (w < 32u) { return vec2<u32>((1u << w) - 1u, 0u); }
+    if (w == 32u) { return vec2<u32>(0xFFFFFFFFu, 0u); }
+    if (w < 64u) { return vec2<u32>(0xFFFFFFFFu, (1u << (w - 32u)) - 1u); }
+    return vec2<u32>(0xFFFFFFFFu, 0xFFFFFFFFu);
+}
+
+fn w64_shl(v : vec2<u32>, sh : u32) -> vec2<u32> {
+    if (sh == 0u) { return v; }
+    if (sh >= 64u) { return vec2<u32>(0u, 0u); }
+    if (sh < 32u) { return vec2<u32>(v.x << sh, (v.y << sh) | (v.x >> (32u - sh))); }
+    return vec2<u32>(0u, v.x << (sh - 32u));
+}
+
+fn w64_shr(v : vec2<u32>, sh : u32) -> vec2<u32> {
+    if (sh == 0u) { return v; }
+    if (sh >= 64u) { return vec2<u32>(0u, 0u); }
+    if (sh < 32u) { return vec2<u32>((v.x >> sh) | (v.y << (32u - sh)), v.y >> sh); }
+    return vec2<u32>(v.y >> (sh - 32u), 0u);
+}
+
+fn w64_add(a : vec2<u32>, b : vec2<u32>) -> vec2<u32> {
+    let lo = a.x + b.x;
+    let cy = select(0u, 1u, lo < a.x);
+    return vec2<u32>(lo, a.y + b.y + cy);
+}
+
+fn w64_sub(a : vec2<u32>, b : vec2<u32>) -> vec2<u32> {
+    let lo = a.x - b.x;
+    let br = select(0u, 1u, a.x < b.x);
+    return vec2<u32>(lo, a.y - b.y - br);
+}
+
+fn w64_mul128_shr(a : vec2<u32>, b : vec2<u32>, sh : u32) -> vec2<u32> {
+    if (sh >= 128u) { return vec2<u32>(0u, 0u); }
+    let al = array<u32, 4>(a.x & 0xFFFFu, a.x >> 16u, a.y & 0xFFFFu, a.y >> 16u);
+    let bl = array<u32, 4>(b.x & 0xFFFFu, b.x >> 16u, b.y & 0xFFFFu, b.y >> 16u);
+    var w = array<u32, 8>(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
+    for (var i : u32 = 0u; i < 4u; i = i + 1u) {
+        for (var j : u32 = 0u; j < 4u; j = j + 1u) {
+            let k = i + j;
+            let prod = al[i] * bl[j];
+            let s0 = w[k] + (prod & 0xFFFFu);
+            w[k] = s0 & 0xFFFFu;
+            let s1 = w[k + 1u] + (prod >> 16u) + (s0 >> 16u);
+            w[k + 1u] = s1 & 0xFFFFu;
+            var cy = s1 >> 16u;
+            var kk = k + 2u;
+            while (cy > 0u && kk < 8u) {
+                let sc = w[kk] + cy;
+                w[kk] = sc & 0xFFFFu;
+                cy = sc >> 16u;
+                kk = kk + 1u;
+            }
+        }
+    }
+    let lo64 = vec2<u32>(w[0] | (w[1] << 16u), w[2] | (w[3] << 16u));
+    let hi64 = vec2<u32>(w[4] | (w[5] << 16u), w[6] | (w[7] << 16u));
+    if (sh == 0u) { return lo64; }
+    if (sh < 64u) {
+        return vec2<u32>(w64_shr(lo64, sh).x | w64_shl(hi64, 64u - sh).x,
+                         w64_shr(lo64, sh).y | w64_shl(hi64, 64u - sh).y);
+    }
+    return w64_shr(hi64, sh - 64u);
+}
+
+fn w64_gf8_mul_0xb(a_in : u32, b_in : u32) -> u32 {
+    var a = a_in & 7u;
+    let b = b_in & 7u;
+    var res : u32 = 0u;
+    for (var i : u32 = 0u; i < 3u; i = i + 1u) {
+        if (((b >> i) & 1u) != 0u) { res = res ^ a; }
+        a = a << 1u;
+        if ((a & 8u) != 0u) { a = a ^ 0xBu; }
+    }
+    return res & 7u;
+}
+
+fn w64_gf2m_mul(a_in : vec2<u32>, b_in : vec2<u32>, deg : u32, irred : vec2<u32>) -> vec2<u32> {
+    if (deg == 0u || deg > 32u) { return vec2<u32>(0u, 0u); }
+    if (deg == 6u && irred.x == 0u && irred.y == 0u) {
+        let x0 = a_in.x & 7u;
+        let x1 = (a_in.x >> 3u) & 7u;
+        let y0 = b_in.x & 7u;
+        let y1 = (b_in.x >> 3u) & 7u;
+        let p0 = w64_gf8_mul_0xb(x0, y0);
+        let p1 = w64_gf8_mul_0xb(x1, y1);
+        let pm = w64_gf8_mul_0xb(x0 ^ x1, y0 ^ y1);
+        return vec2<u32>((p0 ^ p1) | ((pm ^ p0) << 3u), 0u);
+    }
+    let mask = w64_mask(deg);
+    let top  = w64_shl(vec2<u32>(1u, 0u), deg);
+    var a    = a_in & mask;
+    let b    = b_in & mask;
+    var res  = vec2<u32>(0u, 0u);
+    for (var i : u32 = 0u; i < 32u; i = i + 1u) {
+        if (i >= deg) { break; }
+        let bit_i = w64_shr(b, i).x & 1u;
+        if (bit_i != 0u) { res = res ^ a; }
+        a = w64_shl(a, 1u);
+        if ((a.x & top.x) != 0u || (a.y & top.y) != 0u) {
+            a = a ^ irred;
+        }
+    }
+    return res & mask;
+}
+
+fn w64_gf2m_inv(a_in : vec2<u32>, deg : u32, irred : vec2<u32>) -> vec2<u32> {
+    if (deg == 0u || deg > 32u) { return vec2<u32>(0u, 0u); }
+    let mask = w64_mask(deg);
+    let a    = a_in & mask;
+    if (a.x == 0u && a.y == 0u) { return vec2<u32>(0u, 0u); }
+    var exp  = w64_sub(mask, vec2<u32>(1u, 0u));
+    var res  = vec2<u32>(1u, 0u);
+    var base = a;
+    for (var step : u32 = 0u; step < 33u; step = step + 1u) {
+        if (exp.x == 0u && exp.y == 0u) { break; }
+        if ((exp.x & 1u) != 0u) {
+            res = w64_gf2m_mul(res, base, deg, irred);
+        }
+        base = w64_gf2m_mul(base, base, deg, irred);
+        exp = w64_shr(exp, 1u);
+    }
+    return res & mask;
+}
+
+fn arena_read_u32(cell_base : u32, idx : u32) -> u32 {
+    let cell = arena[cell_base + (idx >> 4u)];
+    let qi = (idx >> 2u) & 3u;
+    var q = cell.q0;
+    if (qi == 1u) { q = cell.q1; }
+    else if (qi == 2u) { q = cell.q2; }
+    else if (qi == 3u) { q = cell.q3; }
+    return vec4_u32_lane(q, idx & 3u);
+}
+
+fn arena_read_w64(cell_base : u32, idx : u32) -> vec2<u32> {
+    let cell = arena[cell_base + (idx >> 3u)];
+    let qi = (idx >> 1u) & 3u;
+    var q = cell.q0;
+    if (qi == 1u) { q = cell.q1; }
+    else if (qi == 2u) { q = cell.q2; }
+    else if (qi == 3u) { q = cell.q3; }
+    return select(vec2<u32>(q.x, q.y), vec2<u32>(q.z, q.w), (idx & 1u) != 0u);
+}
+
+fn fmix32(h_in : u32) -> u32 {
+    var h = h_in;
+    h = h ^ (h >> 16u);
+    h = h * 0x85EBCA6Bu;
+    h = h ^ (h >> 13u);
+    h = h * 0xC2B2AE35u;
+    h = h ^ (h >> 16u);
+    return h;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn bloom_fir1_hunt(
+    @builtin(global_invocation_id) gid : vec3<u32>
+) {
+    if (gid.x == 0xFFFFFFFFu) { textureStore(out_tex, vec2<i32>(0, 0), vec4<f32>(0.0)); }
+    let tid = gid.x;
+    let hdr_q0 = arena[0].q0;
+    let hdr_q1 = arena[0].q1;
+    let hdr_q2 = arena[0].q2;
+    let hdr_q3 = arena[0].q3;
+
+    let num_vals     = min(hdr_q0.y, 128u);
+    let num_inputs   = min(hdr_q0.z, 32u);
+    let num_outputs  = min(hdr_q0.w, 32u);
+    let num_ops      = min(hdr_q1.x, 512u);
+    let num_lut      = min(hdr_q1.y, 1736u);
+    let total_trials = hdr_q1.z;
+    let target_mode  = hdr_q1.w;
+    let seed_lo      = hdr_q2.x;
+    let seed_hi      = hdr_q2.y;
+    let target_val   = vec2<u32>(hdr_q2.z, hdr_q2.w);
+    let vary_mask    = hdr_q3.x;
+    let sweep_mode   = hdr_q3.y;
+    let num_threads  = min(hdr_q3.z, 32768u);
+    let trial_base   = hdr_q3.w;
+
+    if (hdr_q0.x != 0x46495248u || num_threads == 0u || tid >= num_threads) {
+        return;
+    }
+
+    var best_local : u32 = 0xFFFFFFFFu;
+    var hit_acc    : u32 = 0u;
+    var xor_lo     : u32 = 0u;
+    var xor_hi     : u32 = 0u;
+
+    var local_tid : u32 = tid;
+    while (local_tid < total_trials) {
+        let gtid = trial_base + local_tid;
+        var env : array<vec2<u32>, 128>;
+        for (var i : u32 = 0u; i < num_inputs; i = i + 1u) {
+            let w = arena_read_u32(7u, i);
+            let wm = w64_mask(w);
+            var iv = arena_read_w64(1u, i);
+            if (((vary_mask >> min(i, 31u)) & 1u) != 0u) {
+                if (sweep_mode == 1u) {
+                    let h0 = fmix32(seed_lo ^ gtid ^ (i * 0x9E3779B9u));
+                    let h1 = fmix32(seed_hi ^ (gtid * 0x85EBCA6Bu) ^ (i * 0xC2B2AE35u) ^ h0);
+                    iv = vec2<u32>(h0, h1);
+                } else {
+                    if (i == 0u) {
+                        iv = w64_add(iv, vec2<u32>(seed_lo + gtid, select(0u, 1u, (seed_lo + gtid) < seed_lo) + seed_hi));
+                    } else {
+                        iv = w64_add(iv, vec2<u32>(gtid ^ (i * 0x9E3779B9u), 0u));
+                    }
+                }
+            }
+            env[i] = iv & wm;
+        }
+
+        for (var op_i : u32 = 0u; op_i < num_ops; op_i = op_i + 1u) {
+            let op_c   = mesh_buf[op_i];
+            let kind   = op_c.q0.x & 0xFFFFu;
+            let nins   = (op_c.q0.x >> 16u) & 0xFFFFu;
+            let oid    = op_c.q0.y;
+            let ins    = array<u32, 6>(op_c.q0.z, op_c.q0.w, op_c.q1.x, op_c.q1.y, op_c.q1.z, op_c.q1.w);
+            let lut_off = op_c.q2.x;
+            let lut_len = op_c.q2.y;
+            let p0     = vec2<u32>(op_c.q2.z, op_c.q2.w);
+            let p1     = vec2<u32>(op_c.q3.x, op_c.q3.y);
+            let p2_lo  = op_c.q3.z;
+
+            if (oid >= num_vals) { continue; }
+            let omask = w64_mask(arena_read_u32(7u, oid));
+            let a0 = select(vec2<u32>(0u, 0u), env[min(ins[0], 127u)], nins >= 1u);
+            let a1 = select(vec2<u32>(0u, 0u), env[min(ins[1], 127u)], nins >= 2u);
+            let a2 = select(vec2<u32>(0u, 0u), env[min(ins[2], 127u)], nins >= 3u);
+            var r = vec2<u32>(0u, 0u);
+
+            if (kind == 1u) {
+                r = p0 & omask;
+            } else if (kind == 2u) {
+                r = w64_shr(a0, p0.x) & omask;
+            } else if (kind == 3u) {
+                var pos : u32 = 0u;
+                for (var j : u32 = 0u; j < 6u; j = j + 1u) {
+                    if (j >= nins) { break; }
+                    let iv_id = min(ins[j], 127u);
+                    let iw = arena_read_u32(7u, iv_id);
+                    let piece = env[iv_id] & w64_mask(iw);
+                    if (pos < 64u) {
+                        r = r | w64_shl(piece, pos);
+                    }
+                    pos = pos + iw;
+                }
+                r = r & omask;
+            } else if (kind == 4u) {
+                r = (a0 ^ a1) & omask;
+            } else if (kind == 5u) {
+                r = (a0 & a1) & omask;
+            } else if (kind == 6u) {
+                r = (~a0) & omask;
+            } else if (kind == 7u) {
+                r = vec2<u32>(select(0u, 1u, a0.x != 0u || a0.y != 0u), 0u);
+            } else if (kind == 8u) {
+                r = w64_add(a0, a1) & omask;
+            } else if (kind == 9u) {
+                r = w64_sub(a0, a1) & omask;
+            } else if (kind == 10u) {
+                let s_sum = p0.x + p1.x;
+                let sh = select(0u, s_sum - p2_lo, s_sum > p2_lo);
+                r = w64_mul128_shr(a0, a1, sh) & omask;
+            } else if (kind == 11u) {
+                let s_sum = 2u * p0.x;
+                let sh = select(0u, s_sum - p2_lo, s_sum > p2_lo);
+                r = w64_mul128_shr(a0, a0, sh) & omask;
+            } else if (kind == 12u) {
+                r = w64_gf2m_mul(a0, a1, p0.x, p1) & omask;
+            } else if (kind == 13u) {
+                r = w64_gf2m_inv(a0, p0.x, p1) & omask;
+            } else if (kind == 14u) {
+                let addr = a0.x;
+                if (a0.y == 0u && addr < lut_len && (lut_off + addr) < num_lut) {
+                    r = arena_read_w64(39u, lut_off + addr) & omask;
+                }
+            } else if (kind == 15u) {
+                r = select(a1, a2, (a0.x & 1u) != 0u) & omask;
+            } else if (kind == 16u) {
+                let sh = select(64u, a1.x, a1.y == 0u && a1.x < 64u);
+                r = w64_shl(a0, sh) & omask;
+            } else if (kind == 17u) {
+                let sh = select(64u, a1.x, a1.y == 0u && a1.x < 64u);
+                r = w64_shr(a0, sh) & omask;
+            } else if (kind == 18u) {
+                r = vec2<u32>(select(0u, 1u, a0.x == 0u && a0.y == 0u), 0u);
+            }
+            env[oid] = r;
+        }
+
+        var out0 = vec2<u32>(0u, 0u);
+        if (num_outputs > 0u) {
+            let oid0 = min(arena_read_u32(5u, 0u), 127u);
+            out0 = env[oid0];
+        }
+        xor_lo = xor_lo ^ out0.x;
+        xor_hi = xor_hi ^ out0.y;
+
+        var matched = false;
+        if (target_mode == 0u) {
+            matched = (out0.x == target_val.x) && (out0.y == target_val.y);
+        } else if (target_mode == 1u) {
+            matched = (out0.x != target_val.x) || (out0.y != target_val.y);
+        } else {
+            matched = true;
+        }
+        if (matched) {
+            hit_acc = hit_acc + 1u;
+            if (local_tid < best_local) {
+                best_local = local_tid;
+            }
+        }
+        if (total_trials - local_tid <= num_threads) {
+            break;
+        }
+        local_tid = local_tid + num_threads;
+    }
+
+    rc_buf[tid] = vec4<f32>(
+        bitcast<f32>(best_local),
+        bitcast<f32>(hit_acc),
+        bitcast<f32>(xor_lo),
+        bitcast<f32>(xor_hi)
+    );
+}

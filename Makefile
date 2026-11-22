@@ -51,10 +51,10 @@ STATIC_STAMP := $(BUILD_DIR)/.static.ok
 NOGPR_FLAG   := $(shell $(CC) -mgeneral-regs-only -x c -c /dev/null -o /dev/null 2>/dev/null && echo -mgeneral-regs-only)
 UBTRAP_FLAGS := $(shell $(CC) -fsanitize=signed-integer-overflow,shift-exponent,bounds,null,return,unreachable -fsanitize-trap=all -x c -c /dev/null -o /dev/null 2>/dev/null && echo "-fsanitize=signed-integer-overflow,shift-exponent,bounds,null,return,unreachable -fsanitize-trap=all")
 
-CORE_CFLAGS := -std=c17 -Wall -Wextra -Wpedantic -Werror $(NOGPR_FLAG) $(UBTRAP_FLAGS) -O2 -fPIC -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core"
-HOST_CFLAGS := -std=c17 -Wall -Wextra -Wpedantic -Werror $(UBTRAP_FLAGS) -O2 -fPIC -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" $(SDL3_CFLAGS)
-CLI_CFLAGS  := -std=c17 -Wall -Wextra -Wpedantic -Werror $(UBTRAP_FLAGS) -O2 -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core"
-JSI_CFLAGS  := -std=c17 -Wall -Wextra -Werror $(UBTRAP_FLAGS) -O2 -fPIC -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -isystem "$(LEAN_SYSROOT)/include"
+CORE_CFLAGS := -std=c17 -Wall -Wextra -Wpedantic -Werror $(NOGPR_FLAG) $(UBTRAP_FLAGS) -O2 -fPIC -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -isystem "$(FLOW_DIR)/sdk"
+HOST_CFLAGS := -std=c17 -Wall -Wextra -Wpedantic -Werror $(UBTRAP_FLAGS) -O2 -fPIC -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -isystem "$(FLOW_DIR)/sdk" $(SDL3_CFLAGS)
+CLI_CFLAGS  := -std=c17 -Wall -Wextra -Wpedantic -Werror $(UBTRAP_FLAGS) -O2 -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -isystem "$(FLOW_DIR)/sdk"
+JSI_CFLAGS  := -std=c17 -Wall -Wextra -Werror $(UBTRAP_FLAGS) -O2 -fPIC -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -isystem "$(FLOW_DIR)/sdk" -isystem "$(LEAN_SYSROOT)/include"
 
 ALL_C_SRCS := src/bloom_scene.c src/bloom_ui.c src/bloom_prefab.c src/bloom_lean_jsi.c src/bloom_gpu_host.c src/bloom_cli.c
 CORE_OBJS  := $(BUILD_DIR)/bloom_scene.o $(BUILD_DIR)/bloom_ui.o $(BUILD_DIR)/bloom_prefab.o
@@ -82,18 +82,17 @@ all: cpp-gate $(LIBBLOOM_A) $(LIBBLOOM_DYN) $(GEN_SPV) $(GEN_MSL) $(BLOOM_BIN) $
 verify: all test mutate-check
 
 test: cpp-gate all
-	./$(BLOOM_BIN) --headless $(STUDIO_IMG) --out $(BUILD_DIR)/.cli_smoke.ppm --steps 30 && rm -f $(BUILD_DIR)/.cli_smoke.ppm
+	./$(BLOOM_BIN) --headless $(STUDIO_IMG) --out $(BUILD_DIR)/.cli_smoke.ppm --emit-fir $(BUILD_DIR)/.cli_smoke.fir --steps 30
+	./$(BLOOM_BIN) --hunt-fir $(BUILD_DIR)/.cli_smoke.fir --trials 65536 --hunt-mode sweep --verify-cpu
+	./$(BLOOM_BIN) --hunt-fir $(BUILD_DIR)/.cli_smoke.fir --trials 65536 --hunt-mode neq --hunt-target 0 --hunt-prng --verify-cpu
+	@rm -f $(BUILD_DIR)/.cli_smoke.ppm $(BUILD_DIR)/.cli_smoke.fir
 
-mutate-check: $(LIBBLOOM_A)
-	@if [ "$(UNAME_S)" = "Darwin" ] && [ "$$(uname -m)" = "arm64" ]; then \
-		python3 tools/sabotage_check.py; \
-	else \
-		echo "[mutate-check] Skipping Mach-O ARM64 binary sabotage gate on $(UNAME_S)/$$(uname -m)"; \
-	fi
+mutate-check: $(LIBBLOOM_A) $(SCHEMA_HDR)
+	python3 tools/sabotage_check.py
 
 cpp-gate: include/*.h $(SCHEMA_HDR) | $(BUILD_DIR)
-	@printf '#include "flow.h"\n#include "searu.h"\n#include "bloom.h"\n#include "bloom_abi.h"\n#include "bloom_scene.h"\n#include "bloom_ui.h"\n#include "bloom_prefab.h"\n#include "bloom_host.h"\nint bloom_cpp20_abi_probe(void) { return (int)(sizeof(BloomEngineArena) + alignof(BloomEngineArena) + alignof(BloomCell64)); }\n' | \
-		$(CXX) -x c++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -c - -o $(BUILD_DIR)/.cpp_gate.o
+	@printf '#include "flow.h"\n#include "searu.h"\n#include "flow_cholesky_sdd.h"\n#include "flow_sha256.h"\n#include "flow_sha256_io.h"\n#include "flow_ir_builder.h"\n#include "flow_ir_io.h"\n#include "bloom.h"\n#include "bloom_abi.h"\n#include "bloom_scene.h"\n#include "bloom_ui.h"\n#include "bloom_prefab.h"\n#include "bloom_host.h"\nint bloom_cpp20_abi_probe(void) { return (int)(sizeof(BloomEngineArena) + alignof(BloomEngineArena) + alignof(BloomCell64)); }\n' | \
+		$(CXX) -x c++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -isystem "$(FLOW_DIR)/sdk" -c - -o $(BUILD_DIR)/.cpp_gate.o
 	@rm -f $(BUILD_DIR)/.cpp_gate.o
 
 $(BUILD_DIR):
@@ -118,7 +117,7 @@ $(STATIC_STAMP): $(ALL_C_SRCS) include/*.h $(SCHEMA_HDR) | $(BUILD_DIR) upstream
 	$(CLANG_TIDY) -checks='-*,clang-analyzer-*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling' \
 		--header-filter='include/.*' -warnings-as-errors='*' \
 		$(ALL_C_SRCS) \
-		-- -std=c17 -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -isystem "$(LEAN_SYSROOT)/include" $(SDL3_CFLAGS)
+		-- -std=c17 -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -isystem "$(FLOW_DIR)/sdk" -isystem "$(LEAN_SYSROOT)/include" $(SDL3_CFLAGS)
 	@touch $@
 
 $(LIBBLOOM_A): $(CORE_OBJS) $(STATIC_STAMP)
@@ -165,6 +164,7 @@ $(SHADER_STAMP): $(WGSL_SRC) | $(BUILD_DIR)
 	    -e 's/rc_buf \[\[user(fake0)\]\]/rc_buf [[buffer(2)]]/g' \
 	    -e 's/out_tex \[\[user(fake0)\]\]/out_tex [[texture(0)]]/g' \
 	    -e 's/bloom_rc_cascade\([012]\)_(/bloom_rc_cascade\1(/g' \
+	    -e 's/bloom_fir1_hunt_(/bloom_fir1_hunt(/g' \
 	    $(GEN_MSL) > $(GEN_MSL).tmp && mv $(GEN_MSL).tmp $(GEN_MSL)
 	@! grep -q 'user(fake' $(GEN_MSL)
 	@touch $@

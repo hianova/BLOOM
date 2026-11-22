@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "bloom.h"
+#include "flow_ir.h"
 
 struct BloomGpuCtx {
     BloomEngineArena       *arena;
@@ -13,11 +14,13 @@ struct BloomGpuCtx {
     SDL_GPUComputePipeline *pipe_rc2;
     SDL_GPUComputePipeline *pipe_rc1;
     SDL_GPUComputePipeline *pipe_rc0;
+    SDL_GPUComputePipeline *pipe_fir1;
     SDL_GPUBuffer          *arena_gpu_buf;
     SDL_GPUBuffer          *mesh_gpu_buf;
     SDL_GPUBuffer          *rc_gpu_buf;
     SDL_GPUTransferBuffer  *upload_tbuf;
     SDL_GPUTransferBuffer  *mesh_upload_tbuf;
+    SDL_GPUTransferBuffer  *rc_download_tbuf;
     SDL_GPUTexture         *frame_tex;
     SDL_GPUTransferBuffer  *download_tbuf;
     SDL_AudioStream        *audio_stream;
@@ -25,6 +28,10 @@ struct BloomGpuCtx {
     uint32_t                height;
     uint32_t                dispatch_count;
     uint32_t                idle_skip_count;
+    uint32_t                rc_cache_hits;
+    uint32_t                mesh_epoch;
+    uint64_t                rc_scene_hash;
+    bool                    rc_valid;
     bool                    hardware_gpu;
     bool                    unified_memory;
     char                    driver_name[32];
@@ -266,8 +273,13 @@ BloomGpuCtx *bloom_gpu_init(BloomEngineArena *arena, const char *shader_path) {
     ctx->pipe_rc1 = SDL_CreateGPUComputePipeline(dev, &pipe_info);
     pipe_info.entrypoint = "bloom_rc_cascade0";
     ctx->pipe_rc0 = SDL_CreateGPUComputePipeline(dev, &pipe_info);
+    pipe_info.entrypoint = "bloom_fir1_hunt";
+    pipe_info.threadcount_x = 64U;
+    pipe_info.threadcount_y = 1U;
+    pipe_info.threadcount_z = 1U;
+    ctx->pipe_fir1 = SDL_CreateGPUComputePipeline(dev, &pipe_info);
     SDL_free(code);
-    if (!ctx->pipeline || !ctx->pipe_rc2 || !ctx->pipe_rc1 || !ctx->pipe_rc0) {
+    if (!ctx->pipeline || !ctx->pipe_rc2 || !ctx->pipe_rc1 || !ctx->pipe_rc0 || !ctx->pipe_fir1) {
         fprintf(stderr, "[BLOOM SDL3-GPU] SDL_CreateGPUComputePipeline('%s') failed: %s\n",
                 resolved_path, SDL_GetError());
         bloom_gpu_destroy(ctx);
@@ -296,8 +308,14 @@ BloomGpuCtx *bloom_gpu_init(BloomEngineArena *arena, const char *shader_path) {
     up_info.size = (Uint32)BLOOM_MESH_ARENA_BYTES;
     ctx->mesh_upload_tbuf = SDL_CreateGPUTransferBuffer(dev, &up_info);
 
+    SDL_GPUTransferBufferCreateInfo rc_dl_info;
+    memset(&rc_dl_info, 0, sizeof(rc_dl_info));
+    rc_dl_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+    rc_dl_info.size = (Uint32)BLOOM_RC_BUFFER_BYTES;
+    ctx->rc_download_tbuf = SDL_CreateGPUTransferBuffer(dev, &rc_dl_info);
+
     if (!ctx->arena_gpu_buf || !ctx->mesh_gpu_buf || !ctx->rc_gpu_buf || !ctx->upload_tbuf ||
-        !ctx->mesh_upload_tbuf || !bloom_gpu_alloc_frame_targets(ctx, w, h) ||
+        !ctx->mesh_upload_tbuf || !ctx->rc_download_tbuf || !bloom_gpu_alloc_frame_targets(ctx, w, h) ||
         !bloom_gpu_upload_mesh(ctx, NULL)) {
         fprintf(stderr, "[BLOOM SDL3-GPU] GPU resource allocation failed: %s\n", SDL_GetError());
         bloom_gpu_destroy(ctx);
@@ -354,10 +372,326 @@ uint32_t bloom_gpu_idle_skip_count(const BloomGpuCtx *ctx) {
     return ctx ? ctx->idle_skip_count : 0U;
 }
 
+uint32_t bloom_gpu_rc_cache_hits(const BloomGpuCtx *ctx) {
+    return ctx ? ctx->rc_cache_hits : 0U;
+}
+
+static uint64_t bloom_gpu_fnv1a_u32(uint64_t h, uint32_t v) {
+    for (uint32_t b = 0U; b < 4U; ++b) {
+        h ^= (uint64_t)((v >> (b * 8U)) & 0xFFU);
+        h *= UINT64_C(0x00000100000001B3);
+    }
+    return h;
+}
+
+static uint64_t bloom_gpu_hash_rc_scene(const BloomEngineArena *arena, uint32_t mesh_epoch) {
+    const BloomFrameHeader64 *hdr = &arena->map.frame_hdr;
+    const uint32_t *u32_cells = (const uint32_t *)(const void *)arena->cells;
+    uint64_t h = UINT64_C(0xCBF29CE484222325);
+    h = bloom_gpu_fnv1a_u32(h, hdr->frame_seq);
+    h = bloom_gpu_fnv1a_u32(h, hdr->inst_count);
+    h = bloom_gpu_fnv1a_u32(h, hdr->csg_count);
+    h = bloom_gpu_fnv1a_u32(h, hdr->bvh_count);
+    h = bloom_gpu_fnv1a_u32(h, hdr->flags & (BLOOM_FLAG_XRAY_ENABLED | BLOOM_FLAG_RADIANCE_CASCADES));
+    h = bloom_gpu_fnv1a_u32(h, (uint32_t)hdr->xray_plane_q16);
+    h = bloom_gpu_fnv1a_u32(h, mesh_epoch);
+    for (size_t i = 8U * 16U; i < 152U * 16U; ++i) {
+        h = bloom_gpu_fnv1a_u32(h, u32_cells[i]);
+    }
+    for (size_t i = 254U * 16U; i < 256U * 16U; ++i) {
+        h = bloom_gpu_fnv1a_u32(h, u32_cells[i]);
+    }
+    return h;
+}
+
+static uint32_t bloom_fir_fmix32(uint32_t h) {
+    h ^= h >> 16U;
+    h *= UINT32_C(0x85EBCA6B);
+    h ^= h >> 13U;
+    h *= UINT32_C(0xC2B2AE35);
+    h ^= h >> 16U;
+    return h;
+}
+
+static void bloom_fir_build_trial_inputs(const flow_ir_prog_t *prog,
+                                         const BloomFir1HuntConfig *cfg,
+                                         uint32_t gtid,
+                                         uint64_t out_inputs[FLOW_IR_MAX_IO]) {
+    memset(out_inputs, 0, sizeof(uint64_t) * FLOW_IR_MAX_IO);
+    uint64_t seed_full = ((uint64_t)cfg->seed_hi << 32U) | (uint64_t)cfg->seed_lo;
+    for (uint32_t i = 0U; i < prog->num_inputs; ++i) {
+        uint64_t wm = flow_ir_mask_u64(prog->vals[i].width);
+        uint64_t iv = cfg->base_inputs[i];
+        uint32_t sh = (i < 31U) ? i : 31U;
+        if (((cfg->vary_input_mask >> sh) & 1U) != 0U) {
+            if (cfg->sweep_mode == 1U) {
+                uint32_t h0 = bloom_fir_fmix32(cfg->seed_lo ^ gtid ^ (i * UINT32_C(0x9E3779B9)));
+                uint32_t h1 = bloom_fir_fmix32(cfg->seed_hi ^ (gtid * UINT32_C(0x85EBCA6B)) ^
+                                               (i * UINT32_C(0xC2B2AE35)) ^ h0);
+                iv = ((uint64_t)h1 << 32U) | (uint64_t)h0;
+            } else {
+                if (i == 0U) {
+                    iv += seed_full + (uint64_t)gtid;
+                } else {
+                    iv += (uint64_t)(gtid ^ (i * UINT32_C(0x9E3779B9)));
+                }
+            }
+        }
+        out_inputs[i] = iv & wm;
+    }
+}
+
+bool bloom_gpu_hunt_fir1(BloomGpuCtx *ctx,
+                         const uint8_t *fir_bytes,
+                         size_t fir_len,
+                         const BloomFir1HuntConfig *cfg,
+                         BloomFir1HuntResult *out) {
+    if (!ctx || !ctx->device || !ctx->pipe_fir1 || !ctx->arena_gpu_buf || !ctx->mesh_gpu_buf ||
+        !ctx->rc_gpu_buf || !ctx->upload_tbuf || !ctx->mesh_upload_tbuf || !ctx->rc_download_tbuf ||
+        !fir_bytes || !cfg || !out || cfg->num_trials == 0U) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    out->first_hit_trial = 0xFFFFFFFFU;
+
+    flow_ir_prog_t *prog = (flow_ir_prog_t *)calloc(1U, sizeof(flow_ir_prog_t));
+    BloomEngineArena *h_arena = (BloomEngineArena *)calloc(1U, sizeof(BloomEngineArena));
+    BloomMeshArena *h_mesh = (BloomMeshArena *)calloc(1U, sizeof(BloomMeshArena));
+    if (!prog || !h_arena || !h_mesh) {
+        free(h_mesh);
+        free(h_arena);
+        free(prog);
+        return false;
+    }
+
+    if (!flow_ir_load_bytes(prog, fir_bytes, fir_len) ||
+        prog->num_vals == 0U || prog->num_vals > 128U ||
+        prog->num_ops > 512U || prog->num_lut_u64 > 1736U ||
+        prog->num_inputs > 32U || prog->num_outputs > 32U) {
+        free(h_mesh);
+        free(h_arena);
+        free(prog);
+        return false;
+    }
+    for (uint32_t i = 0U; i < prog->num_vals; ++i) {
+        if (prog->vals[i].width > 64U) {
+            free(h_mesh);
+            free(h_arena);
+            free(prog);
+            return false;
+        }
+    }
+
+    out->num_inputs = prog->num_inputs;
+    out->num_outputs = prog->num_outputs;
+
+    uint32_t *au = (uint32_t *)(void *)h_arena;
+    au[0] = UINT32_C(0x46495248); /* "FIRH" */
+    au[1] = prog->num_vals;
+    au[2] = prog->num_inputs;
+    au[3] = prog->num_outputs;
+    au[4] = prog->num_ops;
+    au[5] = prog->num_lut_u64;
+    au[7] = cfg->target_mode;
+    au[8] = cfg->seed_lo;
+    au[9] = cfg->seed_hi;
+    au[10] = cfg->target_lo;
+    au[11] = cfg->target_hi;
+    au[12] = cfg->vary_input_mask;
+    au[13] = cfg->sweep_mode;
+
+    for (uint32_t i = 0U; i < prog->num_inputs; ++i) {
+        au[16U + i * 2U + 0U] = (uint32_t)(cfg->base_inputs[i] & UINT64_C(0xFFFFFFFF));
+        au[16U + i * 2U + 1U] = (uint32_t)(cfg->base_inputs[i] >> 32U);
+    }
+    for (uint32_t i = 0U; i < prog->num_outputs; ++i) {
+        au[80U + i] = prog->outputs[i];
+    }
+    for (uint32_t i = 0U; i < prog->num_vals; ++i) {
+        au[112U + i] = (uint32_t)prog->vals[i].width;
+    }
+    for (uint32_t i = 0U; i < prog->num_lut_u64; ++i) {
+        au[624U + i * 2U + 0U] = (uint32_t)(prog->lut_pool[i] & UINT64_C(0xFFFFFFFF));
+        au[624U + i * 2U + 1U] = (uint32_t)(prog->lut_pool[i] >> 32U);
+    }
+    uint32_t *mu = (uint32_t *)(void *)h_mesh;
+    for (uint32_t i = 0U; i < prog->num_ops; ++i) {
+        const flow_ir_op_t *op = &prog->ops[i];
+        uint32_t *mo = mu + (i * 16U);
+        mo[0] = (uint32_t)op->kind | ((uint32_t)op->num_ins << 16U);
+        mo[1] = op->out_val;
+        mo[2] = op->ins[0];
+        mo[3] = op->ins[1];
+        mo[4] = op->ins[2];
+        mo[5] = op->ins[3];
+        mo[6] = op->ins[4];
+        mo[7] = op->ins[5];
+        mo[8] = op->lut_off;
+        mo[9] = op->lut_len;
+        mo[10] = (uint32_t)(op->p0 & UINT64_C(0xFFFFFFFF));
+        mo[11] = (uint32_t)(op->p0 >> 32U);
+        mo[12] = (uint32_t)(op->p1 & UINT64_C(0xFFFFFFFF));
+        mo[13] = (uint32_t)(op->p1 >> 32U);
+        mo[14] = (uint32_t)(op->p2 & UINT64_C(0xFFFFFFFF));
+        mo[15] = (uint32_t)(op->p3 & UINT64_C(0xFFFFFFFF));
+    }
+
+    if (!bloom_gpu_upload_mesh(ctx, h_mesh)) {
+        free(h_mesh);
+        free(h_arena);
+        free(prog);
+        return false;
+    }
+
+    const uint32_t max_chunk_trials = UINT32_C(4194304); /* 4M trials per GPU command buffer */
+    uint64_t t_start_ns = SDL_GetTicksNS();
+    uint32_t remaining = cfg->num_trials;
+    uint32_t base_off = 0U;
+    bool ok = true;
+
+    while (remaining > 0U && ok) {
+        uint32_t chunk_trials = (remaining > max_chunk_trials) ? max_chunk_trials : remaining;
+        uint32_t num_threads = (chunk_trials < 32768U) ? chunk_trials : 32768U;
+        uint32_t num_wgs = (num_threads + 63U) / 64U;
+        au[6] = chunk_trials;
+        au[14] = num_threads;
+        au[15] = base_off;
+
+        void *mapped_up = SDL_MapGPUTransferBuffer(ctx->device, ctx->upload_tbuf, false);
+        if (!mapped_up) {
+            ok = false;
+            break;
+        }
+        memcpy(mapped_up, h_arena, BLOOM_ARENA_BYTES);
+        SDL_UnmapGPUTransferBuffer(ctx->device, ctx->upload_tbuf);
+
+        SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ctx->device);
+        if (!cmd) {
+            ok = false;
+            break;
+        }
+
+        SDL_GPUCopyPass *up_pass = SDL_BeginGPUCopyPass(cmd);
+        if (!up_pass) {
+            SDL_CancelGPUCommandBuffer(cmd);
+            ok = false;
+            break;
+        }
+        SDL_GPUTransferBufferLocation up_src;
+        memset(&up_src, 0, sizeof(up_src));
+        up_src.transfer_buffer = ctx->upload_tbuf;
+        SDL_GPUBufferRegion up_dst;
+        memset(&up_dst, 0, sizeof(up_dst));
+        up_dst.buffer = ctx->arena_gpu_buf;
+        up_dst.size = (Uint32)BLOOM_ARENA_BYTES;
+        SDL_UploadToGPUBuffer(up_pass, &up_src, &up_dst, false);
+        SDL_EndGPUCopyPass(up_pass);
+
+        SDL_GPUStorageTextureReadWriteBinding rw_tex;
+        memset(&rw_tex, 0, sizeof(rw_tex));
+        rw_tex.texture = ctx->frame_tex;
+        SDL_GPUStorageBufferReadWriteBinding rw_buf;
+        memset(&rw_buf, 0, sizeof(rw_buf));
+        rw_buf.buffer = ctx->rc_gpu_buf;
+        SDL_GPUComputePass *cpass = SDL_BeginGPUComputePass(cmd, &rw_tex, 1U, &rw_buf, 1U);
+        if (!cpass) {
+            SDL_CancelGPUCommandBuffer(cmd);
+            ok = false;
+            break;
+        }
+        SDL_GPUBuffer *ro_bufs[2] = { ctx->arena_gpu_buf, ctx->mesh_gpu_buf };
+        SDL_BindGPUComputePipeline(cpass, ctx->pipe_fir1);
+        SDL_BindGPUComputeStorageBuffers(cpass, 0U, ro_bufs, 2U);
+        SDL_DispatchGPUCompute(cpass, num_wgs, 1U, 1U);
+        SDL_EndGPUComputePass(cpass);
+
+        SDL_GPUCopyPass *dl_pass = SDL_BeginGPUCopyPass(cmd);
+        if (!dl_pass) {
+            SDL_CancelGPUCommandBuffer(cmd);
+            ok = false;
+            break;
+        }
+        SDL_GPUBufferRegion dl_src;
+        memset(&dl_src, 0, sizeof(dl_src));
+        dl_src.buffer = ctx->rc_gpu_buf;
+        dl_src.size = (Uint32)(num_threads * 16U);
+        SDL_GPUTransferBufferLocation dl_dst;
+        memset(&dl_dst, 0, sizeof(dl_dst));
+        dl_dst.transfer_buffer = ctx->rc_download_tbuf;
+        SDL_DownloadFromGPUBuffer(dl_pass, &dl_src, &dl_dst);
+        SDL_EndGPUCopyPass(dl_pass);
+
+        SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+        if (!fence || !SDL_WaitForGPUFences(ctx->device, true, &fence, 1U)) {
+            if (fence) SDL_ReleaseGPUFence(ctx->device, fence);
+            ok = false;
+            break;
+        }
+        SDL_ReleaseGPUFence(ctx->device, fence);
+
+        const uint32_t *wg_res = (const uint32_t *)SDL_MapGPUTransferBuffer(
+            ctx->device, ctx->rc_download_tbuf, false);
+        if (!wg_res) {
+            ok = false;
+            break;
+        }
+        for (uint32_t t = 0U; t < num_threads; ++t) {
+            uint32_t min_local = wg_res[t * 4U + 0U];
+            uint32_t t_hits = wg_res[t * 4U + 1U];
+            uint64_t t_xor = ((uint64_t)wg_res[t * 4U + 3U] << 32U) | (uint64_t)wg_res[t * 4U + 2U];
+            out->out0_xor_checksum ^= t_xor;
+            out->hit_count += t_hits;
+            if (min_local != 0xFFFFFFFFU) {
+                uint32_t cand = base_off + min_local;
+                if (!out->found || cand < out->first_hit_trial) {
+                    out->found = true;
+                    out->first_hit_trial = cand;
+                }
+            }
+        }
+        SDL_UnmapGPUTransferBuffer(ctx->device, ctx->rc_download_tbuf);
+
+        out->trials_evaluated += chunk_trials;
+        base_off += chunk_trials;
+        remaining -= chunk_trials;
+    }
+
+    uint64_t t_end_ns = SDL_GetTicksNS();
+    out->elapsed_us = (t_end_ns >= t_start_ns) ? ((t_end_ns - t_start_ns) / 1000ULL) : 1ULL;
+    if (out->elapsed_us == 0ULL) {
+        out->elapsed_us = 1ULL;
+    }
+    ctx->rc_valid = false;
+    ctx->mesh_epoch++;
+
+    if (ok && out->found) {
+        bloom_fir_build_trial_inputs(prog, cfg, out->first_hit_trial, out->witness_inputs);
+        if (!flow_ir_eval_u64(prog, out->witness_inputs, out->witness_outputs)) {
+            ok = false;
+        } else {
+            uint64_t target = ((uint64_t)cfg->target_hi << 32U) | (uint64_t)cfg->target_lo;
+            uint64_t got = (prog->num_outputs > 0U) ? out->witness_outputs[0] : 0ULL;
+            bool match = (cfg->target_mode == 0U) ? (got == target) :
+                         ((cfg->target_mode == 1U) ? (got != target) : true);
+            out->cpu_verified = match;
+            if (!match) {
+                ok = false;
+            }
+        }
+    }
+
+    free(h_mesh);
+    free(h_arena);
+    free(prog);
+    return ok;
+}
+
 bool bloom_gpu_upload_mesh(BloomGpuCtx *ctx, const BloomMeshArena *mesh) {
     if (!ctx || !ctx->device || !ctx->mesh_gpu_buf || !ctx->mesh_upload_tbuf) {
         return false;
     }
+    ctx->mesh_epoch++;
+    ctx->rc_valid = false;
     void *mapped = SDL_MapGPUTransferBuffer(ctx->device, ctx->mesh_upload_tbuf, false);
     if (!mapped) {
         return false;
@@ -459,19 +793,26 @@ bool bloom_gpu_render(BloomGpuCtx *ctx, bool force_render) {
 
     SDL_GPUBuffer *ro_bufs[2] = { ctx->arena_gpu_buf, ctx->mesh_gpu_buf };
     if ((hdr->flags & BLOOM_FLAG_RADIANCE_CASCADES) != 0U) {
-        SDL_GPUComputePipeline *rc_pipes[3] = { ctx->pipe_rc2, ctx->pipe_rc1, ctx->pipe_rc0 };
-        const Uint32 rc_gx[3] = { 64U, 64U, 32U };
-        const Uint32 rc_gy[3] = { 1U,  4U,  1U };
-        for (uint32_t p = 0U; p < 3U; ++p) {
-            SDL_GPUComputePass *rc_pass = SDL_BeginGPUComputePass(cmd, &rw_tex, 1U, &rw_buf, 1U);
-            if (!rc_pass) {
-                SDL_CancelGPUCommandBuffer(cmd);
-                return false;
+        uint64_t cur_rc_hash = bloom_gpu_hash_rc_scene(ctx->arena, ctx->mesh_epoch);
+        if (!force_render && ctx->rc_valid && cur_rc_hash == ctx->rc_scene_hash) {
+            ctx->rc_cache_hits++;
+        } else {
+            SDL_GPUComputePipeline *rc_pipes[3] = { ctx->pipe_rc2, ctx->pipe_rc1, ctx->pipe_rc0 };
+            const Uint32 rc_gx[3] = { 64U, 64U, 32U };
+            const Uint32 rc_gy[3] = { 1U,  4U,  1U };
+            for (uint32_t p = 0U; p < 3U; ++p) {
+                SDL_GPUComputePass *rc_pass = SDL_BeginGPUComputePass(cmd, &rw_tex, 1U, &rw_buf, 1U);
+                if (!rc_pass) {
+                    SDL_CancelGPUCommandBuffer(cmd);
+                    return false;
+                }
+                SDL_BindGPUComputePipeline(rc_pass, rc_pipes[p]);
+                SDL_BindGPUComputeStorageBuffers(rc_pass, 0U, ro_bufs, 2U);
+                SDL_DispatchGPUCompute(rc_pass, rc_gx[p], rc_gy[p], 1U);
+                SDL_EndGPUComputePass(rc_pass);
             }
-            SDL_BindGPUComputePipeline(rc_pass, rc_pipes[p]);
-            SDL_BindGPUComputeStorageBuffers(rc_pass, 0U, ro_bufs, 2U);
-            SDL_DispatchGPUCompute(rc_pass, rc_gx[p], rc_gy[p], 1U);
-            SDL_EndGPUComputePass(rc_pass);
+            ctx->rc_scene_hash = cur_rc_hash;
+            ctx->rc_valid = true;
         }
     }
 
@@ -1196,6 +1537,9 @@ void bloom_gpu_destroy(BloomGpuCtx *ctx) {
         if (ctx->mesh_upload_tbuf) {
             SDL_ReleaseGPUTransferBuffer(ctx->device, ctx->mesh_upload_tbuf);
         }
+        if (ctx->rc_download_tbuf) {
+            SDL_ReleaseGPUTransferBuffer(ctx->device, ctx->rc_download_tbuf);
+        }
         if (ctx->upload_tbuf) {
             SDL_ReleaseGPUTransferBuffer(ctx->device, ctx->upload_tbuf);
         }
@@ -1207,6 +1551,9 @@ void bloom_gpu_destroy(BloomGpuCtx *ctx) {
         }
         if (ctx->arena_gpu_buf) {
             SDL_ReleaseGPUBuffer(ctx->device, ctx->arena_gpu_buf);
+        }
+        if (ctx->pipe_fir1) {
+            SDL_ReleaseGPUComputePipeline(ctx->device, ctx->pipe_fir1);
         }
         if (ctx->pipe_rc0) {
             SDL_ReleaseGPUComputePipeline(ctx->device, ctx->pipe_rc0);
