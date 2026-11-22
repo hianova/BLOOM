@@ -4016,3 +4016,224 @@ fn bloom_info_sim_matrix(@builtin(global_invocation_id) gid : vec3<u32>) {
         bitcast<f32>(exact_cnt)
     );
 }
+
+// ----------------------------------------------------------------------------
+// 10. BLOOM Parallel-Universe Distributed System DST (`bloom_node_dst`)
+// ----------------------------------------------------------------------------
+// Simulates 5-node Raft/BFT clusters across N parallel universes x T ticks
+// under crash/recovery + network partition faults (magic = 0x4E445354 "NDST").
+// Safe mode preserves (term, voted_for) atomically across crash recovery.
+// Buggy mode (mode_flags & 1u) wipes voted_for on crash recovery, exposing
+// classic split-brain dual-leader elections in identical terms.
+// Outputs per-universe vec4<u32> packed as vec4<f32> at rc_buf[24576u + gid.x]:
+//   .x = safety_violations, .y = commits_total, .z = elections_total, .w = digest
+
+fn dst_hash_u32(x : u32) -> u32 {
+    var v : u32 = x ^ (x >> 16u);
+    v = v * 0x7FEB352Du;
+    v = v ^ (v >> 15u);
+    v = v * 0x846CA68Bu;
+    return v ^ (v >> 16u);
+}
+
+fn dst_xorshift32(state : u32) -> u32 {
+    var x : u32 = state;
+    if (x == 0u) {
+        x = 0x6D2B79F5u;
+    }
+    x = x ^ (x << 13u);
+    x = x ^ (x >> 17u);
+    x = x ^ (x << 5u);
+    return x;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn bloom_node_dst(@builtin(global_invocation_id) gid : vec3<u32>) {
+    if (gid.x == 0xFFFFFFFFu) {
+        textureStore(out_tex, vec2<i32>(0, 0), vec4<f32>(0.0));
+    }
+
+    let hdr0 = arena[0].q0;
+    let hdr1 = arena[0].q1;
+    if (hdr0.x != 0x4E445354u) {
+        return;
+    }
+
+    let batch_count = min(hdr0.y, 8192u);
+    let i = gid.x;
+    if (i >= batch_count) {
+        return;
+    }
+
+    let ticks = min(hdr0.z, 4096u);
+    let fault_ppm = min(hdr0.w, 1000000u);
+    let seed_lo = hdr1.x;
+    let seed_hi = hdr1.y;
+    let base_u = hdr1.z;
+    let buggy_mode = (hdr1.w & 1u) != 0u;
+
+    let u_id = base_u + i;
+    var rng : u32 = dst_hash_u32(seed_lo ^ dst_hash_u32(seed_hi ^ (u_id + 0x9E3779B9u)));
+    if (rng == 0u) {
+        rng = 0x6D2B79F5u;
+    }
+
+    var term : array<u32, 5>;
+    var voted_for : array<u32, 5>;
+    var role : array<u32, 5>;
+    var log_len : array<u32, 5>;
+    var commit_idx : array<u32, 5>;
+    var alive : array<u32, 5>;
+    var part : array<u32, 5>;
+
+    for (var n : u32 = 0u; n < 5u; n = n + 1u) {
+        term[n] = 0u;
+        voted_for[n] = 5u;
+        role[n] = 0u;
+        log_len[n] = 0u;
+        commit_idx[n] = 0u;
+        alive[n] = 1u;
+        part[n] = 0u;
+    }
+
+    var last_elected_term : u32 = 0u;
+    var last_elected_leader : u32 = 5u;
+    var safety_violations : u32 = 0u;
+    var commits_total : u32 = 0u;
+    var elections_total : u32 = 0u;
+
+    for (var t : u32 = 0u; t < ticks; t = t + 1u) {
+        // Phase 1: Crash / recover / partition / heal fault injection
+        for (var n : u32 = 0u; n < 5u; n = n + 1u) {
+            rng = dst_xorshift32(rng);
+            if ((rng % 1000000u) < fault_ppm) {
+                let kind = (rng >> 8u) & 3u;
+                if (kind == 0u) {
+                    alive[n] = 0u;
+                    role[n] = 0u;
+                } else if (kind == 1u) {
+                    alive[n] = 1u;
+                    role[n] = 0u;
+                    if (buggy_mode) {
+                        voted_for[n] = 5u;
+                    }
+                } else if (kind == 2u) {
+                    part[n] = 1u;
+                } else {
+                    part[n] = 0u;
+                    alive[n] = 1u;
+                }
+            } else if (alive[n] == 0u && ((rng & 1u) != 0u)) {
+                alive[n] = 1u;
+                if (buggy_mode) {
+                    voted_for[n] = 5u;
+                }
+            }
+        }
+
+        // Phase 2: Two election attempts per tick to exercise split votes & recovery
+        for (var attempt : u32 = 0u; attempt < 2u; attempt = attempt + 1u) {
+            rng = dst_xorshift32(rng);
+            let cand = rng % 5u;
+            if (alive[cand] != 0u && role[cand] == 0u) {
+                var new_term : u32 = term[cand] + 1u;
+                if (term[cand] > 0u && voted_for[cand] == 5u) {
+                    new_term = term[cand];
+                }
+                term[cand] = new_term;
+                voted_for[cand] = cand;
+                role[cand] = 1u;
+
+                var votes : u32 = 1u;
+                for (var v : u32 = 0u; v < 5u; v = v + 1u) {
+                    if (v != cand && alive[v] != 0u && part[v] == part[cand]) {
+                        if (term[v] < new_term) {
+                            term[v] = new_term;
+                            voted_for[v] = 5u;
+                            role[v] = 0u;
+                        }
+                        if (term[v] == new_term && (voted_for[v] == 5u || voted_for[v] == cand) &&
+                            commit_idx[cand] >= commit_idx[v]) {
+                            voted_for[v] = cand;
+                            votes = votes + 1u;
+                        }
+                    }
+                }
+
+                if (votes >= 3u) {
+                    role[cand] = 2u;
+                    elections_total = elections_total + 1u;
+                    if (new_term == last_elected_term && last_elected_leader != 5u && last_elected_leader != cand) {
+                        safety_violations = safety_violations + 1u;
+                    }
+                    if (new_term > last_elected_term) {
+                        last_elected_term = new_term;
+                        last_elected_leader = cand;
+                    }
+                } else {
+                    role[cand] = 0u;
+                }
+            }
+        }
+
+        // Phase 3: Same-term multi-leader invariant check across alive cluster
+        for (var a : u32 = 0u; a < 5u; a = a + 1u) {
+            if (role[a] == 2u) {
+                for (var b : u32 = a + 1u; b < 5u; b = b + 1u) {
+                    if (role[b] == 2u && term[a] == term[b]) {
+                        safety_violations = safety_violations + 1u;
+                    }
+                }
+            }
+        }
+
+        // Phase 4: Active leader replication & quorum commit
+        for (var ldr : u32 = 0u; ldr < 5u; ldr = ldr + 1u) {
+            if (alive[ldr] != 0u && role[ldr] == 2u) {
+                var acks : u32 = 1u;
+                for (var p : u32 = 0u; p < 5u; p = p + 1u) {
+                    if (p != ldr && alive[p] != 0u && part[p] == part[ldr]) {
+                        if (term[p] <= term[ldr]) {
+                            if (term[p] < term[ldr]) {
+                                term[p] = term[ldr];
+                                voted_for[p] = 5u;
+                                role[p] = 0u;
+                            }
+                            acks = acks + 1u;
+                        }
+                    }
+                }
+                if (acks >= 3u) {
+                    log_len[ldr] = log_len[ldr] + 1u;
+                    commit_idx[ldr] = log_len[ldr];
+                    commits_total = commits_total + 1u;
+                    for (var p2 : u32 = 0u; p2 < 5u; p2 = p2 + 1u) {
+                        if (p2 != ldr && alive[p2] != 0u && part[p2] == part[ldr] && term[p2] == term[ldr]) {
+                            if (log_len[p2] < log_len[ldr]) {
+                                log_len[p2] = log_len[ldr];
+                            }
+                            if (commit_idx[p2] < commit_idx[ldr]) {
+                                commit_idx[p2] = commit_idx[ldr];
+                            }
+                        }
+                    }
+                } else {
+                    role[ldr] = 0u;
+                }
+            }
+        }
+    }
+
+    var digest : u32 = 0x811C9DC5u ^ u_id;
+    for (var n : u32 = 0u; n < 5u; n = n + 1u) {
+        digest = (digest ^ (term[n] + (voted_for[n] << 8u) + (role[n] << 12u) + (commit_idx[n] << 16u))) * 0x01000193u;
+    }
+    digest = (digest ^ safety_violations ^ (commits_total * 0x9E3779B9u) ^ (elections_total * 0x85EBCA6Bu)) * 0x01000193u;
+
+    rc_buf[24576u + i] = vec4<f32>(
+        bitcast<f32>(safety_violations),
+        bitcast<f32>(commits_total),
+        bitcast<f32>(elections_total),
+        bitcast<f32>(digest)
+    );
+}

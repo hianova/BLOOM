@@ -96,6 +96,8 @@ test: cpp-gate all
 	./$(BLOOM_BIN) --faultsim-fir $(BUILD_DIR)/.cli_smoke.fir --trials 256
 	./$(BLOOM_BIN) --equiv-fir $(BUILD_DIR)/.cli_smoke.fir $(BUILD_DIR)/.cli_smoke.fir --verify-cpu
 	./$(BLOOM_BIN) --gpu-ncd src,include --top 5 --verify-cpu
+	./$(BLOOM_BIN) --node-dst --universes 1024 --ticks 64
+	./$(BLOOM_BIN) --node-dst --universes 1024 --ticks 64 --buggy
 	@rm -f $(BUILD_DIR)/.cli_smoke*
 
 mutate-check: $(LIBBLOOM_A) $(SCHEMA_HDR)
@@ -180,6 +182,7 @@ $(SHADER_STAMP): $(WGSL_SRC) | $(BUILD_DIR)
 	    -e 's/bloom_searu_solve_(/bloom_searu_solve(/g' \
 	    -e 's/bloom_fir1_faultsim_(/bloom_fir1_faultsim(/g' \
 	    -e 's/bloom_info_sim_matrix_(/bloom_info_sim_matrix(/g' \
+	    -e 's/bloom_node_dst_(/bloom_node_dst(/g' \
 	    $(GEN_MSL) > $(GEN_MSL).tmp && mv $(GEN_MSL).tmp $(GEN_MSL)
 	@! grep -q 'user(fake' $(GEN_MSL)
 	@touch $@

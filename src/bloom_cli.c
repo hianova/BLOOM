@@ -69,6 +69,10 @@ typedef struct {
     uint32_t    searu_universes;
     uint32_t    searu_iters;
     uint32_t    searu_rounds;
+    bool        node_dst;
+    bool        node_dst_buggy;
+    uint32_t    node_dst_ticks;
+    uint32_t    node_dst_fault_ppm;
     uint32_t    override_w;
     uint32_t    override_h;
     uint32_t    steps;
@@ -290,6 +294,8 @@ static bool cli_parse_args(int argc, char **argv, BloomCliArgs *out) {
     out->searu_universes = 4096U;
     out->searu_iters = 256U;
     out->searu_rounds = 4U;
+    out->node_dst_ticks = 128U;
+    out->node_dst_fault_ppm = 150000U;
     out->ncd_thr = 36U;
     out->ncd_top = 10U;
     out->sec_norm_q16[0] = BLOOM_Q16_ONE;
@@ -482,10 +488,27 @@ static bool cli_parse_args(int argc, char **argv, BloomCliArgs *out) {
             out->headless = true;
         } else if (strcmp(arg, "--universes") == 0) {
             if (i + 1 >= argc || !cli_parse_u32(argv[++i], &out->searu_universes) ||
-                out->searu_universes == 0U || out->searu_universes > 8192U) {
-                fprintf(stderr, "[BLOOM CLI] Invalid --universes (expected 1..8192)\n");
+                out->searu_universes == 0U || out->searu_universes > 65536U) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --universes (expected 1..65536)\n");
                 return false;
             }
+        } else if (strcmp(arg, "--node-dst") == 0) {
+            out->node_dst = true;
+            out->headless = true;
+        } else if (strcmp(arg, "--ticks") == 0) {
+            if (i + 1 >= argc || !cli_parse_u32(argv[++i], &out->node_dst_ticks) ||
+                out->node_dst_ticks == 0U || out->node_dst_ticks > 4096U) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --ticks (expected 1..4096)\n");
+                return false;
+            }
+        } else if (strcmp(arg, "--fault-prob") == 0) {
+            if (i + 1 >= argc || !cli_parse_u32(argv[++i], &out->node_dst_fault_ppm) ||
+                out->node_dst_fault_ppm > 1000000U) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --fault-prob (expected 0..1000000 ppm)\n");
+                return false;
+            }
+        } else if (strcmp(arg, "--buggy") == 0) {
+            out->node_dst_buggy = true;
         } else if (strcmp(arg, "--searu-iters") == 0) {
             if (i + 1 >= argc || !cli_parse_u32(argv[++i], &out->searu_iters) ||
                 out->searu_iters == 0U || out->searu_iters > 4096U) {
@@ -1450,7 +1473,7 @@ static int cli_run_searu_bench_3sat(const BloomCliArgs *args, BloomEngineArena *
     }
 
     BloomSearuGpuConfig scfg;
-    scfg.num_universes = args->searu_universes;
+    scfg.num_universes = (args->searu_universes <= 8192U) ? args->searu_universes : 8192U;
     scfg.iters_per_round = args->searu_iters;
     scfg.max_rounds = args->searu_rounds;
     scfg.seed = (args->hunt_seed != 0ULL) ? args->hunt_seed : UINT64_C(0xB100BEEF12345678);
@@ -1532,7 +1555,7 @@ static int cli_run_searu_bench_color(const BloomCliArgs *args, BloomEngineArena 
     }
 
     BloomSearuGpuConfig scfg;
-    scfg.num_universes = args->searu_universes;
+    scfg.num_universes = (args->searu_universes <= 8192U) ? args->searu_universes : 8192U;
     scfg.iters_per_round = args->searu_iters;
     scfg.max_rounds = args->searu_rounds;
     scfg.seed = (args->hunt_seed != 0ULL) ? args->hunt_seed : UINT64_C(0xC010A40112345678);
@@ -1640,7 +1663,7 @@ static int cli_run_searu_cnf(const BloomCliArgs *args, BloomEngineArena *arena) 
         return 1;
     }
     BloomSearuGpuConfig scfg;
-    scfg.num_universes = args->searu_universes;
+    scfg.num_universes = (args->searu_universes <= 8192U) ? args->searu_universes : 8192U;
     scfg.iters_per_round = args->searu_iters;
     scfg.max_rounds = args->searu_rounds;
     scfg.seed = (args->hunt_seed != 0ULL) ? args->hunt_seed : UINT64_C(0x5A70C4F012345678);
@@ -1954,6 +1977,35 @@ static int cli_run_gpu_ncd_command(const BloomCliArgs *args, BloomEngineArena *a
     return (ok && cpu_full_ok) ? 0 : 1;
 }
 
+static int cli_run_node_dst_command(const BloomCliArgs *args, BloomEngineArena *arena) {
+    arena->map.frame_hdr.width_px = 64U;
+    arena->map.frame_hdr.height_px = 64U;
+    BloomGpuCtx *gpu = bloom_gpu_init(arena, args->shader_path);
+    if (!gpu) {
+        return 1;
+    }
+
+    uint64_t seed = (args->hunt_seed != 0ULL) ? args->hunt_seed : UINT64_C(0x4E445354C0FFEE01);
+    BloomNodeDstResult res;
+    bool ok = bloom_gpu_node_dst(gpu, args->searu_universes, args->node_dst_ticks,
+                                 args->node_dst_fault_ppm, seed, args->node_dst_buggy, &res);
+    double muticks = (res.elapsed_us > 0ULL)
+                         ? ((double)res.total_universe_ticks / (double)res.elapsed_us)
+                         : 0.0;
+    printf("[BLOOM GPU-NODE-DST] universes=%u ticks=%u fault_ppm=%u buggy=%u total_ticks=%" PRIu64
+           " violated=%u/%u first_cex=%u commits=%" PRIu64 " elections=%" PRIu64
+           " time=%.2fms (%.2f M_uticks/s) cpu_verified=%s GPU=%s\n",
+           res.num_universes, res.ticks, res.fault_prob_ppm, res.buggy_mode ? 1U : 0U,
+           res.total_universe_ticks, res.violated_universes, res.num_universes,
+           res.first_cex_universe, res.total_commits, res.total_elections,
+           (double)res.elapsed_us / 1000.0, muticks,
+           res.cpu_verified ? "EXACT" : "FAIL", bloom_gpu_device_name(gpu));
+
+    bool expectation_met = args->node_dst_buggy ? (res.violated_universes > 0U) : (res.violated_universes == 0U);
+    bloom_gpu_destroy(gpu);
+    return (ok && res.cpu_verified && expectation_met) ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     BloomCliArgs args;
     if (!cli_parse_args(argc, argv, &args)) {
@@ -2056,6 +2108,14 @@ int main(int argc, char **argv) {
         free(staging);
         free(arena);
         return cnf_rc;
+    }
+
+    if (args.node_dst) {
+        int dst_rc = cli_run_node_dst_command(&args, arena);
+        free(mesh);
+        free(staging);
+        free(arena);
+        return dst_rc;
     }
 
     bool is_mesh_asset = false;

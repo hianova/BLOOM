@@ -209,6 +209,31 @@ bool bloom_gpu_info_sim_matrix(BloomGpuCtx *ctx,
                                BloomInfoSimRow *out_rows,
                                BloomInfoSimResult *out_summary);
 
+/* GPU Parallel-Universe Distributed System DST (5-node Raft/BFT cluster per universe) */
+typedef struct {
+    uint32_t num_universes;
+    uint32_t ticks;
+    uint32_t fault_prob_ppm;
+    bool     buggy_mode;
+    uint64_t total_universe_ticks;
+    uint32_t violated_universes;
+    uint64_t total_violations;
+    uint32_t first_cex_universe; /* UINT32_MAX if none */
+    uint64_t total_commits;
+    uint64_t total_elections;
+    uint32_t state_digest_xor;
+    uint64_t elapsed_us;
+    bool     cpu_verified;
+} BloomNodeDstResult;
+
+bool bloom_gpu_node_dst(BloomGpuCtx *ctx,
+                        uint32_t num_universes,
+                        uint32_t ticks,
+                        uint32_t fault_prob_ppm,
+                        uint64_t seed,
+                        bool buggy_mode,
+                        BloomNodeDstResult *out);
+
 /* Dispatches GPU compute if !BLOOM_FLAG_IDLE_SLEEP or force_render == true */
 bool bloom_gpu_render(BloomGpuCtx *ctx, bool force_render);
 

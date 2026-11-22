@@ -20,6 +20,7 @@ struct BloomGpuCtx {
     SDL_GPUComputePipeline *pipe_searu;
     SDL_GPUComputePipeline *pipe_faultsim;
     SDL_GPUComputePipeline *pipe_info_sim;
+    SDL_GPUComputePipeline *pipe_node_dst;
     SDL_GPUBuffer          *arena_gpu_buf;
     SDL_GPUBuffer          *mesh_gpu_buf;
     SDL_GPUBuffer          *rc_gpu_buf;
@@ -291,10 +292,12 @@ BloomGpuCtx *bloom_gpu_init(BloomEngineArena *arena, const char *shader_path) {
     ctx->pipe_faultsim = SDL_CreateGPUComputePipeline(dev, &pipe_info);
     pipe_info.entrypoint = "bloom_info_sim_matrix";
     ctx->pipe_info_sim = SDL_CreateGPUComputePipeline(dev, &pipe_info);
+    pipe_info.entrypoint = "bloom_node_dst";
+    ctx->pipe_node_dst = SDL_CreateGPUComputePipeline(dev, &pipe_info);
     SDL_free(code);
     if (!ctx->pipeline || !ctx->pipe_rc2 || !ctx->pipe_rc1 || !ctx->pipe_rc0 ||
         !ctx->pipe_fir1 || !ctx->pipe_fir1_bs || !ctx->pipe_searu ||
-        !ctx->pipe_faultsim || !ctx->pipe_info_sim) {
+        !ctx->pipe_faultsim || !ctx->pipe_info_sim || !ctx->pipe_node_dst) {
         fprintf(stderr, "[BLOOM SDL3-GPU] SDL_CreateGPUComputePipeline('%s') failed: %s\n",
                 resolved_path, SDL_GetError());
         bloom_gpu_destroy(ctx);
@@ -2745,6 +2748,362 @@ bool bloom_gpu_info_sim_matrix(BloomGpuCtx *ctx,
     return cpu_ok;
 }
 
+static uint32_t bloom_dst_hash_u32(uint32_t x) {
+    uint32_t v = x ^ (x >> 16U);
+    v *= UINT32_C(0x7FEB352D);
+    v ^= (v >> 15U);
+    v *= UINT32_C(0x846CA68B);
+    return v ^ (v >> 16U);
+}
+
+static uint32_t bloom_dst_xorshift32(uint32_t state) {
+    uint32_t x = (state == 0U) ? UINT32_C(0x6D2B79F5) : state;
+    x ^= (x << 13U);
+    x ^= (x >> 17U);
+    x ^= (x << 5U);
+    return x;
+}
+
+static void bloom_node_dst_cpu_sim_one(uint32_t u_id,
+                                         uint32_t ticks,
+                                         uint32_t fault_ppm,
+                                         uint32_t seed_lo,
+                                         uint32_t seed_hi,
+                                         bool buggy_mode,
+                                         uint32_t *out_viol,
+                                         uint32_t *out_commits,
+                                         uint32_t *out_elections,
+                                         uint32_t *out_digest) {
+    uint32_t clamped_ticks = (ticks <= 4096U) ? ticks : 4096U;
+    uint32_t clamped_ppm = (fault_ppm <= 1000000U) ? fault_ppm : 1000000U;
+    uint32_t rng = bloom_dst_hash_u32(seed_lo ^ bloom_dst_hash_u32(seed_hi ^ (u_id + UINT32_C(0x9E3779B9))));
+    if (rng == 0U) {
+        rng = UINT32_C(0x6D2B79F5);
+    }
+
+    uint32_t term[5];
+    uint32_t voted_for[5];
+    uint32_t role[5];
+    uint32_t log_len[5];
+    uint32_t commit_idx[5];
+    uint32_t alive[5];
+    uint32_t part[5];
+    for (uint32_t n = 0U; n < 5U; ++n) {
+        term[n] = 0U;
+        voted_for[n] = 5U;
+        role[n] = 0U;
+        log_len[n] = 0U;
+        commit_idx[n] = 0U;
+        alive[n] = 1U;
+        part[n] = 0U;
+    }
+
+    uint32_t last_elected_term = 0U;
+    uint32_t last_elected_leader = 5U;
+    uint32_t safety_violations = 0U;
+    uint32_t commits_total = 0U;
+    uint32_t elections_total = 0U;
+
+    for (uint32_t t = 0U; t < clamped_ticks; ++t) {
+        for (uint32_t n = 0U; n < 5U; ++n) {
+            rng = bloom_dst_xorshift32(rng);
+            if ((rng % 1000000U) < clamped_ppm) {
+                uint32_t kind = (rng >> 8U) & 3U;
+                if (kind == 0U) {
+                    alive[n] = 0U;
+                    role[n] = 0U;
+                } else if (kind == 1U) {
+                    alive[n] = 1U;
+                    role[n] = 0U;
+                    if (buggy_mode) {
+                        voted_for[n] = 5U;
+                    }
+                } else if (kind == 2U) {
+                    part[n] = 1U;
+                } else {
+                    part[n] = 0U;
+                    alive[n] = 1U;
+                }
+            } else if (alive[n] == 0U && ((rng & 1U) != 0U)) {
+                alive[n] = 1U;
+                if (buggy_mode) {
+                    voted_for[n] = 5U;
+                }
+            }
+        }
+
+        for (uint32_t attempt = 0U; attempt < 2U; ++attempt) {
+            rng = bloom_dst_xorshift32(rng);
+            uint32_t cand = rng % 5U;
+            if (alive[cand] != 0U && role[cand] == 0U) {
+                uint32_t new_term = term[cand] + 1U;
+                if (term[cand] > 0U && voted_for[cand] == 5U) {
+                    new_term = term[cand];
+                }
+                term[cand] = new_term;
+                voted_for[cand] = cand;
+                role[cand] = 1U;
+
+                uint32_t votes = 1U;
+                for (uint32_t v = 0U; v < 5U; ++v) {
+                    if (v != cand && alive[v] != 0U && part[v] == part[cand]) {
+                        if (term[v] < new_term) {
+                            term[v] = new_term;
+                            voted_for[v] = 5U;
+                            role[v] = 0U;
+                        }
+                        if (term[v] == new_term && (voted_for[v] == 5U || voted_for[v] == cand) &&
+                            commit_idx[cand] >= commit_idx[v]) {
+                            voted_for[v] = cand;
+                            votes++;
+                        }
+                    }
+                }
+
+                if (votes >= 3U) {
+                    role[cand] = 2U;
+                    elections_total++;
+                    if (new_term == last_elected_term && last_elected_leader != 5U && last_elected_leader != cand) {
+                        safety_violations++;
+                    }
+                    if (new_term > last_elected_term) {
+                        last_elected_term = new_term;
+                        last_elected_leader = cand;
+                    }
+                } else {
+                    role[cand] = 0U;
+                }
+            }
+        }
+
+        for (uint32_t a = 0U; a < 5U; ++a) {
+            if (role[a] == 2U) {
+                for (uint32_t b = a + 1U; b < 5U; ++b) {
+                    if (role[b] == 2U && term[a] == term[b]) {
+                        safety_violations++;
+                    }
+                }
+            }
+        }
+
+        for (uint32_t ldr = 0U; ldr < 5U; ++ldr) {
+            if (alive[ldr] != 0U && role[ldr] == 2U) {
+                uint32_t acks = 1U;
+                for (uint32_t p = 0U; p < 5U; ++p) {
+                    if (p != ldr && alive[p] != 0U && part[p] == part[ldr]) {
+                        if (term[p] <= term[ldr]) {
+                            if (term[p] < term[ldr]) {
+                                term[p] = term[ldr];
+                                voted_for[p] = 5U;
+                                role[p] = 0U;
+                            }
+                            acks++;
+                        }
+                    }
+                }
+                if (acks >= 3U) {
+                    log_len[ldr] += 1U;
+                    commit_idx[ldr] = log_len[ldr];
+                    commits_total++;
+                    for (uint32_t p2 = 0U; p2 < 5U; ++p2) {
+                        if (p2 != ldr && alive[p2] != 0U && part[p2] == part[ldr] && term[p2] == term[ldr]) {
+                            if (log_len[p2] < log_len[ldr]) {
+                                log_len[p2] = log_len[ldr];
+                            }
+                            if (commit_idx[p2] < commit_idx[ldr]) {
+                                commit_idx[p2] = commit_idx[ldr];
+                            }
+                        }
+                    }
+                } else {
+                    role[ldr] = 0U;
+                }
+            }
+        }
+    }
+
+    uint32_t digest = UINT32_C(0x811C9DC5) ^ u_id;
+    for (uint32_t n = 0U; n < 5U; ++n) {
+        digest = (digest ^ (term[n] + (voted_for[n] << 8U) + (role[n] << 12U) + (commit_idx[n] << 16U))) *
+                 UINT32_C(0x01000193);
+    }
+    digest = (digest ^ safety_violations ^ (commits_total * UINT32_C(0x9E3779B9)) ^
+              (elections_total * UINT32_C(0x85EBCA6B))) *
+             UINT32_C(0x01000193);
+
+    *out_viol = safety_violations;
+    *out_commits = commits_total;
+    *out_elections = elections_total;
+    *out_digest = digest;
+}
+
+bool bloom_gpu_node_dst(BloomGpuCtx *ctx,
+                        uint32_t num_universes,
+                        uint32_t ticks,
+                        uint32_t fault_prob_ppm,
+                        uint64_t seed,
+                        bool buggy_mode,
+                        BloomNodeDstResult *out) {
+    if (!ctx || !ctx->device || !ctx->pipe_node_dst || !ctx->arena_gpu_buf || !ctx->rc_gpu_buf ||
+        !ctx->upload_tbuf || !ctx->rc_download_tbuf || !out ||
+        num_universes == 0U || num_universes > 65536U || ticks == 0U || ticks > 4096U ||
+        fault_prob_ppm > 1000000U) {
+        return false;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->num_universes = num_universes;
+    out->ticks = ticks;
+    out->fault_prob_ppm = fault_prob_ppm;
+    out->buggy_mode = buggy_mode;
+    out->total_universe_ticks = (uint64_t)num_universes * (uint64_t)ticks;
+    out->first_cex_universe = UINT32_MAX;
+
+    BloomEngineArena *h_arena = (BloomEngineArena *)calloc(1U, sizeof(BloomEngineArena));
+    if (!h_arena) {
+        return false;
+    }
+
+    uint32_t seed_lo = (uint32_t)(seed & 0xFFFFFFFFULL);
+    uint32_t seed_hi = (uint32_t)(seed >> 32U);
+    uint32_t *au = (uint32_t *)(void *)h_arena;
+    au[0] = UINT32_C(0x4E445354); /* "NDST" */
+    au[2] = ticks;
+    au[3] = fault_prob_ppm;
+    au[4] = seed_lo;
+    au[5] = seed_hi;
+    au[7] = buggy_mode ? 1U : 0U;
+
+    bool cpu_ok = true;
+    uint64_t t_start_ns = SDL_GetTicksNS();
+
+    for (uint32_t base_u = 0U; base_u < num_universes; base_u += 8192U) {
+        uint32_t batch_n = (num_universes - base_u > 8192U) ? 8192U : (num_universes - base_u);
+        au[1] = batch_n;
+        au[6] = base_u;
+
+        void *m_ar = SDL_MapGPUTransferBuffer(ctx->device, ctx->upload_tbuf, false);
+        if (!m_ar) {
+            free(h_arena);
+            return false;
+        }
+        memcpy(m_ar, h_arena, BLOOM_ARENA_BYTES);
+        SDL_UnmapGPUTransferBuffer(ctx->device, ctx->upload_tbuf);
+
+        SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ctx->device);
+        if (!cmd) {
+            free(h_arena);
+            return false;
+        }
+
+        SDL_GPUCopyPass *up_pass = SDL_BeginGPUCopyPass(cmd);
+        if (!up_pass) {
+            SDL_CancelGPUCommandBuffer(cmd);
+            free(h_arena);
+            return false;
+        }
+        SDL_GPUTransferBufferLocation a_src;
+        memset(&a_src, 0, sizeof(a_src));
+        a_src.transfer_buffer = ctx->upload_tbuf;
+        SDL_GPUBufferRegion a_dst;
+        memset(&a_dst, 0, sizeof(a_dst));
+        a_dst.buffer = ctx->arena_gpu_buf;
+        a_dst.size = (Uint32)BLOOM_ARENA_BYTES;
+        SDL_UploadToGPUBuffer(up_pass, &a_src, &a_dst, false);
+        SDL_EndGPUCopyPass(up_pass);
+
+        SDL_GPUStorageTextureReadWriteBinding rw_tex;
+        memset(&rw_tex, 0, sizeof(rw_tex));
+        rw_tex.texture = ctx->frame_tex;
+        SDL_GPUStorageBufferReadWriteBinding rw_buf;
+        memset(&rw_buf, 0, sizeof(rw_buf));
+        rw_buf.buffer = ctx->rc_gpu_buf;
+        SDL_GPUComputePass *cpass = SDL_BeginGPUComputePass(cmd, &rw_tex, 1U, &rw_buf, 1U);
+        if (!cpass) {
+            SDL_CancelGPUCommandBuffer(cmd);
+            free(h_arena);
+            return false;
+        }
+        SDL_GPUBuffer *ro_bufs[2] = { ctx->arena_gpu_buf, ctx->mesh_gpu_buf };
+        SDL_BindGPUComputePipeline(cpass, ctx->pipe_node_dst);
+        SDL_BindGPUComputeStorageBuffers(cpass, 0U, ro_bufs, 2U);
+        SDL_DispatchGPUCompute(cpass, (batch_n + 63U) / 64U, 1U, 1U);
+        SDL_EndGPUComputePass(cpass);
+
+        SDL_GPUCopyPass *dl_pass = SDL_BeginGPUCopyPass(cmd);
+        if (!dl_pass) {
+            SDL_CancelGPUCommandBuffer(cmd);
+            free(h_arena);
+            return false;
+        }
+        SDL_GPUBufferRegion dl_src;
+        memset(&dl_src, 0, sizeof(dl_src));
+        dl_src.buffer = ctx->rc_gpu_buf;
+        dl_src.offset = (Uint32)(24576U * 16U);
+        dl_src.size = (Uint32)(batch_n * 16U);
+        SDL_GPUTransferBufferLocation dl_dst;
+        memset(&dl_dst, 0, sizeof(dl_dst));
+        dl_dst.transfer_buffer = ctx->rc_download_tbuf;
+        SDL_DownloadFromGPUBuffer(dl_pass, &dl_src, &dl_dst);
+        SDL_EndGPUCopyPass(dl_pass);
+
+        SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+        bool waited = (fence != NULL) && SDL_WaitForGPUFences(ctx->device, true, &fence, 1U);
+        if (fence) SDL_ReleaseGPUFence(ctx->device, fence);
+        if (!waited) {
+            free(h_arena);
+            return false;
+        }
+
+        const uint32_t *res = (const uint32_t *)SDL_MapGPUTransferBuffer(
+            ctx->device, ctx->rc_download_tbuf, false);
+        if (!res) {
+            free(h_arena);
+            return false;
+        }
+
+        for (uint32_t i = 0U; i < batch_n; ++i) {
+            uint32_t g_u = base_u + i;
+            uint32_t viol = res[i * 4U + 0U];
+            uint32_t commits = res[i * 4U + 1U];
+            uint32_t elecs = res[i * 4U + 2U];
+            uint32_t digest = res[i * 4U + 3U];
+            if (viol > 0U) {
+                out->violated_universes++;
+                out->total_violations += (uint64_t)viol;
+                if (out->first_cex_universe == UINT32_MAX) {
+                    out->first_cex_universe = g_u;
+                }
+            }
+            out->total_commits += (uint64_t)commits;
+            out->total_elections += (uint64_t)elecs;
+            out->state_digest_xor ^= digest;
+
+            bool check_sample = (batch_n <= 256U) || (i < 32U) || (i + 32U >= batch_n) ||
+                                (viol > 0U && g_u == out->first_cex_universe);
+            if (check_sample && cpu_ok) {
+                uint32_t c_v = 0U, c_c = 0U, c_e = 0U, c_d = 0U;
+                bloom_node_dst_cpu_sim_one(g_u, ticks, fault_prob_ppm, seed_lo, seed_hi, buggy_mode,
+                                           &c_v, &c_c, &c_e, &c_d);
+                if (c_v != viol || c_c != commits || c_e != elecs || c_d != digest) {
+                    cpu_ok = false;
+                }
+            }
+        }
+        SDL_UnmapGPUTransferBuffer(ctx->device, ctx->rc_download_tbuf);
+    }
+
+    uint64_t t_end_ns = SDL_GetTicksNS();
+    out->elapsed_us = (t_end_ns >= t_start_ns) ? ((t_end_ns - t_start_ns) / 1000ULL) : 1ULL;
+    if (out->elapsed_us == 0ULL) {
+        out->elapsed_us = 1ULL;
+    }
+    ctx->rc_valid = false;
+    free(h_arena);
+    out->cpu_verified = cpu_ok;
+    return cpu_ok;
+}
+
 bool bloom_gpu_upload_mesh(BloomGpuCtx *ctx, const BloomMeshArena *mesh) {
     if (!ctx || !ctx->device || !ctx->mesh_gpu_buf || !ctx->mesh_upload_tbuf) {
         return false;
@@ -3610,6 +3969,9 @@ void bloom_gpu_destroy(BloomGpuCtx *ctx) {
         }
         if (ctx->arena_gpu_buf) {
             SDL_ReleaseGPUBuffer(ctx->device, ctx->arena_gpu_buf);
+        }
+        if (ctx->pipe_node_dst) {
+            SDL_ReleaseGPUComputePipeline(ctx->device, ctx->pipe_node_dst);
         }
         if (ctx->pipe_info_sim) {
             SDL_ReleaseGPUComputePipeline(ctx->device, ctx->pipe_info_sim);
