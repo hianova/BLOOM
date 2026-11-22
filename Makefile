@@ -85,7 +85,15 @@ test: cpp-gate all
 	./$(BLOOM_BIN) --headless $(STUDIO_IMG) --out $(BUILD_DIR)/.cli_smoke.ppm --emit-fir $(BUILD_DIR)/.cli_smoke.fir --steps 30
 	./$(BLOOM_BIN) --hunt-fir $(BUILD_DIR)/.cli_smoke.fir --trials 65536 --hunt-mode sweep --verify-cpu
 	./$(BLOOM_BIN) --hunt-fir $(BUILD_DIR)/.cli_smoke.fir --trials 65536 --hunt-mode neq --hunt-target 0 --hunt-prng --verify-cpu
-	@rm -f $(BUILD_DIR)/.cli_smoke.ppm $(BUILD_DIR)/.cli_smoke.fir
+	./$(BLOOM_BIN) --hunt-fir $(BUILD_DIR)/.cli_smoke.fir --trials 65536 --bitslice --hunt-mode neq --hunt-target 0 --verify-cpu
+	./$(BLOOM_BIN) --compile-fir-wgsl $(BUILD_DIR)/.cli_smoke.fir $(BUILD_DIR)/.cli_smoke_aot.wgsl
+	! grep -Eq '\b(u64|i64)\b' $(BUILD_DIR)/.cli_smoke_aot.wgsl
+	$(NAGA) $(BUILD_DIR)/.cli_smoke_aot.wgsl $(BUILD_DIR)/.cli_smoke_aot.spv
+	$(NAGA) --metal-version 2.4 $(BUILD_DIR)/.cli_smoke_aot.wgsl $(BUILD_DIR)/.cli_smoke_aot.metal
+	./$(BLOOM_BIN) --hunt-fir $(BUILD_DIR)/.cli_smoke.fir --aot-shader $(BUILD_DIR)/.cli_smoke_aot.wgsl --trials 65536 --hunt-mode neq --hunt-target 0 --verify-cpu
+	./$(BLOOM_BIN) --searu-bench-3sat 64,272 --universes 1024 --searu-iters 256 --searu-rounds 2
+	./$(BLOOM_BIN) --searu-bench-color 32,4 --universes 1024 --searu-iters 256 --searu-rounds 2
+	@rm -f $(BUILD_DIR)/.cli_smoke*
 
 mutate-check: $(LIBBLOOM_A) $(SCHEMA_HDR)
 	python3 tools/sabotage_check.py
@@ -165,6 +173,8 @@ $(SHADER_STAMP): $(WGSL_SRC) | $(BUILD_DIR)
 	    -e 's/out_tex \[\[user(fake0)\]\]/out_tex [[texture(0)]]/g' \
 	    -e 's/bloom_rc_cascade\([012]\)_(/bloom_rc_cascade\1(/g' \
 	    -e 's/bloom_fir1_hunt_(/bloom_fir1_hunt(/g' \
+	    -e 's/bloom_fir1_bitslice_(/bloom_fir1_bitslice(/g' \
+	    -e 's/bloom_searu_solve_(/bloom_searu_solve(/g' \
 	    $(GEN_MSL) > $(GEN_MSL).tmp && mv $(GEN_MSL).tmp $(GEN_MSL)
 	@! grep -q 'user(fake' $(GEN_MSL)
 	@touch $@

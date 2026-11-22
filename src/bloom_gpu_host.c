@@ -6,6 +6,7 @@
 
 #include "bloom.h"
 #include "flow_ir.h"
+#include "searu.h"
 
 struct BloomGpuCtx {
     BloomEngineArena       *arena;
@@ -15,6 +16,8 @@ struct BloomGpuCtx {
     SDL_GPUComputePipeline *pipe_rc1;
     SDL_GPUComputePipeline *pipe_rc0;
     SDL_GPUComputePipeline *pipe_fir1;
+    SDL_GPUComputePipeline *pipe_fir1_bs;
+    SDL_GPUComputePipeline *pipe_searu;
     SDL_GPUBuffer          *arena_gpu_buf;
     SDL_GPUBuffer          *mesh_gpu_buf;
     SDL_GPUBuffer          *rc_gpu_buf;
@@ -278,8 +281,13 @@ BloomGpuCtx *bloom_gpu_init(BloomEngineArena *arena, const char *shader_path) {
     pipe_info.threadcount_y = 1U;
     pipe_info.threadcount_z = 1U;
     ctx->pipe_fir1 = SDL_CreateGPUComputePipeline(dev, &pipe_info);
+    pipe_info.entrypoint = "bloom_fir1_bitslice";
+    ctx->pipe_fir1_bs = SDL_CreateGPUComputePipeline(dev, &pipe_info);
+    pipe_info.entrypoint = "bloom_searu_solve";
+    ctx->pipe_searu = SDL_CreateGPUComputePipeline(dev, &pipe_info);
     SDL_free(code);
-    if (!ctx->pipeline || !ctx->pipe_rc2 || !ctx->pipe_rc1 || !ctx->pipe_rc0 || !ctx->pipe_fir1) {
+    if (!ctx->pipeline || !ctx->pipe_rc2 || !ctx->pipe_rc1 || !ctx->pipe_rc0 ||
+        !ctx->pipe_fir1 || !ctx->pipe_fir1_bs || !ctx->pipe_searu) {
         fprintf(stderr, "[BLOOM SDL3-GPU] SDL_CreateGPUComputePipeline('%s') failed: %s\n",
                 resolved_path, SDL_GetError());
         bloom_gpu_destroy(ctx);
@@ -419,12 +427,17 @@ static void bloom_fir_build_trial_inputs(const flow_ir_prog_t *prog,
                                          uint64_t out_inputs[FLOW_IR_MAX_IO]) {
     memset(out_inputs, 0, sizeof(uint64_t) * FLOW_IR_MAX_IO);
     uint64_t seed_full = ((uint64_t)cfg->seed_hi << 32U) | (uint64_t)cfg->seed_lo;
+    uint64_t ex_val = seed_full ^ (uint64_t)gtid;
+    uint32_t ex_bit = 0U;
     for (uint32_t i = 0U; i < prog->num_inputs; ++i) {
         uint64_t wm = flow_ir_mask_u64(prog->vals[i].width);
         uint64_t iv = cfg->base_inputs[i];
         uint32_t sh = (i < 31U) ? i : 31U;
         if (((cfg->vary_input_mask >> sh) & 1U) != 0U) {
-            if (cfg->sweep_mode == 1U) {
+            if (cfg->sweep_mode == 2U) {
+                iv = (ex_bit < 64U) ? (ex_val >> ex_bit) : UINT64_C(0);
+                ex_bit += (uint32_t)prog->vals[i].width;
+            } else if (cfg->sweep_mode == 1U) {
                 uint32_t h0 = bloom_fir_fmix32(cfg->seed_lo ^ gtid ^ (i * UINT32_C(0x9E3779B9)));
                 uint32_t h1 = bloom_fir_fmix32(cfg->seed_hi ^ (gtid * UINT32_C(0x85EBCA6B)) ^
                                                (i * UINT32_C(0xC2B2AE35)) ^ h0);
@@ -439,6 +452,127 @@ static void bloom_fir_build_trial_inputs(const flow_ir_prog_t *prog,
         }
         out_inputs[i] = iv & wm;
     }
+}
+
+static bool bloom_fir_dispatch_reduce_chunk(BloomGpuCtx *ctx,
+                                            SDL_GPUComputePipeline *pipe,
+                                            bool bind_mesh,
+                                            bool bind_out_tex,
+                                            const BloomEngineArena *h_arena,
+                                            uint32_t num_threads,
+                                            uint32_t num_wgs,
+                                            uint32_t base_off,
+                                            BloomFir1HuntResult *out) {
+    void *mapped_up = SDL_MapGPUTransferBuffer(ctx->device, ctx->upload_tbuf, false);
+    if (!mapped_up) {
+        return false;
+    }
+    memcpy(mapped_up, h_arena, BLOOM_ARENA_BYTES);
+    SDL_UnmapGPUTransferBuffer(ctx->device, ctx->upload_tbuf);
+
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ctx->device);
+    if (!cmd) {
+        return false;
+    }
+
+    SDL_GPUCopyPass *up_pass = SDL_BeginGPUCopyPass(cmd);
+    if (!up_pass) {
+        SDL_CancelGPUCommandBuffer(cmd);
+        return false;
+    }
+    SDL_GPUTransferBufferLocation up_src;
+    memset(&up_src, 0, sizeof(up_src));
+    up_src.transfer_buffer = ctx->upload_tbuf;
+    SDL_GPUBufferRegion up_dst;
+    memset(&up_dst, 0, sizeof(up_dst));
+    up_dst.buffer = ctx->arena_gpu_buf;
+    up_dst.size = (Uint32)BLOOM_ARENA_BYTES;
+    SDL_UploadToGPUBuffer(up_pass, &up_src, &up_dst, false);
+    SDL_EndGPUCopyPass(up_pass);
+
+    SDL_GPUStorageTextureReadWriteBinding rw_tex;
+    memset(&rw_tex, 0, sizeof(rw_tex));
+    rw_tex.texture = ctx->frame_tex;
+    SDL_GPUStorageBufferReadWriteBinding rw_buf;
+    memset(&rw_buf, 0, sizeof(rw_buf));
+    rw_buf.buffer = ctx->rc_gpu_buf;
+    SDL_GPUComputePass *cpass = SDL_BeginGPUComputePass(
+        cmd,
+        bind_out_tex ? &rw_tex : NULL,
+        bind_out_tex ? 1U : 0U,
+        &rw_buf,
+        1U);
+    if (!cpass) {
+        SDL_CancelGPUCommandBuffer(cmd);
+        return false;
+    }
+    SDL_GPUBuffer *ro_bufs[2] = { ctx->arena_gpu_buf, ctx->mesh_gpu_buf };
+    SDL_BindGPUComputePipeline(cpass, pipe);
+    SDL_BindGPUComputeStorageBuffers(cpass, 0U, ro_bufs, bind_mesh ? 2U : 1U);
+    SDL_DispatchGPUCompute(cpass, num_wgs, 1U, 1U);
+    SDL_EndGPUComputePass(cpass);
+
+    SDL_GPUCopyPass *dl_pass = SDL_BeginGPUCopyPass(cmd);
+    if (!dl_pass) {
+        SDL_CancelGPUCommandBuffer(cmd);
+        return false;
+    }
+    SDL_GPUBufferRegion dl_src;
+    memset(&dl_src, 0, sizeof(dl_src));
+    dl_src.buffer = ctx->rc_gpu_buf;
+    dl_src.size = (Uint32)(num_threads * 16U);
+    SDL_GPUTransferBufferLocation dl_dst;
+    memset(&dl_dst, 0, sizeof(dl_dst));
+    dl_dst.transfer_buffer = ctx->rc_download_tbuf;
+    SDL_DownloadFromGPUBuffer(dl_pass, &dl_src, &dl_dst);
+    SDL_EndGPUCopyPass(dl_pass);
+
+    SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+    if (!fence || !SDL_WaitForGPUFences(ctx->device, true, &fence, 1U)) {
+        if (fence) SDL_ReleaseGPUFence(ctx->device, fence);
+        return false;
+    }
+    SDL_ReleaseGPUFence(ctx->device, fence);
+
+    const uint32_t *wg_res = (const uint32_t *)SDL_MapGPUTransferBuffer(
+        ctx->device, ctx->rc_download_tbuf, false);
+    if (!wg_res) {
+        return false;
+    }
+    for (uint32_t t = 0U; t < num_threads; ++t) {
+        uint32_t min_local = wg_res[t * 4U + 0U];
+        uint32_t t_hits = wg_res[t * 4U + 1U];
+        uint64_t t_xor = ((uint64_t)wg_res[t * 4U + 3U] << 32U) | (uint64_t)wg_res[t * 4U + 2U];
+        out->out0_xor_checksum ^= t_xor;
+        out->hit_count += t_hits;
+        if (min_local != 0xFFFFFFFFU) {
+            uint32_t cand = base_off + min_local;
+            if (!out->found || cand < out->first_hit_trial) {
+                out->found = true;
+                out->first_hit_trial = cand;
+            }
+        }
+    }
+    SDL_UnmapGPUTransferBuffer(ctx->device, ctx->rc_download_tbuf);
+    return true;
+}
+
+static bool bloom_fir_verify_witness(const flow_ir_prog_t *prog,
+                                     const BloomFir1HuntConfig *cfg,
+                                     BloomFir1HuntResult *out) {
+    if (!out->found) {
+        return true;
+    }
+    bloom_fir_build_trial_inputs(prog, cfg, out->first_hit_trial, out->witness_inputs);
+    if (!flow_ir_eval_u64(prog, out->witness_inputs, out->witness_outputs)) {
+        return false;
+    }
+    uint64_t target = ((uint64_t)cfg->target_hi << 32U) | (uint64_t)cfg->target_lo;
+    uint64_t got = (prog->num_outputs > 0U) ? out->witness_outputs[0] : 0ULL;
+    bool match = (cfg->target_mode == 0U) ? (got == target) :
+                 ((cfg->target_mode == 1U) ? (got != target) : true);
+    out->cpu_verified = match;
+    return match;
 }
 
 bool bloom_gpu_hunt_fir1(BloomGpuCtx *ctx,
@@ -543,7 +677,7 @@ bool bloom_gpu_hunt_fir1(BloomGpuCtx *ctx,
         return false;
     }
 
-    const uint32_t max_chunk_trials = UINT32_C(4194304); /* 4M trials per GPU command buffer */
+    const uint32_t max_chunk_trials = UINT32_C(4194304);
     uint64_t t_start_ns = SDL_GetTicksNS();
     uint32_t remaining = cfg->num_trials;
     uint32_t base_off = 0U;
@@ -557,26 +691,1174 @@ bool bloom_gpu_hunt_fir1(BloomGpuCtx *ctx,
         au[14] = num_threads;
         au[15] = base_off;
 
-        void *mapped_up = SDL_MapGPUTransferBuffer(ctx->device, ctx->upload_tbuf, false);
-        if (!mapped_up) {
+        if (!bloom_fir_dispatch_reduce_chunk(ctx, ctx->pipe_fir1, true, true, h_arena,
+                                             num_threads, num_wgs, base_off, out)) {
             ok = false;
             break;
         }
+        out->trials_evaluated += chunk_trials;
+        base_off += chunk_trials;
+        remaining -= chunk_trials;
+    }
+
+    uint64_t t_end_ns = SDL_GetTicksNS();
+    out->elapsed_us = (t_end_ns >= t_start_ns) ? ((t_end_ns - t_start_ns) / 1000ULL) : 1ULL;
+    if (out->elapsed_us == 0ULL) {
+        out->elapsed_us = 1ULL;
+    }
+    ctx->rc_valid = false;
+    ctx->mesh_epoch++;
+
+    if (ok && !bloom_fir_verify_witness(prog, cfg, out)) {
+        ok = false;
+    }
+
+    free(h_mesh);
+    free(h_arena);
+    free(prog);
+    return ok;
+}
+
+/* ----------------------------------------------------------------------------
+ * 32-Way Bit-Blaster + SIMT Bit-Sliced Accelerator + AOT WGSL Compiler
+ * ---------------------------------------------------------------------------- */
+
+#define BLOOM_BS_TMP_WIRES  4096U
+#define BLOOM_BS_TMP_GATES  8192U
+#define BLOOM_BS_MAX_WIRES  512U
+#define BLOOM_BS_MAX_INBITS 256U
+#define BLOOM_BS_MAX_GATES  2048U
+
+typedef enum {
+    BLOOM_BS_AND = 1U,
+    BLOOM_BS_OR  = 2U,
+    BLOOM_BS_XOR = 3U,
+    BLOOM_BS_NOT = 4U,
+    BLOOM_BS_MUX = 5U
+} BloomBsGateKind;
+
+typedef struct {
+    uint16_t kind;
+    uint16_t out_w;
+    uint16_t a;
+    uint16_t b;
+    uint16_t c;
+} BloomBsGate;
+
+typedef struct {
+    uint16_t wire_id;
+    uint8_t  in_idx;
+    uint8_t  in_bit;
+    uint8_t  src_bit;
+    uint8_t  const_bit;
+    bool     varying;
+} BloomBsInput;
+
+typedef struct {
+    uint32_t     num_wires;
+    uint32_t     num_inputs;
+    uint32_t     num_gates;
+    uint32_t     out0_width;
+    BloomBsInput inputs[BLOOM_BS_MAX_INBITS];
+    uint16_t     out0_wires[64];
+    BloomBsGate  gates[BLOOM_BS_MAX_GATES];
+} BloomBsNetlist;
+
+typedef struct {
+    uint32_t     num_wires;
+    uint32_t     num_gates;
+    uint32_t     num_inputs;
+    BloomBsGate  gates[BLOOM_BS_TMP_GATES];
+    int32_t      wire_gate[BLOOM_BS_TMP_WIRES];
+    int32_t      wire_in[BLOOM_BS_TMP_WIRES];
+    uint16_t     not_cache[BLOOM_BS_TMP_WIRES];
+    BloomBsInput tmp_inputs[BLOOM_BS_TMP_WIRES];
+    uint16_t     val_wires[FLOW_IR_MAX_VALS][64];
+    uint8_t      used[BLOOM_BS_TMP_WIRES];
+    int32_t      remap[BLOOM_BS_TMP_WIRES];
+} BloomBsBuilder;
+
+static uint16_t bb_push_gate(BloomBsBuilder *bb, uint16_t kind, uint16_t a, uint16_t b, uint16_t c) {
+    if (bb->num_wires >= BLOOM_BS_TMP_WIRES || bb->num_gates >= BLOOM_BS_TMP_GATES) {
+        return UINT16_C(0xFFFF);
+    }
+    uint16_t wid = (uint16_t)bb->num_wires++;
+    bb->wire_gate[wid] = (int32_t)bb->num_gates;
+    bb->wire_in[wid] = -1;
+    bb->gates[bb->num_gates].kind = kind;
+    bb->gates[bb->num_gates].out_w = wid;
+    bb->gates[bb->num_gates].a = a;
+    bb->gates[bb->num_gates].b = b;
+    bb->gates[bb->num_gates].c = c;
+    bb->num_gates++;
+    return wid;
+}
+
+static uint16_t bb_not(BloomBsBuilder *bb, uint16_t a) {
+    if (a == UINT16_C(0xFFFF)) return a;
+    if (a == 0U) return 1U;
+    if (a == 1U) return 0U;
+    if (bb->not_cache[a] != UINT16_C(0xFFFF)) {
+        return bb->not_cache[a];
+    }
+    uint16_t inv = bb_push_gate(bb, BLOOM_BS_NOT, a, 0U, 0U);
+    if (inv != UINT16_C(0xFFFF)) {
+        bb->not_cache[a] = inv;
+        bb->not_cache[inv] = a;
+    }
+    return inv;
+}
+
+static uint16_t bb_and(BloomBsBuilder *bb, uint16_t a, uint16_t b) {
+    if (a == UINT16_C(0xFFFF) || b == UINT16_C(0xFFFF)) return UINT16_C(0xFFFF);
+    if (a == 0U || b == 0U) return 0U;
+    if (a == 1U) return b;
+    if (b == 1U || a == b) return a;
+    return bb_push_gate(bb, BLOOM_BS_AND, a, b, 0U);
+}
+
+static uint16_t bb_or(BloomBsBuilder *bb, uint16_t a, uint16_t b) {
+    if (a == UINT16_C(0xFFFF) || b == UINT16_C(0xFFFF)) return UINT16_C(0xFFFF);
+    if (a == 1U || b == 1U) return 1U;
+    if (a == 0U) return b;
+    if (b == 0U || a == b) return a;
+    return bb_push_gate(bb, BLOOM_BS_OR, a, b, 0U);
+}
+
+static uint16_t bb_xor(BloomBsBuilder *bb, uint16_t a, uint16_t b) {
+    if (a == UINT16_C(0xFFFF) || b == UINT16_C(0xFFFF)) return UINT16_C(0xFFFF);
+    if (a == 0U) return b;
+    if (b == 0U) return a;
+    if (a == b) return 0U;
+    if (a == 1U) return bb_not(bb, b);
+    if (b == 1U) return bb_not(bb, a);
+    return bb_push_gate(bb, BLOOM_BS_XOR, a, b, 0U);
+}
+
+static uint16_t bb_mux(BloomBsBuilder *bb, uint16_t sel, uint16_t f_br, uint16_t t_br) {
+    if (sel == UINT16_C(0xFFFF) || f_br == UINT16_C(0xFFFF) || t_br == UINT16_C(0xFFFF)) {
+        return UINT16_C(0xFFFF);
+    }
+    if (sel == 0U) return f_br;
+    if (sel == 1U || f_br == t_br) return t_br;
+    if (f_br == 0U && t_br == 1U) return sel;
+    if (f_br == 1U && t_br == 0U) return bb_not(bb, sel);
+    if (f_br == 0U) return bb_and(bb, sel, t_br);
+    if (t_br == 1U) return bb_or(bb, sel, f_br);
+    if (f_br == 1U) return bb_or(bb, bb_not(bb, sel), t_br);
+    if (t_br == 0U) return bb_and(bb, bb_not(bb, sel), f_br);
+    return bb_push_gate(bb, BLOOM_BS_MUX, sel, f_br, t_br);
+}
+
+static uint16_t bb_or_reduce_bits(BloomBsBuilder *bb, const uint16_t *bits, uint32_t count) {
+    if (count == 0U) {
+        return 0U;
+    }
+    uint16_t acc = bits[0];
+    for (uint32_t i = 1U; i < count; ++i) {
+        acc = bb_or(bb, acc, bits[i]);
+    }
+    return acc;
+}
+
+static bool bb_blast_add(BloomBsBuilder *bb,
+                         const uint16_t *a_bits,
+                         const uint16_t *b_bits,
+                         uint16_t cin,
+                         bool invert_b,
+                         uint32_t width,
+                         uint16_t *out_bits) {
+    for (uint32_t b = 0U; b < width; ++b) {
+        uint16_t av = a_bits[b];
+        uint16_t bv = invert_b ? bb_not(bb, b_bits[b]) : b_bits[b];
+        uint16_t axb = bb_xor(bb, av, bv);
+        uint16_t sum = bb_xor(bb, axb, cin);
+        if (sum == UINT16_C(0xFFFF)) {
+            return false;
+        }
+        out_bits[b] = sum;
+        if (b + 1U < width) {
+            uint16_t c1 = bb_and(bb, av, bv);
+            uint16_t c2 = bb_and(bb, axb, cin);
+            cin = bb_or(bb, c1, c2);
+            if (cin == UINT16_C(0xFFFF)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static uint16_t bb_lut_mux_tree(BloomBsBuilder *bb,
+                                const uint64_t *lut,
+                                uint32_t lut_len,
+                                const uint16_t *addr_bits,
+                                uint32_t depth,
+                                uint32_t idx_base,
+                                uint32_t out_bit) {
+    if (depth == 0U) {
+        if (idx_base < lut_len && ((lut[idx_base] >> out_bit) & 1ULL) != 0ULL) {
+            return 1U;
+        }
+        return 0U;
+    }
+    uint32_t half = 1U << (depth - 1U);
+    uint16_t lo = bb_lut_mux_tree(bb, lut, lut_len, addr_bits, depth - 1U, idx_base, out_bit);
+    uint16_t hi = bb_lut_mux_tree(bb, lut, lut_len, addr_bits, depth - 1U, idx_base + half, out_bit);
+    return bb_mux(bb, addr_bits[depth - 1U], lo, hi);
+}
+
+static bool bb_blast_shift(BloomBsBuilder *bb,
+                           const uint16_t *in_bits,
+                           uint32_t iw,
+                           const uint16_t *sh_bits,
+                           uint32_t sw,
+                           bool shift_left,
+                           uint32_t ow,
+                           uint16_t *out_bits) {
+    uint32_t width = shift_left ? ow : iw;
+    if (width > 64U) width = 64U;
+    uint16_t cur[64];
+    for (uint32_t b = 0U; b < 64U; ++b) {
+        cur[b] = (b < iw) ? in_bits[b] : 0U;
+    }
+
+    uint32_t active_sh = (sw < 6U) ? sw : 6U;
+    for (uint32_t s = 0U; s < active_sh; ++s) {
+        uint32_t amt = 1U << s;
+        uint16_t nxt[64];
+        for (uint32_t b = 0U; b < width; ++b) {
+            uint16_t moved = 0U;
+            if (shift_left) {
+                moved = (b >= amt) ? cur[b - amt] : 0U;
+            } else {
+                moved = (b + amt < iw) ? cur[b + amt] : 0U;
+            }
+            nxt[b] = bb_mux(bb, sh_bits[s], cur[b], moved);
+            if (nxt[b] == UINT16_C(0xFFFF)) {
+                return false;
+            }
+        }
+        for (uint32_t b = 0U; b < width; ++b) {
+            cur[b] = nxt[b];
+        }
+    }
+
+    uint16_t valid = 1U;
+    if (sw > 6U) {
+        uint16_t hi_any = bb_or_reduce_bits(bb, sh_bits + 6U, sw - 6U);
+        valid = bb_not(bb, hi_any);
+        if (valid == UINT16_C(0xFFFF)) {
+            return false;
+        }
+    }
+    for (uint32_t b = 0U; b < ow; ++b) {
+        out_bits[b] = (b < width) ? bb_and(bb, valid, cur[b]) : 0U;
+        if (out_bits[b] == UINT16_C(0xFFFF)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool bloom_fir1_bitblast(const flow_ir_prog_t *prog,
+                                uint32_t vary_mask,
+                                const uint64_t base_inputs[32],
+                                bool dynamic_inputs,
+                                BloomBsNetlist *out) {
+    if (!prog || !out || prog->num_outputs == 0U || prog->num_inputs > 32U) {
+        return false;
+    }
+    BloomBsBuilder *bb = (BloomBsBuilder *)calloc(1U, sizeof(BloomBsBuilder));
+    if (!bb) {
+        return false;
+    }
+    memset(bb->wire_gate, -1, sizeof(bb->wire_gate));
+    memset(bb->wire_in, -1, sizeof(bb->wire_in));
+    for (uint32_t i = 0U; i < BLOOM_BS_TMP_WIRES; ++i) {
+        bb->not_cache[i] = UINT16_C(0xFFFF);
+        bb->remap[i] = -1;
+    }
+    bb->num_wires = 2U; /* 0 = const 0, 1 = const 1 */
+
+    uint32_t ex_bit = 0U;
+    for (uint32_t i = 0U; i < prog->num_inputs; ++i) {
+        uint32_t w = prog->vals[i].width;
+        if (w == 0U || w > 64U) {
+            free(bb);
+            return false;
+        }
+        uint32_t sh = (i < 31U) ? i : 31U;
+        bool is_vary = ((vary_mask >> sh) & 1U) != 0U;
+        for (uint32_t b = 0U; b < w; ++b) {
+            uint8_t cbit = (uint8_t)((base_inputs[i] >> b) & 1ULL);
+            if (!dynamic_inputs && !is_vary) {
+                bb->val_wires[i][b] = (cbit != 0U) ? 1U : 0U;
+                continue;
+            }
+            if (!dynamic_inputs && is_vary && (ex_bit + b >= 64U)) {
+                bb->val_wires[i][b] = 0U;
+                continue;
+            }
+            if (bb->num_wires >= BLOOM_BS_TMP_WIRES) {
+                free(bb);
+                return false;
+            }
+            uint16_t wid = (uint16_t)bb->num_wires++;
+            uint32_t sbit = is_vary ? (ex_bit + b) : 255U;
+            if (sbit > 64U && is_vary) sbit = 64U;
+            bb->wire_in[wid] = (int32_t)bb->num_inputs;
+            BloomBsInput *bi = &bb->tmp_inputs[bb->num_inputs++];
+            bi->wire_id = wid;
+            bi->in_idx = (uint8_t)i;
+            bi->in_bit = (uint8_t)b;
+            bi->src_bit = (uint8_t)sbit;
+            bi->const_bit = cbit;
+            bi->varying = is_vary;
+            bb->val_wires[i][b] = wid;
+        }
+        if (is_vary || dynamic_inputs) {
+            ex_bit += w;
+        }
+    }
+
+    bool ok = true;
+    for (uint32_t oi = 0U; oi < prog->num_ops && ok; ++oi) {
+        const flow_ir_op_t *op = &prog->ops[oi];
+        uint32_t oid = op->out_val;
+        if (oid >= FLOW_IR_MAX_VALS) {
+            ok = false;
+            break;
+        }
+        uint32_t ow = prog->vals[oid].width;
+        if (ow == 0U || ow > 64U) {
+            ok = false;
+            break;
+        }
+        uint16_t k = op->kind;
+        uint16_t *dst = bb->val_wires[oid];
+
+        if (k == FLOW_IR_OP_CONST_U64) {
+            for (uint32_t b = 0U; b < ow; ++b) {
+                dst[b] = (((op->p0 >> b) & 1ULL) != 0ULL) ? 1U : 0U;
+            }
+        } else if (k == FLOW_IR_OP_SLICE) {
+            if (op->num_ins < 1U || op->p0 >= 64ULL) { ok = false; break; }
+            uint32_t in0 = op->ins[0];
+            uint32_t iw0 = prog->vals[in0].width;
+            uint32_t off = (uint32_t)op->p0;
+            for (uint32_t b = 0U; b < ow; ++b) {
+                dst[b] = (off + b < iw0) ? bb->val_wires[in0][off + b] : 0U;
+            }
+        } else if (k == FLOW_IR_OP_CONCAT) {
+            uint32_t pos = 0U;
+            for (uint16_t j = 0U; j < op->num_ins && j < FLOW_IR_MAX_INS; ++j) {
+                uint32_t iv = op->ins[j];
+                uint32_t iw = prog->vals[iv].width;
+                for (uint32_t b = 0U; b < iw; ++b) {
+                    if (pos + b < ow) {
+                        dst[pos + b] = bb->val_wires[iv][b];
+                    }
+                }
+                pos += iw;
+            }
+        } else if (k == FLOW_IR_OP_XOR_VEC) {
+            if (op->num_ins < 2U) { ok = false; break; }
+            uint32_t i0 = op->ins[0], i1 = op->ins[1];
+            uint32_t w0 = prog->vals[i0].width, w1 = prog->vals[i1].width;
+            for (uint32_t b = 0U; b < ow; ++b) {
+                uint16_t a = (b < w0) ? bb->val_wires[i0][b] : 0U;
+                uint16_t bv = (b < w1) ? bb->val_wires[i1][b] : 0U;
+                dst[b] = bb_xor(bb, a, bv);
+                if (dst[b] == UINT16_C(0xFFFF)) { ok = false; break; }
+            }
+        } else if (k == FLOW_IR_OP_AND_VEC) {
+            if (op->num_ins < 2U) { ok = false; break; }
+            uint32_t i0 = op->ins[0], i1 = op->ins[1];
+            uint32_t w0 = prog->vals[i0].width, w1 = prog->vals[i1].width;
+            for (uint32_t b = 0U; b < ow; ++b) {
+                uint16_t a = (b < w0) ? bb->val_wires[i0][b] : 0U;
+                uint16_t bv = (b < w1) ? bb->val_wires[i1][b] : 0U;
+                dst[b] = bb_and(bb, a, bv);
+                if (dst[b] == UINT16_C(0xFFFF)) { ok = false; break; }
+            }
+        } else if (k == FLOW_IR_OP_NOT_VEC) {
+            if (op->num_ins < 1U) { ok = false; break; }
+            uint32_t i0 = op->ins[0];
+            uint32_t w0 = prog->vals[i0].width;
+            for (uint32_t b = 0U; b < ow; ++b) {
+                uint16_t a = (b < w0) ? bb->val_wires[i0][b] : 0U;
+                dst[b] = bb_not(bb, a);
+                if (dst[b] == UINT16_C(0xFFFF)) { ok = false; break; }
+            }
+        } else if (k == FLOW_IR_OP_OR_REDUCE) {
+            if (op->num_ins < 1U) { ok = false; break; }
+            uint32_t i0 = op->ins[0];
+            dst[0] = bb_or_reduce_bits(bb, bb->val_wires[i0], prog->vals[i0].width);
+            if (dst[0] == UINT16_C(0xFFFF)) { ok = false; break; }
+        } else if (k == FLOW_IR_OP_EQ_ZERO) {
+            if (op->num_ins < 1U) { ok = false; break; }
+            uint32_t i0 = op->ins[0];
+            uint16_t any1 = bb_or_reduce_bits(bb, bb->val_wires[i0], prog->vals[i0].width);
+            dst[0] = bb_not(bb, any1);
+            if (dst[0] == UINT16_C(0xFFFF)) { ok = false; break; }
+        } else if (k == FLOW_IR_OP_ADD || k == FLOW_IR_OP_SUB) {
+            if (op->num_ins < 2U) { ok = false; break; }
+            uint16_t abits[64], bbits[64];
+            uint32_t i0 = op->ins[0], i1 = op->ins[1];
+            uint32_t w0 = prog->vals[i0].width, w1 = prog->vals[i1].width;
+            for (uint32_t b = 0U; b < ow; ++b) {
+                abits[b] = (b < w0) ? bb->val_wires[i0][b] : 0U;
+                bbits[b] = (b < w1) ? bb->val_wires[i1][b] : 0U;
+            }
+            bool is_sub = (k == FLOW_IR_OP_SUB);
+            ok = bb_blast_add(bb, abits, bbits, is_sub ? 1U : 0U, is_sub, ow, dst);
+        } else if (k == FLOW_IR_OP_CTRL_SEL) {
+            if (op->num_ins < 3U) { ok = false; break; }
+            uint16_t sel = bb->val_wires[op->ins[0]][0];
+            uint32_t i1 = op->ins[1], i2 = op->ins[2];
+            uint32_t w1 = prog->vals[i1].width, w2 = prog->vals[i2].width;
+            for (uint32_t b = 0U; b < ow; ++b) {
+                uint16_t f_br = (b < w1) ? bb->val_wires[i1][b] : 0U;
+                uint16_t t_br = (b < w2) ? bb->val_wires[i2][b] : 0U;
+                dst[b] = bb_mux(bb, sel, f_br, t_br);
+                if (dst[b] == UINT16_C(0xFFFF)) { ok = false; break; }
+            }
+        } else if (k == FLOW_IR_OP_SHL_VAR || k == FLOW_IR_OP_SHR_VAR) {
+            if (op->num_ins < 2U) { ok = false; break; }
+            uint32_t i0 = op->ins[0], i1 = op->ins[1];
+            ok = bb_blast_shift(bb, bb->val_wires[i0], prog->vals[i0].width,
+                                bb->val_wires[i1], prog->vals[i1].width,
+                                (k == FLOW_IR_OP_SHL_VAR), ow, dst);
+        } else if (k == FLOW_IR_OP_LUT_ROM) {
+            if (op->num_ins < 1U || op->lut_len > 16U) { ok = false; break; }
+            uint32_t i0 = op->ins[0];
+            uint32_t iw = prog->vals[i0].width;
+            uint32_t depth = (iw < 4U) ? iw : 4U;
+            uint16_t in_range = 1U;
+            if (iw > 4U) {
+                uint16_t hi_any = bb_or_reduce_bits(bb, bb->val_wires[i0] + 4U, iw - 4U);
+                in_range = bb_not(bb, hi_any);
+            }
+            if (in_range == UINT16_C(0xFFFF)) { ok = false; break; }
+            for (uint32_t b = 0U; b < ow; ++b) {
+                uint16_t lv = bb_lut_mux_tree(bb, &prog->lut_pool[op->lut_off],
+                                              op->lut_len, bb->val_wires[i0], depth, 0U, b);
+                dst[b] = bb_and(bb, in_range, lv);
+                if (dst[b] == UINT16_C(0xFFFF)) { ok = false; break; }
+            }
+        } else {
+            ok = false;
+        }
+    }
+
+    if (!ok) {
+        free(bb);
+        return false;
+    }
+
+    /* Dead-Gate Elimination (DFS backward from out0 wires) */
+    uint32_t out0_id = prog->outputs[0];
+    uint32_t out0_w = prog->vals[out0_id].width;
+    if (out0_w == 0U || out0_w > 64U) {
+        free(bb);
+        return false;
+    }
+    bb->used[0] = 1U;
+    bb->used[1] = 1U;
+
+    uint16_t stack[BLOOM_BS_TMP_WIRES];
+    uint32_t sp = 0U;
+    for (uint32_t b = 0U; b < out0_w; ++b) {
+        uint16_t w = bb->val_wires[out0_id][b];
+        if (!bb->used[w]) {
+            bb->used[w] = 1U;
+            stack[sp++] = w;
+        }
+    }
+    while (sp > 0U) {
+        uint16_t w = stack[--sp];
+        int32_t gi = bb->wire_gate[w];
+        if (gi >= 0) {
+            const BloomBsGate *g = &bb->gates[gi];
+            uint16_t ops3[3] = { g->a, g->b, g->c };
+            uint32_t ar = (g->kind == BLOOM_BS_MUX) ? 3U : ((g->kind == BLOOM_BS_NOT) ? 1U : 2U);
+            for (uint32_t k = 0U; k < ar; ++k) {
+                uint16_t child = ops3[k];
+                if (!bb->used[child]) {
+                    bb->used[child] = 1U;
+                    stack[sp++] = child;
+                }
+            }
+        }
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->out0_width = out0_w;
+    bb->remap[0] = 0;
+    bb->remap[1] = 1;
+    out->num_wires = 2U;
+
+    for (uint32_t w = 2U; w < bb->num_wires; ++w) {
+        if (!bb->used[w]) {
+            continue;
+        }
+        if (bb->wire_in[w] >= 0) {
+            if (out->num_wires >= BLOOM_BS_MAX_WIRES || out->num_inputs >= BLOOM_BS_MAX_INBITS) {
+                free(bb);
+                return false;
+            }
+            uint16_t nw = (uint16_t)out->num_wires++;
+            bb->remap[w] = (int32_t)nw;
+            BloomBsInput bi = bb->tmp_inputs[bb->wire_in[w]];
+            bi.wire_id = nw;
+            out->inputs[out->num_inputs++] = bi;
+        }
+    }
+    for (uint32_t gi = 0U; gi < bb->num_gates; ++gi) {
+        const BloomBsGate *g = &bb->gates[gi];
+        if (!bb->used[g->out_w]) {
+            continue;
+        }
+        if (out->num_wires >= BLOOM_BS_MAX_WIRES || out->num_gates >= BLOOM_BS_MAX_GATES) {
+            free(bb);
+            return false;
+        }
+        uint16_t nw = (uint16_t)out->num_wires++;
+        bb->remap[g->out_w] = (int32_t)nw;
+        BloomBsGate ng;
+        ng.kind = g->kind;
+        ng.out_w = nw;
+        ng.a = (uint16_t)bb->remap[g->a];
+        ng.b = (uint16_t)bb->remap[g->b];
+        ng.c = (uint16_t)bb->remap[g->c];
+        out->gates[out->num_gates++] = ng;
+    }
+    for (uint32_t b = 0U; b < out0_w; ++b) {
+        out->out0_wires[b] = (uint16_t)bb->remap[bb->val_wires[out0_id][b]];
+    }
+
+    free(bb);
+    return true;
+}
+
+bool bloom_gpu_hunt_fir1_bitslice(BloomGpuCtx *ctx,
+                                  const uint8_t *fir_bytes,
+                                  size_t fir_len,
+                                  const BloomFir1HuntConfig *cfg,
+                                  BloomFir1HuntResult *out) {
+    if (!ctx || !ctx->device || !ctx->pipe_fir1_bs || !ctx->arena_gpu_buf || !ctx->mesh_gpu_buf ||
+        !ctx->rc_gpu_buf || !ctx->upload_tbuf || !ctx->mesh_upload_tbuf || !ctx->rc_download_tbuf ||
+        !fir_bytes || !cfg || !out || cfg->num_trials == 0U || cfg->sweep_mode != 2U) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    out->first_hit_trial = 0xFFFFFFFFU;
+
+    flow_ir_prog_t *prog = (flow_ir_prog_t *)calloc(1U, sizeof(flow_ir_prog_t));
+    BloomBsNetlist *nl = (BloomBsNetlist *)calloc(1U, sizeof(BloomBsNetlist));
+    BloomEngineArena *h_arena = (BloomEngineArena *)calloc(1U, sizeof(BloomEngineArena));
+    BloomMeshArena *h_mesh = (BloomMeshArena *)calloc(1U, sizeof(BloomMeshArena));
+    if (!prog || !nl || !h_arena || !h_mesh) {
+        free(h_mesh);
+        free(h_arena);
+        free(nl);
+        free(prog);
+        return false;
+    }
+
+    if (!flow_ir_load_bytes(prog, fir_bytes, fir_len) ||
+        !bloom_fir1_bitblast(prog, cfg->vary_input_mask, cfg->base_inputs, false, nl)) {
+        free(h_mesh);
+        free(h_arena);
+        free(nl);
+        free(prog);
+        return false;
+    }
+
+    out->num_inputs = prog->num_inputs;
+    out->num_outputs = prog->num_outputs;
+
+    uint32_t *au = (uint32_t *)(void *)h_arena;
+    au[0] = UINT32_C(0x46495242); /* "FIRB" */
+    au[1] = nl->num_wires;
+    au[2] = nl->num_inputs;
+    au[3] = nl->out0_width;
+    au[4] = nl->num_gates;
+    au[7] = cfg->target_mode;
+    au[8] = cfg->seed_lo;
+    au[9] = cfg->seed_hi;
+    au[10] = cfg->target_lo;
+    au[11] = cfg->target_hi;
+
+    for (uint32_t k = 0U; k < nl->num_inputs; ++k) {
+        const BloomBsInput *bi = &nl->inputs[k];
+        uint32_t spec = (bi->varying ? UINT32_C(0x80000000) : UINT32_C(0)) |
+                        (((uint32_t)bi->wire_id & 0x1FFU) << 16U) |
+                        (uint32_t)(bi->varying ? bi->src_bit : bi->const_bit);
+        au[16U + k] = spec;
+    }
+    for (uint32_t b = 0U; b < nl->out0_width; ++b) {
+        au[272U + b] = nl->out0_wires[b];
+    }
+
+    uint32_t *mu = (uint32_t *)(void *)h_mesh;
+    for (uint32_t g = 0U; g < nl->num_gates; ++g) {
+        const BloomBsGate *gt = &nl->gates[g];
+        uint32_t *mo = mu + g * 4U;
+        mo[0] = (uint32_t)gt->kind | (((uint32_t)gt->out_w & 0x1FFU) << 16U);
+        mo[1] = (uint32_t)gt->a;
+        mo[2] = (uint32_t)gt->b;
+        mo[3] = (uint32_t)gt->c;
+    }
+
+    if (!bloom_gpu_upload_mesh(ctx, h_mesh)) {
+        free(h_mesh);
+        free(h_arena);
+        free(nl);
+        free(prog);
+        return false;
+    }
+
+    const uint32_t max_chunk_trials = UINT32_C(67108864); /* 2M packs * 32 trials/pack */
+    uint64_t t_start_ns = SDL_GetTicksNS();
+    uint32_t remaining = cfg->num_trials;
+    uint32_t base_off = 0U;
+    bool ok = true;
+
+    while (remaining > 0U && ok) {
+        uint32_t chunk_trials = (remaining > max_chunk_trials) ? max_chunk_trials : remaining;
+        uint32_t total_packs = (chunk_trials + 31U) >> 5U;
+        uint32_t num_threads = (total_packs < 32768U) ? total_packs : 32768U;
+        uint32_t num_wgs = (num_threads + 63U) / 64U;
+        au[5] = total_packs;
+        au[6] = chunk_trials;
+        au[14] = num_threads;
+        au[15] = base_off >> 5U;
+
+        if (!bloom_fir_dispatch_reduce_chunk(ctx, ctx->pipe_fir1_bs, true, true, h_arena,
+                                             num_threads, num_wgs, base_off, out)) {
+            ok = false;
+            break;
+        }
+        out->trials_evaluated += chunk_trials;
+        base_off += chunk_trials;
+        remaining -= chunk_trials;
+    }
+
+    uint64_t t_end_ns = SDL_GetTicksNS();
+    out->elapsed_us = (t_end_ns >= t_start_ns) ? ((t_end_ns - t_start_ns) / 1000ULL) : 1ULL;
+    if (out->elapsed_us == 0ULL) {
+        out->elapsed_us = 1ULL;
+    }
+    ctx->rc_valid = false;
+    ctx->mesh_epoch++;
+
+    if (ok && !bloom_fir_verify_witness(prog, cfg, out)) {
+        ok = false;
+    }
+
+    free(h_mesh);
+    free(h_arena);
+    free(nl);
+    free(prog);
+    return ok;
+}
+
+bool bloom_fir1_compile_wgsl(const uint8_t *fir_bytes,
+                             size_t fir_len,
+                             const char *wgsl_out_path,
+                             uint32_t *out_gate_count,
+                             uint32_t *out_in_bits,
+                             uint32_t *out_out0_bits) {
+    if (!fir_bytes || !wgsl_out_path || wgsl_out_path[0] == '\0') {
+        return false;
+    }
+    flow_ir_prog_t *prog = (flow_ir_prog_t *)calloc(1U, sizeof(flow_ir_prog_t));
+    BloomBsNetlist *nl = (BloomBsNetlist *)calloc(1U, sizeof(BloomBsNetlist));
+    if (!prog || !nl) {
+        free(nl);
+        free(prog);
+        return false;
+    }
+
+    uint64_t zero_base[32];
+    memset(zero_base, 0, sizeof(zero_base));
+    if (!flow_ir_load_bytes(prog, fir_bytes, fir_len) ||
+        !bloom_fir1_bitblast(prog, UINT32_C(0xFFFFFFFF), zero_base, true, nl)) {
+        free(nl);
+        free(prog);
+        return false;
+    }
+
+    FILE *fp = fopen(wgsl_out_path, "wb");
+    if (!fp) {
+        free(nl);
+        free(prog);
+        return false;
+    }
+
+    if (out_gate_count) *out_gate_count = nl->num_gates;
+    if (out_in_bits) *out_in_bits = nl->num_inputs;
+    if (out_out0_bits) *out_out0_bits = nl->out0_width;
+
+    fprintf(fp,
+            "// Auto-compiled Straight-Line AOT WGSL from FLOW FIR1 ('%s')\n"
+            "// Zero workgroup globals, zero 64-bit integer tokens, 32-way SIMT bit-sliced\n\n"
+            "@group(0) @binding(0) var<storage, read> arena : array<vec4<u32>, 1024>;\n"
+            "@group(1) @binding(0) var<storage, read_write> rc_buf : array<vec4<f32>, 32768>;\n\n"
+            "@compute @workgroup_size(64, 1, 1)\n"
+            "fn bloom_fir1_aot(@builtin(global_invocation_id) gid : vec3<u32>) {\n"
+            "    let tid = gid.x;\n"
+            "    let h0 = arena[0];\n"
+            "    let h1 = arena[1];\n"
+            "    let h2 = arena[2];\n"
+            "    let h3 = arena[3];\n"
+            "    let total_packs  = h1.y;\n"
+            "    let total_trials = h1.z;\n"
+            "    let target_mode  = h1.w;\n"
+            "    let seed_lo      = h2.x;\n"
+            "    let seed_hi      = h2.y;\n"
+            "    let target_lo    = h2.z;\n"
+            "    let target_hi    = h2.w;\n"
+            "    let vary_mask    = h3.x;\n"
+            "    let num_threads  = min(h3.z, 32768u);\n"
+            "    let pack_base    = h3.w;\n"
+            "    if (h0.x != 0x46495241u || num_threads == 0u || tid >= num_threads) { return; }\n\n",
+            prog->name);
+
+    static const char lane_ch[4] = { 'x', 'y', 'z', 'w' };
+    for (uint32_t k = 0U; k < nl->num_inputs; ++k) {
+        const BloomBsInput *bi = &nl->inputs[k];
+        uint32_t uid = 16U + (uint32_t)bi->in_idx * 2U + ((uint32_t)bi->in_bit >> 5U);
+        uint32_t vec_i = uid >> 2U;
+        char lc = lane_ch[uid & 3U];
+        uint32_t b_mod = (uint32_t)bi->in_bit & 31U;
+        uint32_t vsh = ((uint32_t)bi->in_idx < 31U) ? (uint32_t)bi->in_idx : 31U;
+        fprintf(fp,
+                "    let iv_%u = ((vary_mask >> %uu) & 1u) != 0u;\n"
+                "    let bv_%u = select(0u, 0xFFFFFFFFu, ((arena[%u].%c >> %uu) & 1u) != 0u);\n",
+                k, vsh, k, vec_i, lc, b_mod);
+        if (bi->src_bit < 32U) {
+            fprintf(fp,
+                    "    let sm_%u = select(0u, 0xFFFFFFFFu, ((seed_lo >> %uu) & 1u) != 0u);\n",
+                    k, (uint32_t)bi->src_bit);
+        } else if (bi->src_bit < 64U) {
+            fprintf(fp,
+                    "    let sm_%u = select(0u, 0xFFFFFFFFu, ((seed_hi >> %uu) & 1u) != 0u);\n",
+                    k, (uint32_t)(bi->src_bit - 32U));
+        }
+    }
+
+    uint32_t mask_lo = (nl->out0_width >= 32U) ? UINT32_C(0xFFFFFFFF) : ((UINT32_C(1) << nl->out0_width) - 1U);
+    uint32_t mask_hi = (nl->out0_width <= 32U) ? 0U :
+                       ((nl->out0_width >= 64U) ? UINT32_C(0xFFFFFFFF) : ((UINT32_C(1) << (nl->out0_width - 32U)) - 1U));
+    fprintf(fp,
+            "    let high_mismatch = ((target_lo & 0x%08Xu) != 0u) || ((target_hi & 0x%08Xu) != 0u);\n"
+            "    var best_local : u32 = 0xFFFFFFFFu;\n"
+            "    var hit_acc    : u32 = 0u;\n",
+            ~mask_lo, ~mask_hi);
+
+    for (uint32_t b = 0U; b < nl->out0_width; ++b) {
+        fprintf(fp, "    var xp_%u : u32 = 0u;\n", b);
+        if (b < 32U) {
+            fprintf(fp, "    let tb_%u = ((target_lo >> %uu) & 1u) != 0u;\n", b, b);
+        } else {
+            fprintf(fp, "    let tb_%u = ((target_hi >> %uu) & 1u) != 0u;\n", b, b - 32U);
+        }
+    }
+
+    fprintf(fp,
+            "\n    var local_pack : u32 = tid;\n"
+            "    while (local_pack < total_packs) {\n"
+            "        let gpack = pack_base + local_pack;\n"
+            "        let rem = total_trials - local_pack * 32u;\n"
+            "        let valid_mask = select((1u << min(rem, 31u)) - 1u, 0xFFFFFFFFu, rem >= 32u);\n"
+            "        let w0 : u32 = 0u;\n"
+            "        let w1 : u32 = 0xFFFFFFFFu;\n");
+
+    static const uint32_t base_pat[5] = {
+        UINT32_C(0xAAAAAAAA), UINT32_C(0xCCCCCCCC), UINT32_C(0xF0F0F0F0),
+        UINT32_C(0xFF00FF00), UINT32_C(0xFFFF0000)
+    };
+    for (uint32_t k = 0U; k < nl->num_inputs; ++k) {
+        const BloomBsInput *bi = &nl->inputs[k];
+        if (bi->src_bit < 5U) {
+            fprintf(fp, "        let p_%u = 0x%08Xu ^ sm_%u;\n", k, base_pat[bi->src_bit], k);
+        } else if (bi->src_bit < 37U) {
+            fprintf(fp, "        let p_%u = select(0u, 0xFFFFFFFFu, ((gpack >> %uu) & 1u) != 0u) ^ sm_%u;\n",
+                    k, (uint32_t)(bi->src_bit - 5U), k);
+        } else if (bi->src_bit < 64U) {
+            fprintf(fp, "        let p_%u = sm_%u;\n", k, k);
+        } else {
+            fprintf(fp, "        let p_%u = 0u;\n", k);
+        }
+        fprintf(fp, "        let w%u : u32 = select(bv_%u, p_%u, iv_%u);\n",
+                (unsigned)bi->wire_id, k, k, k);
+    }
+
+    for (uint32_t g = 0U; g < nl->num_gates; ++g) {
+        const BloomBsGate *gt = &nl->gates[g];
+        if (gt->kind == BLOOM_BS_AND) {
+            fprintf(fp, "        let w%u : u32 = w%u & w%u;\n", gt->out_w, gt->a, gt->b);
+        } else if (gt->kind == BLOOM_BS_OR) {
+            fprintf(fp, "        let w%u : u32 = w%u | w%u;\n", gt->out_w, gt->a, gt->b);
+        } else if (gt->kind == BLOOM_BS_XOR) {
+            fprintf(fp, "        let w%u : u32 = w%u ^ w%u;\n", gt->out_w, gt->a, gt->b);
+        } else if (gt->kind == BLOOM_BS_NOT) {
+            fprintf(fp, "        let w%u : u32 = ~w%u;\n", gt->out_w, gt->a);
+        } else if (gt->kind == BLOOM_BS_MUX) {
+            fprintf(fp, "        let w%u : u32 = (w%u & w%u) | ((~w%u) & w%u);\n",
+                    gt->out_w, gt->a, gt->c, gt->a, gt->b);
+        }
+    }
+
+    fprintf(fp, "        var eq_mask : u32 = select(0xFFFFFFFFu, 0u, high_mismatch);\n");
+    for (uint32_t b = 0U; b < nl->out0_width; ++b) {
+        uint16_t ow = nl->out0_wires[b];
+        fprintf(fp,
+                "        xp_%u = xp_%u ^ (w%u & valid_mask);\n"
+                "        eq_mask = eq_mask & select(~w%u, w%u, tb_%u);\n",
+                b, b, ow, ow, ow, b);
+    }
+
+    fprintf(fp,
+            "        var match_mask : u32 = valid_mask;\n"
+            "        if (target_mode == 0u) { match_mask = eq_mask & valid_mask; }\n"
+            "        else if (target_mode == 1u) { match_mask = (~eq_mask) & valid_mask; }\n"
+            "        if (match_mask != 0u) {\n"
+            "            hit_acc = hit_acc + countOneBits(match_mask);\n"
+            "            let cand = local_pack * 32u + countTrailingZeros(match_mask);\n"
+            "            if (cand < best_local) { best_local = cand; }\n"
+            "        }\n"
+            "        if (total_packs - local_pack <= num_threads) { break; }\n"
+            "        local_pack = local_pack + num_threads;\n"
+            "    }\n\n"
+            "    var xor_lo : u32 = 0u;\n"
+            "    var xor_hi : u32 = 0u;\n");
+
+    for (uint32_t b = 0U; b < nl->out0_width; ++b) {
+        if (b < 32U) {
+            fprintf(fp, "    if ((countOneBits(xp_%u) & 1u) != 0u) { xor_lo = xor_lo | (1u << %uu); }\n", b, b);
+        } else {
+            fprintf(fp, "    if ((countOneBits(xp_%u) & 1u) != 0u) { xor_hi = xor_hi | (1u << %uu); }\n", b, b - 32U);
+        }
+    }
+
+    fprintf(fp,
+            "    rc_buf[tid] = vec4<f32>(bitcast<f32>(best_local), bitcast<f32>(hit_acc), bitcast<f32>(xor_lo), bitcast<f32>(xor_hi));\n"
+            "}\n");
+
+    fclose(fp);
+    free(nl);
+    free(prog);
+    return true;
+}
+
+static char *bloom_patch_aot_metal(const char *src, size_t len, size_t *out_len) {
+    size_t cap = len + 256U;
+    char *buf = (char *)calloc(1U, cap);
+    if (!buf) {
+        return NULL;
+    }
+    static const char *const k_from[3] = {
+        "arena [[user(fake0)]]",
+        "rc_buf [[user(fake0)]]",
+        "bloom_fir1_aot_("
+    };
+    static const char *const k_to[3] = {
+        "arena [[buffer(0)]]",
+        "rc_buf [[buffer(1)]]",
+        "bloom_fir1_aot("
+    };
+    size_t i = 0U;
+    size_t o = 0U;
+    while (i < len) {
+        bool matched = false;
+        for (size_t r = 0U; r < 3U; ++r) {
+            size_t fl = strlen(k_from[r]);
+            size_t tl = strlen(k_to[r]);
+            if (i + fl <= len && memcmp(src + i, k_from[r], fl) == 0) {
+                if (o + tl + 1U > cap) {
+                    cap *= 2U;
+                    char *nb = (char *)realloc(buf, cap);
+                    if (!nb) {
+                        free(buf);
+                        return NULL;
+                    }
+                    buf = nb;
+                }
+                memcpy(buf + o, k_to[r], tl);
+                o += tl;
+                i += fl;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            if (o + 2U > cap) {
+                cap *= 2U;
+                char *nb = (char *)realloc(buf, cap);
+                if (!nb) {
+                    free(buf);
+                    return NULL;
+                }
+                buf = nb;
+            }
+            buf[o++] = src[i++];
+        }
+    }
+    buf[o] = '\0';
+    *out_len = o;
+    return buf;
+}
+
+static bool bloom_vary_mask_is_prefix(uint32_t mask, uint32_t num_inputs) {
+    uint32_t used_mask = (num_inputs >= 32U) ? UINT32_C(0xFFFFFFFF) : ((UINT32_C(1) << num_inputs) - 1U);
+    uint32_t m = mask & used_mask;
+    return (m & (m + 1U)) == 0U;
+}
+
+bool bloom_gpu_hunt_fir1_aot(BloomGpuCtx *ctx,
+                             const uint8_t *fir_bytes,
+                             size_t fir_len,
+                             const char *aot_shader_path,
+                             const BloomFir1HuntConfig *cfg,
+                             BloomFir1HuntResult *out) {
+    if (!ctx || !ctx->device || !ctx->arena_gpu_buf || !ctx->rc_gpu_buf ||
+        !ctx->upload_tbuf || !ctx->rc_download_tbuf ||
+        !fir_bytes || !aot_shader_path || !cfg || !out || cfg->num_trials == 0U ||
+        cfg->sweep_mode != 2U) {
+        return false;
+    }
+
+    flow_ir_prog_t *prog = (flow_ir_prog_t *)calloc(1U, sizeof(flow_ir_prog_t));
+    if (!prog || !flow_ir_load_bytes(prog, fir_bytes, fir_len)) {
+        free(prog);
+        return false;
+    }
+
+    /* Non-prefix vary masks compact src_bit offsets across holes; handle via bitslice netlist */
+    if (!bloom_vary_mask_is_prefix(cfg->vary_input_mask, prog->num_inputs)) {
+        free(prog);
+        return bloom_gpu_hunt_fir1_bitslice(ctx, fir_bytes, fir_len, cfg, out);
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->first_hit_trial = 0xFFFFFFFFU;
+    out->num_inputs = prog->num_inputs;
+    out->num_outputs = prog->num_outputs;
+
+    SDL_GPUShaderFormat formats = SDL_GetGPUShaderFormats(ctx->device);
+    SDL_GPUShaderFormat chosen_fmt = SDL_GPU_SHADERFORMAT_INVALID;
+    const char *ext = NULL;
+    if ((formats & SDL_GPU_SHADERFORMAT_MSL) != 0U) {
+        chosen_fmt = SDL_GPU_SHADERFORMAT_MSL;
+        ext = ".metal";
+    } else if ((formats & SDL_GPU_SHADERFORMAT_SPIRV) != 0U) {
+        chosen_fmt = SDL_GPU_SHADERFORMAT_SPIRV;
+        ext = ".spv";
+    } else {
+        free(prog);
+        return false;
+    }
+
+    char resolved[544];
+    resolved[0] = '\0';
+    size_t code_size = 0U;
+    uint8_t *code = bloom_load_compiled_shader(aot_shader_path, ext, resolved, sizeof(resolved), &code_size);
+    if (!code || code_size == 0U) {
+        SDL_free(code);
+        free(prog);
+        return false;
+    }
+
+    char *patched = NULL;
+    size_t pipe_sz = code_size;
+    const void *pipe_code = code;
+    if (chosen_fmt == SDL_GPU_SHADERFORMAT_MSL) {
+        patched = bloom_patch_aot_metal((const char *)code, code_size, &pipe_sz);
+        if (!patched) {
+            SDL_free(code);
+            free(prog);
+            return false;
+        }
+        pipe_code = patched;
+    }
+
+    SDL_GPUComputePipelineCreateInfo pi;
+    memset(&pi, 0, sizeof(pi));
+    pi.code_size = pipe_sz;
+    pi.code = (const Uint8 *)pipe_code;
+    pi.entrypoint = "bloom_fir1_aot";
+    pi.format = chosen_fmt;
+    pi.num_readonly_storage_buffers = 1U;
+    pi.num_readwrite_storage_textures = 0U;
+    pi.num_readwrite_storage_buffers = 1U;
+    pi.threadcount_x = 64U;
+    pi.threadcount_y = 1U;
+    pi.threadcount_z = 1U;
+    SDL_GPUComputePipeline *pipe = SDL_CreateGPUComputePipeline(ctx->device, &pi);
+    free(patched);
+    SDL_free(code);
+    if (!pipe) {
+        free(prog);
+        return false;
+    }
+
+    BloomEngineArena *h_arena = (BloomEngineArena *)calloc(1U, sizeof(BloomEngineArena));
+    if (!h_arena) {
+        SDL_ReleaseGPUComputePipeline(ctx->device, pipe);
+        free(prog);
+        return false;
+    }
+
+    uint32_t *au = (uint32_t *)(void *)h_arena;
+    au[0] = UINT32_C(0x46495241); /* "FIRA" */
+    au[7] = cfg->target_mode;
+    au[8] = cfg->seed_lo;
+    au[9] = cfg->seed_hi;
+    au[10] = cfg->target_lo;
+    au[11] = cfg->target_hi;
+    au[12] = cfg->vary_input_mask;
+    for (uint32_t i = 0U; i < prog->num_inputs; ++i) {
+        au[16U + i * 2U + 0U] = (uint32_t)(cfg->base_inputs[i] & UINT64_C(0xFFFFFFFF));
+        au[16U + i * 2U + 1U] = (uint32_t)(cfg->base_inputs[i] >> 32U);
+    }
+
+    const uint32_t max_chunk_trials = UINT32_C(268435456); /* 256M trials per dispatch */
+    uint64_t t_start_ns = SDL_GetTicksNS();
+    uint32_t remaining = cfg->num_trials;
+    uint32_t base_off = 0U;
+    bool ok = true;
+
+    while (remaining > 0U && ok) {
+        uint32_t chunk_trials = (remaining > max_chunk_trials) ? max_chunk_trials : remaining;
+        uint32_t total_packs = (chunk_trials + 31U) >> 5U;
+        uint32_t num_threads = (total_packs < 32768U) ? total_packs : 32768U;
+        uint32_t num_wgs = (num_threads + 63U) / 64U;
+        au[5] = total_packs;
+        au[6] = chunk_trials;
+        au[14] = num_threads;
+        au[15] = base_off >> 5U;
+
+        if (!bloom_fir_dispatch_reduce_chunk(ctx, pipe, false, false, h_arena,
+                                             num_threads, num_wgs, base_off, out)) {
+            ok = false;
+            break;
+        }
+        out->trials_evaluated += chunk_trials;
+        base_off += chunk_trials;
+        remaining -= chunk_trials;
+    }
+
+    uint64_t t_end_ns = SDL_GetTicksNS();
+    out->elapsed_us = (t_end_ns >= t_start_ns) ? ((t_end_ns - t_start_ns) / 1000ULL) : 1ULL;
+    if (out->elapsed_us == 0ULL) {
+        out->elapsed_us = 1ULL;
+    }
+    ctx->rc_valid = false;
+    ctx->mesh_epoch++;
+
+    SDL_ReleaseGPUComputePipeline(ctx->device, pipe);
+    if (ok && !bloom_fir_verify_witness(prog, cfg, out)) {
+        ok = false;
+    }
+
+    free(h_arena);
+    free(prog);
+    return ok;
+}
+
+/* ----------------------------------------------------------------------------
+ * GPU Parallel SEARU Multi-Universe Solver (3-SAT & Graph Coloring)
+ * ---------------------------------------------------------------------------- */
+
+static bool bloom_gpu_searu_dispatch_rounds(BloomGpuCtx *ctx,
+                                            uint32_t mode,
+                                            uint32_t n_items,
+                                            uint32_t n_cons,
+                                            uint32_t n_colors,
+                                            const uint64_t init_canvas[4],
+                                            const uint64_t kan_pin[4],
+                                            const BloomMeshArena *h_mesh,
+                                            const BloomSearuGpuConfig *cfg,
+                                            BloomSearuGpuResult *out) {
+    BloomEngineArena *h_arena = (BloomEngineArena *)calloc(1U, sizeof(BloomEngineArena));
+    if (!h_arena) {
+        return false;
+    }
+    if (!bloom_gpu_upload_mesh(ctx, h_mesh)) {
+        free(h_arena);
+        return false;
+    }
+
+    uint32_t n_unis = (cfg && cfg->num_universes > 0U) ? cfg->num_universes : 4096U;
+    if (n_unis > 8192U) n_unis = 8192U;
+    uint32_t n_iters = (cfg && cfg->iters_per_round > 0U) ? cfg->iters_per_round : 256U;
+    if (n_iters > 4096U) n_iters = 4096U;
+    uint32_t max_rounds = (cfg && cfg->max_rounds > 0U) ? cfg->max_rounds : 4U;
+    if (max_rounds > 32U) max_rounds = 32U;
+    uint64_t seed = cfg ? cfg->seed : UINT64_C(0xB100BEEF12345678);
+
+    uint32_t *au = (uint32_t *)(void *)h_arena;
+    au[0] = UINT32_C(0x53454152); /* "SEAR" */
+    au[1] = mode;
+    au[2] = n_items;
+    au[3] = n_cons;
+    au[4] = n_colors;
+    au[5] = n_unis;
+    au[6] = n_iters;
+    au[8] = (uint32_t)(seed & UINT64_C(0xFFFFFFFF));
+    au[9] = (uint32_t)(seed >> 32U);
+    au[11] = 7U;
+    au[12] = 8192U;
+    au[13] = 65200U;
+    au[14] = 64U;
+    au[15] = 2048U;
+
+    for (uint32_t w = 0U; w < 4U; ++w) {
+        uint64_t cw = init_canvas ? init_canvas[w] : UINT64_C(0);
+        uint64_t pw = kan_pin ? kan_pin[w] : UINT64_C(0);
+        au[16U + w * 2U + 0U] = (uint32_t)(cw & UINT64_C(0xFFFFFFFF));
+        au[16U + w * 2U + 1U] = (uint32_t)(cw >> 32U);
+        au[24U + w * 2U + 0U] = (uint32_t)(pw & UINT64_C(0xFFFFFFFF));
+        au[24U + w * 2U + 1U] = (uint32_t)(pw >> 32U);
+    }
+
+    uint64_t elite_canvases[16][4];
+    uint64_t elite_energies[16];
+    uint32_t num_elites = 0U;
+    for (uint32_t e = 0U; e < 16U; ++e) {
+        memset(elite_canvases[e], 0, sizeof(elite_canvases[e]));
+        elite_energies[e] = UINT64_MAX;
+    }
+
+    out->best_energy = UINT64_MAX;
+    uint32_t num_wgs = (n_unis + 63U) / 64U;
+    uint64_t t_start_ns = SDL_GetTicksNS();
+    bool ok = true;
+
+    for (uint32_t rnd = 0U; rnd < max_rounds && ok; ++rnd) {
+        au[7] = rnd;
+        au[10] = num_elites;
+        for (uint32_t e = 0U; e < num_elites; ++e) {
+            for (uint32_t w = 0U; w < 4U; ++w) {
+                au[32U + e * 8U + w * 2U + 0U] = (uint32_t)(elite_canvases[e][w] & UINT64_C(0xFFFFFFFF));
+                au[32U + e * 8U + w * 2U + 1U] = (uint32_t)(elite_canvases[e][w] >> 32U);
+            }
+        }
+
+        void *mapped_up = SDL_MapGPUTransferBuffer(ctx->device, ctx->upload_tbuf, false);
+        if (!mapped_up) { ok = false; break; }
         memcpy(mapped_up, h_arena, BLOOM_ARENA_BYTES);
         SDL_UnmapGPUTransferBuffer(ctx->device, ctx->upload_tbuf);
 
         SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ctx->device);
-        if (!cmd) {
-            ok = false;
-            break;
-        }
+        if (!cmd) { ok = false; break; }
 
         SDL_GPUCopyPass *up_pass = SDL_BeginGPUCopyPass(cmd);
-        if (!up_pass) {
-            SDL_CancelGPUCommandBuffer(cmd);
-            ok = false;
-            break;
-        }
+        if (!up_pass) { SDL_CancelGPUCommandBuffer(cmd); ok = false; break; }
         SDL_GPUTransferBufferLocation up_src;
         memset(&up_src, 0, sizeof(up_src));
         up_src.transfer_buffer = ctx->upload_tbuf;
@@ -594,27 +1876,19 @@ bool bloom_gpu_hunt_fir1(BloomGpuCtx *ctx,
         memset(&rw_buf, 0, sizeof(rw_buf));
         rw_buf.buffer = ctx->rc_gpu_buf;
         SDL_GPUComputePass *cpass = SDL_BeginGPUComputePass(cmd, &rw_tex, 1U, &rw_buf, 1U);
-        if (!cpass) {
-            SDL_CancelGPUCommandBuffer(cmd);
-            ok = false;
-            break;
-        }
+        if (!cpass) { SDL_CancelGPUCommandBuffer(cmd); ok = false; break; }
         SDL_GPUBuffer *ro_bufs[2] = { ctx->arena_gpu_buf, ctx->mesh_gpu_buf };
-        SDL_BindGPUComputePipeline(cpass, ctx->pipe_fir1);
+        SDL_BindGPUComputePipeline(cpass, ctx->pipe_searu);
         SDL_BindGPUComputeStorageBuffers(cpass, 0U, ro_bufs, 2U);
         SDL_DispatchGPUCompute(cpass, num_wgs, 1U, 1U);
         SDL_EndGPUComputePass(cpass);
 
         SDL_GPUCopyPass *dl_pass = SDL_BeginGPUCopyPass(cmd);
-        if (!dl_pass) {
-            SDL_CancelGPUCommandBuffer(cmd);
-            ok = false;
-            break;
-        }
+        if (!dl_pass) { SDL_CancelGPUCommandBuffer(cmd); ok = false; break; }
         SDL_GPUBufferRegion dl_src;
         memset(&dl_src, 0, sizeof(dl_src));
         dl_src.buffer = ctx->rc_gpu_buf;
-        dl_src.size = (Uint32)(num_threads * 16U);
+        dl_src.size = (Uint32)(n_unis * 48U);
         SDL_GPUTransferBufferLocation dl_dst;
         memset(&dl_dst, 0, sizeof(dl_dst));
         dl_dst.transfer_buffer = ctx->rc_download_tbuf;
@@ -629,31 +1903,54 @@ bool bloom_gpu_hunt_fir1(BloomGpuCtx *ctx,
         }
         SDL_ReleaseGPUFence(ctx->device, fence);
 
-        const uint32_t *wg_res = (const uint32_t *)SDL_MapGPUTransferBuffer(
+        const uint32_t *res = (const uint32_t *)SDL_MapGPUTransferBuffer(
             ctx->device, ctx->rc_download_tbuf, false);
-        if (!wg_res) {
-            ok = false;
-            break;
-        }
-        for (uint32_t t = 0U; t < num_threads; ++t) {
-            uint32_t min_local = wg_res[t * 4U + 0U];
-            uint32_t t_hits = wg_res[t * 4U + 1U];
-            uint64_t t_xor = ((uint64_t)wg_res[t * 4U + 3U] << 32U) | (uint64_t)wg_res[t * 4U + 2U];
-            out->out0_xor_checksum ^= t_xor;
-            out->hit_count += t_hits;
-            if (min_local != 0xFFFFFFFFU) {
-                uint32_t cand = base_off + min_local;
-                if (!out->found || cand < out->first_hit_trial) {
-                    out->found = true;
-                    out->first_hit_trial = cand;
+        if (!res) { ok = false; break; }
+
+        out->rounds_run = rnd + 1U;
+        out->total_universes_eval += n_unis;
+
+        for (uint32_t u = 0U; u < n_unis; ++u) {
+            const uint32_t *ur = res + (size_t)u * 12U;
+            uint64_t ue = (uint64_t)ur[0];
+            uint32_t iters_u = ur[1];
+            out->total_steps_eval += (uint64_t)iters_u;
+
+            uint64_t cand[4];
+            for (uint32_t w = 0U; w < 4U; ++w) {
+                cand[w] = ((uint64_t)ur[4U + w * 2U + 1U] << 32U) | (uint64_t)ur[4U + w * 2U + 0U];
+            }
+            if (ue < out->best_energy) {
+                out->best_energy = ue;
+                out->winning_universe = u;
+                memcpy(out->best_canvas, cand, sizeof(cand));
+            }
+            if (num_elites < 16U || ue < elite_energies[num_elites - 1U]) {
+                bool dup = false;
+                for (uint32_t e = 0U; e < num_elites; ++e) {
+                    if (memcmp(elite_canvases[e], cand, sizeof(cand)) == 0) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    uint32_t pos = (num_elites < 16U) ? num_elites++ : 15U;
+                    while (pos > 0U && ue < elite_energies[pos - 1U]) {
+                        elite_energies[pos] = elite_energies[pos - 1U];
+                        memcpy(elite_canvases[pos], elite_canvases[pos - 1U], sizeof(cand));
+                        pos--;
+                    }
+                    elite_energies[pos] = ue;
+                    memcpy(elite_canvases[pos], cand, sizeof(cand));
                 }
             }
         }
         SDL_UnmapGPUTransferBuffer(ctx->device, ctx->rc_download_tbuf);
 
-        out->trials_evaluated += chunk_trials;
-        base_off += chunk_trials;
-        remaining -= chunk_trials;
+        if (out->best_energy == 0ULL) {
+            out->solved = true;
+            break;
+        }
     }
 
     uint64_t t_end_ns = SDL_GetTicksNS();
@@ -664,26 +1961,97 @@ bool bloom_gpu_hunt_fir1(BloomGpuCtx *ctx,
     ctx->rc_valid = false;
     ctx->mesh_epoch++;
 
-    if (ok && out->found) {
-        bloom_fir_build_trial_inputs(prog, cfg, out->first_hit_trial, out->witness_inputs);
-        if (!flow_ir_eval_u64(prog, out->witness_inputs, out->witness_outputs)) {
-            ok = false;
-        } else {
-            uint64_t target = ((uint64_t)cfg->target_hi << 32U) | (uint64_t)cfg->target_lo;
-            uint64_t got = (prog->num_outputs > 0U) ? out->witness_outputs[0] : 0ULL;
-            bool match = (cfg->target_mode == 0U) ? (got == target) :
-                         ((cfg->target_mode == 1U) ? (got != target) : true);
-            out->cpu_verified = match;
-            if (!match) {
-                ok = false;
+    free(h_arena);
+    return ok;
+}
+
+bool bloom_gpu_searu_solve_3sat(BloomGpuCtx *ctx,
+                                const uint32_t *clauses,
+                                uint32_t num_clauses,
+                                uint32_t num_vars,
+                                const uint64_t init_canvas[4],
+                                const uint64_t kan_pin[4],
+                                const BloomSearuGpuConfig *cfg,
+                                BloomSearuGpuResult *out) {
+    if (!ctx || !ctx->device || !ctx->pipe_searu || !clauses || num_clauses == 0U ||
+        num_clauses > 8192U || num_vars == 0U || num_vars > SEARU_CANVAS_BITS || !out) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    BloomMeshArena *h_mesh = (BloomMeshArena *)calloc(1U, sizeof(BloomMeshArena));
+    if (!h_mesh) {
+        return false;
+    }
+    memcpy(h_mesh, clauses, (size_t)num_clauses * sizeof(uint32_t));
+
+    bool ok = bloom_gpu_searu_dispatch_rounds(ctx, 0U, num_vars, num_clauses, 2U,
+                                              init_canvas, kan_pin, h_mesh, cfg, out);
+    free(h_mesh);
+    if (!ok) {
+        return false;
+    }
+
+    uint64_t frust[4];
+    uint64_t cpu_e = searu_eval_3sat(out->best_canvas, clauses, num_clauses, frust);
+    bool pin_ok = true;
+    if (kan_pin && init_canvas) {
+        for (uint32_t w = 0U; w < 4U; ++w) {
+            if (((out->best_canvas[w] ^ init_canvas[w]) & kan_pin[w]) != 0ULL) {
+                pin_ok = false;
             }
         }
     }
+    out->cpu_verified = (cpu_e == out->best_energy) && pin_ok;
+    out->solved = (cpu_e == 0ULL) && pin_ok;
+    return out->cpu_verified;
+}
 
+bool bloom_gpu_searu_solve_graph_color(BloomGpuCtx *ctx,
+                                       const uint16_t *edges,
+                                       uint32_t num_edges,
+                                       uint32_t num_nodes,
+                                       uint32_t num_colors,
+                                       const uint64_t init_canvas[4],
+                                       uint64_t kan_node_pin,
+                                       const BloomSearuGpuConfig *cfg,
+                                       BloomSearuGpuResult *out) {
+    if (!ctx || !ctx->device || !ctx->pipe_searu || !edges || num_edges > 16384U ||
+        num_nodes == 0U || num_nodes > SEARU_GRAPH_MAX_NODES ||
+        num_colors < 2U || num_colors > 16U || !out) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    BloomMeshArena *h_mesh = (BloomMeshArena *)calloc(1U, sizeof(BloomMeshArena));
+    if (!h_mesh) {
+        return false;
+    }
+    if (num_edges > 0U) {
+        memcpy(h_mesh, edges, (size_t)num_edges * sizeof(uint16_t));
+    }
+    uint64_t pin4[4] = { kan_node_pin, 0ULL, 0ULL, 0ULL };
+    bool ok = bloom_gpu_searu_dispatch_rounds(ctx, 1U, num_nodes, num_edges, num_colors,
+                                              init_canvas, pin4, h_mesh, cfg, out);
     free(h_mesh);
-    free(h_arena);
-    free(prog);
-    return ok;
+    if (!ok) {
+        return false;
+    }
+
+    uint64_t conflict_nodes = 0ULL;
+    uint64_t cpu_e = searu_eval_graph_color(out->best_canvas, edges, num_edges,
+                                            num_nodes, num_colors, &conflict_nodes);
+    bool pin_ok = true;
+    if (init_canvas && kan_node_pin != 0ULL) {
+        for (uint32_t u = 0U; u < num_nodes; ++u) {
+            if (((kan_node_pin >> u) & 1ULL) != 0ULL) {
+                if (searu_color_get(out->best_canvas, u) != searu_color_get(init_canvas, u)) {
+                    pin_ok = false;
+                }
+            }
+        }
+    }
+    out->cpu_verified = (cpu_e == out->best_energy) && pin_ok;
+    out->solved = (cpu_e == 0ULL) && pin_ok;
+    return out->cpu_verified;
 }
 
 bool bloom_gpu_upload_mesh(BloomGpuCtx *ctx, const BloomMeshArena *mesh) {
@@ -1551,6 +2919,12 @@ void bloom_gpu_destroy(BloomGpuCtx *ctx) {
         }
         if (ctx->arena_gpu_buf) {
             SDL_ReleaseGPUBuffer(ctx->device, ctx->arena_gpu_buf);
+        }
+        if (ctx->pipe_searu) {
+            SDL_ReleaseGPUComputePipeline(ctx->device, ctx->pipe_searu);
+        }
+        if (ctx->pipe_fir1_bs) {
+            SDL_ReleaseGPUComputePipeline(ctx->device, ctx->pipe_fir1_bs);
         }
         if (ctx->pipe_fir1) {
             SDL_ReleaseGPUComputePipeline(ctx->device, ctx->pipe_fir1);

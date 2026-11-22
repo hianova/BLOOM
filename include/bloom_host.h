@@ -48,7 +48,7 @@ typedef enum {
 typedef struct {
     uint32_t num_trials;
     uint32_t target_mode;
-    uint32_t sweep_mode; /* 0 = sequential, 1 = deterministic fmix32 PRNG */
+    uint32_t sweep_mode; /* 0 = sequential, 1 = deterministic fmix32 PRNG, 2 = exhaustive bijective (gtid ^ seed) */
     uint32_t vary_input_mask;
     uint32_t seed_lo;
     uint32_t seed_hi;
@@ -76,6 +76,65 @@ bool bloom_gpu_hunt_fir1(BloomGpuCtx *ctx,
                          size_t fir_len,
                          const BloomFir1HuntConfig *cfg,
                          BloomFir1HuntResult *out);
+
+bool bloom_gpu_hunt_fir1_bitslice(BloomGpuCtx *ctx,
+                                  const uint8_t *fir_bytes,
+                                  size_t fir_len,
+                                  const BloomFir1HuntConfig *cfg,
+                                  BloomFir1HuntResult *out);
+
+bool bloom_fir1_compile_wgsl(const uint8_t *fir_bytes,
+                             size_t fir_len,
+                             const char *wgsl_out_path,
+                             uint32_t *out_gate_count,
+                             uint32_t *out_in_bits,
+                             uint32_t *out_out0_bits);
+
+bool bloom_gpu_hunt_fir1_aot(BloomGpuCtx *ctx,
+                             const uint8_t *fir_bytes,
+                             size_t fir_len,
+                             const char *aot_shader_path,
+                             const BloomFir1HuntConfig *cfg,
+                             BloomFir1HuntResult *out);
+
+/* GPU Parallel SEARU Multi-Universe Solver (3-SAT & Graph Coloring) */
+typedef struct {
+    uint32_t num_universes;   /* 1..8192 (default 4096) */
+    uint32_t iters_per_round; /* 1..4096 (default 256) */
+    uint32_t max_rounds;      /* 1..32   (default 4) */
+    uint64_t seed;
+} BloomSearuGpuConfig;
+
+typedef struct {
+    uint64_t best_canvas[4];
+    uint64_t best_energy;
+    uint32_t winning_universe;
+    uint32_t rounds_run;
+    uint32_t total_universes_eval;
+    uint64_t total_steps_eval;
+    uint64_t elapsed_us;
+    bool     solved;
+    bool     cpu_verified;
+} BloomSearuGpuResult;
+
+bool bloom_gpu_searu_solve_3sat(BloomGpuCtx *ctx,
+                                const uint32_t *clauses,
+                                uint32_t num_clauses,
+                                uint32_t num_vars,
+                                const uint64_t init_canvas[4],
+                                const uint64_t kan_pin[4],
+                                const BloomSearuGpuConfig *cfg,
+                                BloomSearuGpuResult *out);
+
+bool bloom_gpu_searu_solve_graph_color(BloomGpuCtx *ctx,
+                                       const uint16_t *edges,
+                                       uint32_t num_edges,
+                                       uint32_t num_nodes,
+                                       uint32_t num_colors,
+                                       const uint64_t init_canvas[4],
+                                       uint64_t kan_node_pin,
+                                       const BloomSearuGpuConfig *cfg,
+                                       BloomSearuGpuResult *out);
 
 /* Dispatches GPU compute if !BLOOM_FLAG_IDLE_SLEEP or force_render == true */
 bool bloom_gpu_render(BloomGpuCtx *ctx, bool force_render);

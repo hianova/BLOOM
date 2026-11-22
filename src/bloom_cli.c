@@ -3,12 +3,14 @@
 #include "bloom.h"
 #include "flow_ir_io.h"
 #include "flow_sha256_io.h"
+#include "searu.h"
 
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /*
  * ============================================================================
@@ -38,13 +40,27 @@ typedef struct {
     const char *out_edl_path;
     const char *out_fir_path;
     const char *hunt_fir_path;
+    const char *aot_shader_path;
+    const char *compile_fir_in;
+    const char *compile_wgsl_out;
+    const char *searu_cnf_path;
     uint32_t    hunt_trials;
     uint32_t    hunt_mode;
     uint32_t    hunt_vary_mask;
     uint64_t    hunt_seed;
     uint64_t    hunt_target;
     bool        hunt_prng;
+    bool        hunt_bitslice;
     bool        verify_cpu;
+    bool        searu_bench_3sat;
+    uint32_t    searu_3sat_vars;
+    uint32_t    searu_3sat_clauses;
+    bool        searu_bench_color;
+    uint32_t    searu_color_nodes;
+    uint32_t    searu_color_k;
+    uint32_t    searu_universes;
+    uint32_t    searu_iters;
+    uint32_t    searu_rounds;
     uint32_t    override_w;
     uint32_t    override_h;
     uint32_t    steps;
@@ -172,6 +188,22 @@ static bool cli_parse_q16_pair(const char *s, int32_t *out_a, int32_t *out_b) {
     return true;
 }
 
+static bool cli_parse_i32_pair(const char *s, int32_t *out_a, int32_t *out_b) {
+    if (!s || !out_a || !out_b) return false;
+    char *e1 = NULL;
+    long v1 = strtol(s, &e1, 10);
+    if (!e1 || e1 == s || *e1 != ',') return false;
+    char *e2 = NULL;
+    long v2 = strtol(e1 + 1, &e2, 10);
+    if (!e2 || e2 == (e1 + 1) || *e2 != '\0') return false;
+    if (v1 < -2147483647L || v1 > 2147483647L || v2 < -2147483647L || v2 > 2147483647L) {
+        return false;
+    }
+    *out_a = (int32_t)v1;
+    *out_b = (int32_t)v2;
+    return true;
+}
+
 static bool cli_parse_section_vec4(const char *s, int32_t out_n[3], int32_t *out_d) {
     const char *p = s;
     for (int i = 0; i < 3; ++i) {
@@ -205,6 +237,15 @@ static void cli_print_usage(const char *prog) {
     printf("  --hunt-target <u64>    64-bit output target for eq / neq hunt modes\n");
     printf("  --hunt-vary <mask32>   Bitmask of varying input slots (default: 0xFFFFFFFF)\n");
     printf("  --hunt-prng            Use fmix32 PRNG input generator instead of linear counter\n");
+    printf("  --bitslice             Use 32-way SIMT bit-sliced netlist accelerator (gtid ^ seed)\n");
+    printf("  --compile-fir-wgsl <in.fir> <out.wgsl>  Compile FLOW FIR1 circuit to straight-line WGSL\n");
+    printf("  --aot-shader <path>    Execute compiled straight-line AOT FIR1 shader (base/.metal/.spv)\n");
+    printf("  --searu-cnf <in.cnf>   Solve DIMACS 3-SAT file using GPU Parallel SEARU (<=256v, <=8192c)\n");
+    printf("  --searu-bench-3sat V,C Planted random 3-SAT GPU vs CPU benchmark\n");
+    printf("  --searu-bench-color N,K Planted dense K-coloring GPU vs CPU benchmark\n");
+    printf("  --universes <N>        Parallel GPU SEARU universes (1..8192, default 4096)\n");
+    printf("  --searu-iters <I>      SEARU iterations per round (1..4096, default 256)\n");
+    printf("  --searu-rounds <R>     SEARU replica-exchange rounds (1..32, default 4)\n");
     printf("  --verify-cpu           Cross-check GPU hit/checksum bit-for-bit on CPU\n");
     printf("  --sha256               Print/verify Pure-GPR SHA-256 digest of loaded asset/arena\n");
     printf("  --kitty                Emit Kitty Graphics APC terminal image payload\n");
@@ -233,6 +274,9 @@ static bool cli_parse_args(int argc, char **argv, BloomCliArgs *out) {
     out->hunt_trials = 65536U;
     out->hunt_mode = BLOOM_FIR_HUNT_SWEEP;
     out->hunt_vary_mask = 0xFFFFFFFFU;
+    out->searu_universes = 4096U;
+    out->searu_iters = 256U;
+    out->searu_rounds = 4U;
     out->sec_norm_q16[0] = BLOOM_Q16_ONE;
     out->slab_half_q16 = 16384;
 
@@ -305,8 +349,8 @@ static bool cli_parse_args(int argc, char **argv, BloomCliArgs *out) {
             out->headless = true;
         } else if (strcmp(arg, "--trials") == 0) {
             if (i + 1 >= argc || !cli_parse_u32(argv[++i], &out->hunt_trials) ||
-                out->hunt_trials == 0U || out->hunt_trials > 268435456U) {
-                fprintf(stderr, "[BLOOM CLI] Invalid --trials (expected 1..268435456)\n");
+                out->hunt_trials == 0U || out->hunt_trials > 1073741824U) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --trials (expected 1..1073741824)\n");
                 return false;
             }
         } else if (strcmp(arg, "--hunt-seed") == 0) {
@@ -342,6 +386,69 @@ static bool cli_parse_args(int argc, char **argv, BloomCliArgs *out) {
             }
         } else if (strcmp(arg, "--hunt-prng") == 0) {
             out->hunt_prng = true;
+        } else if (strcmp(arg, "--bitslice") == 0) {
+            out->hunt_bitslice = true;
+        } else if (strcmp(arg, "--aot-shader") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[BLOOM CLI] Missing path after --aot-shader\n");
+                return false;
+            }
+            out->aot_shader_path = argv[++i];
+        } else if (strcmp(arg, "--compile-fir-wgsl") == 0) {
+            if (i + 2 >= argc) {
+                fprintf(stderr, "[BLOOM CLI] Expected <in.fir> <out.wgsl> after --compile-fir-wgsl\n");
+                return false;
+            }
+            out->compile_fir_in = argv[++i];
+            out->compile_wgsl_out = argv[++i];
+            out->headless = true;
+        } else if (strcmp(arg, "--searu-cnf") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[BLOOM CLI] Missing path after --searu-cnf\n");
+                return false;
+            }
+            out->searu_cnf_path = argv[++i];
+            out->headless = true;
+        } else if (strcmp(arg, "--searu-bench-3sat") == 0) {
+            int32_t v = 0, c = 0;
+            if (i + 1 >= argc || !cli_parse_i32_pair(argv[++i], &v, &c) ||
+                v < 3 || v > 256 || c < 1 || c > 8192) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --searu-bench-3sat (expected V,C with V=3..256, C=1..8192)\n");
+                return false;
+            }
+            out->searu_bench_3sat = true;
+            out->searu_3sat_vars = (uint32_t)v;
+            out->searu_3sat_clauses = (uint32_t)c;
+            out->headless = true;
+        } else if (strcmp(arg, "--searu-bench-color") == 0) {
+            int32_t n = 0, k = 0;
+            if (i + 1 >= argc || !cli_parse_i32_pair(argv[++i], &n, &k) ||
+                n < 2 || n > 64 || k < 2 || k > 16) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --searu-bench-color (expected N,K with N=2..64, K=2..16)\n");
+                return false;
+            }
+            out->searu_bench_color = true;
+            out->searu_color_nodes = (uint32_t)n;
+            out->searu_color_k = (uint32_t)k;
+            out->headless = true;
+        } else if (strcmp(arg, "--universes") == 0) {
+            if (i + 1 >= argc || !cli_parse_u32(argv[++i], &out->searu_universes) ||
+                out->searu_universes == 0U || out->searu_universes > 8192U) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --universes (expected 1..8192)\n");
+                return false;
+            }
+        } else if (strcmp(arg, "--searu-iters") == 0) {
+            if (i + 1 >= argc || !cli_parse_u32(argv[++i], &out->searu_iters) ||
+                out->searu_iters == 0U || out->searu_iters > 4096U) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --searu-iters (expected 1..4096)\n");
+                return false;
+            }
+        } else if (strcmp(arg, "--searu-rounds") == 0) {
+            if (i + 1 >= argc || !cli_parse_u32(argv[++i], &out->searu_rounds) ||
+                out->searu_rounds == 0U || out->searu_rounds > 32U) {
+                fprintf(stderr, "[BLOOM CLI] Invalid --searu-rounds (expected 1..32)\n");
+                return false;
+            }
         } else if (strcmp(arg, "--verify-cpu") == 0) {
             out->verify_cpu = true;
         } else if (strcmp(arg, "--sha256") == 0) {
@@ -1035,21 +1142,63 @@ static uint32_t cli_fir_fmix32(uint32_t h) {
     return h;
 }
 
-static int cli_run_gpu_hunt_command(const BloomCliArgs *args, BloomEngineArena *arena) {
-    FILE *fp = fopen(args->hunt_fir_path, "rb");
+static uint64_t cli_monotonic_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000000ULL) + ((uint64_t)ts.tv_nsec / 1000ULL);
+}
+
+static uint8_t *cli_read_fir_file(const char *path, size_t *out_len) {
+    FILE *fp = fopen(path, "rb");
     if (!fp) {
-        fprintf(stderr, "[BLOOM GPU-HUNT] Cannot open .fir file: %s\n", args->hunt_fir_path);
-        return 1;
+        fprintf(stderr, "[BLOOM FIR] Cannot open .fir file: %s\n", path);
+        return NULL;
     }
     uint8_t *fir_buf = (uint8_t *)malloc(FLOW_IR_MAX_FILE_BYTES + 1U);
     if (!fir_buf) {
         fclose(fp);
-        return 1;
+        return NULL;
     }
     size_t fir_len = fread(fir_buf, 1U, FLOW_IR_MAX_FILE_BYTES + 1U, fp);
     fclose(fp);
     if (fir_len < FLOW_IR_HEADER_BYTES + 8U || fir_len > FLOW_IR_MAX_FILE_BYTES) {
-        fprintf(stderr, "[BLOOM GPU-HUNT] Invalid .fir file size (%zuB): %s\n", fir_len, args->hunt_fir_path);
+        fprintf(stderr, "[BLOOM FIR] Invalid .fir file size (%zuB): %s\n", fir_len, path);
+        free(fir_buf);
+        return NULL;
+    }
+    *out_len = fir_len;
+    return fir_buf;
+}
+
+static int cli_run_compile_fir_wgsl(const BloomCliArgs *args) {
+    size_t fir_len = 0U;
+    uint8_t *fir_buf = cli_read_fir_file(args->compile_fir_in, &fir_len);
+    if (!fir_buf) {
+        return 1;
+    }
+    uint32_t gates = 0U, in_bits = 0U, out0_bits = 0U;
+    bool ok = bloom_fir1_compile_wgsl(fir_buf, fir_len, args->compile_wgsl_out,
+                                      &gates, &in_bits, &out0_bits);
+    free(fir_buf);
+    if (!ok) {
+        fprintf(stderr, "[BLOOM AOT-WGSL] Failed to compile %s -> %s\n",
+                args->compile_fir_in, args->compile_wgsl_out);
+        return 1;
+    }
+    printf("[BLOOM AOT-WGSL] in=%s out=%s gates=%u in_bits=%u out0_bits=%u\n",
+           args->compile_fir_in, args->compile_wgsl_out, gates, in_bits, out0_bits);
+    return 0;
+}
+
+static int cli_run_gpu_hunt_command(const BloomCliArgs *args, BloomEngineArena *arena) {
+    size_t fir_len = 0U;
+    uint8_t *fir_buf = cli_read_fir_file(args->hunt_fir_path, &fir_len);
+    if (!fir_buf) {
+        return 1;
+    }
+
+    if ((args->hunt_bitslice || args->aot_shader_path != NULL) && args->hunt_prng) {
+        fprintf(stderr, "[BLOOM GPU-HUNT] --bitslice / --aot-shader use bijective (gtid ^ seed) and cannot be combined with --hunt-prng\n");
         free(fir_buf);
         return 1;
     }
@@ -1066,7 +1215,9 @@ static int cli_run_gpu_hunt_command(const BloomCliArgs *args, BloomEngineArena *
     memset(&cfg, 0, sizeof(cfg));
     cfg.num_trials = args->hunt_trials;
     cfg.target_mode = args->hunt_mode;
-    cfg.sweep_mode = args->hunt_prng ? 1U : 0U;
+    cfg.sweep_mode = (args->hunt_bitslice || args->aot_shader_path != NULL)
+                         ? 2U
+                         : (args->hunt_prng ? 1U : 0U);
     cfg.vary_input_mask = args->hunt_vary_mask;
     cfg.seed_lo = (uint32_t)(args->hunt_seed & UINT64_C(0xFFFFFFFF));
     cfg.seed_hi = (uint32_t)(args->hunt_seed >> 32U);
@@ -1074,9 +1225,19 @@ static int cli_run_gpu_hunt_command(const BloomCliArgs *args, BloomEngineArena *
     cfg.target_hi = (uint32_t)(args->hunt_target >> 32U);
 
     BloomFir1HuntResult res;
-    if (!bloom_gpu_hunt_fir1(gpu, fir_buf, fir_len, &cfg, &res)) {
-        fprintf(stderr, "[BLOOM GPU-HUNT] Failed on %s (circuit may exceed 128 vals / 512 ops / 64b width or witness mismatch)\n",
-                args->hunt_fir_path);
+    const char *engine_tag = "interp";
+    bool ok = false;
+    if (args->aot_shader_path != NULL) {
+        engine_tag = "aot-wgsl";
+        ok = bloom_gpu_hunt_fir1_aot(gpu, fir_buf, fir_len, args->aot_shader_path, &cfg, &res);
+    } else if (args->hunt_bitslice) {
+        engine_tag = "bitslice";
+        ok = bloom_gpu_hunt_fir1_bitslice(gpu, fir_buf, fir_len, &cfg, &res);
+    } else {
+        ok = bloom_gpu_hunt_fir1(gpu, fir_buf, fir_len, &cfg, &res);
+    }
+    if (!ok) {
+        fprintf(stderr, "[BLOOM GPU-HUNT] Failed (%s) on %s\n", engine_tag, args->hunt_fir_path);
         bloom_gpu_destroy(gpu);
         free(fir_buf);
         return 1;
@@ -1101,12 +1262,17 @@ static int cli_run_gpu_hunt_command(const BloomCliArgs *args, BloomEngineArena *
             uint64_t outs[FLOW_IR_MAX_IO];
             memset(ins, 0, sizeof(ins));
             memset(outs, 0, sizeof(outs));
+            uint64_t ex_val = args->hunt_seed ^ (uint64_t)tid;
+            uint32_t ex_bit = 0U;
             for (uint32_t i = 0U; i < prog->num_inputs; ++i) {
                 uint64_t wm = flow_ir_mask_u64(prog->vals[i].width);
                 uint64_t iv = cfg.base_inputs[i];
                 uint32_t sh = (i < 31U) ? i : 31U;
                 if (((cfg.vary_input_mask >> sh) & 1U) != 0U) {
-                    if (cfg.sweep_mode == 1U) {
+                    if (cfg.sweep_mode == 2U) {
+                        iv = (ex_bit < 64U) ? (ex_val >> ex_bit) : UINT64_C(0);
+                        ex_bit += (uint32_t)prog->vals[i].width;
+                    } else if (cfg.sweep_mode == 1U) {
                         uint32_t h0 = cli_fir_fmix32(cfg.seed_lo ^ tid ^ (i * UINT32_C(0x9E3779B9)));
                         uint32_t h1 = cli_fir_fmix32(cfg.seed_hi ^ (tid * UINT32_C(0x85EBCA6B)) ^
                                                      (i * UINT32_C(0xC2B2AE35)) ^ h0);
@@ -1149,8 +1315,9 @@ static int cli_run_gpu_hunt_command(const BloomCliArgs *args, BloomEngineArena *
     }
 
     double mevals = (double)res.trials_evaluated / (double)res.elapsed_us;
-    printf("[BLOOM GPU-HUNT] file=%s trials=%u hits=%u first_hit=%s xor=0x%016" PRIx64
+    printf("[BLOOM GPU-HUNT:%s] file=%s trials=%u hits=%u first_hit=%s xor=0x%016" PRIx64
            " time=%.2fms (%.2f M_evals/s) cpu_parity=%s GPU=%s\n",
+           engine_tag,
            args->hunt_fir_path,
            res.trials_evaluated,
            res.hit_count,
@@ -1168,6 +1335,283 @@ static int cli_run_gpu_hunt_command(const BloomCliArgs *args, BloomEngineArena *
     bloom_gpu_destroy(gpu);
     free(fir_buf);
     return rc;
+}
+
+static int cli_run_searu_bench_3sat(const BloomCliArgs *args, BloomEngineArena *arena) {
+    uint32_t n_vars = args->searu_3sat_vars;
+    uint32_t n_clauses = args->searu_3sat_clauses;
+    uint32_t *clauses = (uint32_t *)calloc((size_t)n_clauses, sizeof(uint32_t));
+    if (!clauses) return 1;
+
+    uint64_t rng = (args->hunt_seed ^ UINT64_C(0x5A730001DEADBEEF)) | UINT64_C(1);
+    uint64_t planted[4] = { 0ULL, 0ULL, 0ULL, 0ULL };
+    for (uint32_t v = 0U; v < n_vars; ++v) {
+        if ((searu_rng_next(&rng) & 1ULL) != 0ULL) {
+            planted[v >> 6U] |= UINT64_C(1) << (v & 63U);
+        }
+    }
+    uint64_t kan_pin[4] = { 0ULL, 0ULL, 0ULL, 0ULL };
+    uint64_t init_canvas[4] = { 0ULL, 0ULL, 0ULL, 0ULL };
+    uint32_t pin_cnt = n_vars / 12U;
+    if (pin_cnt > 8U) pin_cnt = 8U;
+    for (uint32_t k = 0U; k < pin_cnt; ++k) {
+        uint32_t v = (k * (n_vars / (pin_cnt + 1U))) + 1U;
+        if (v < n_vars) {
+            uint64_t bit = UINT64_C(1) << (v & 63U);
+            kan_pin[v >> 6U] |= bit;
+            if ((planted[v >> 6U] & bit) != 0ULL) {
+                init_canvas[v >> 6U] |= bit;
+            }
+        }
+    }
+
+    for (uint32_t ci = 0U; ci < n_clauses; ++ci) {
+        uint32_t v0 = searu_Bounded_u32(searu_rng_next(&rng), n_vars);
+        uint32_t v1 = searu_Bounded_u32(searu_rng_next(&rng), n_vars);
+        uint32_t v2 = searu_Bounded_u32(searu_rng_next(&rng), n_vars);
+        while (v1 == v0) v1 = searu_Bounded_u32(searu_rng_next(&rng), n_vars);
+        while (v2 == v0 || v2 == v1) v2 = searu_Bounded_u32(searu_rng_next(&rng), n_vars);
+
+        uint32_t neg0 = 0U, neg1 = 0U, neg2 = 0U;
+        for (uint32_t t = 0U; t < 16U; ++t) {
+            uint64_t r = searu_rng_next(&rng);
+            neg0 = (uint32_t)(r & 1ULL);
+            neg1 = (uint32_t)((r >> 1U) & 1ULL);
+            neg2 = (uint32_t)((r >> 2U) & 1ULL);
+            uint32_t b0 = (uint32_t)((planted[v0 >> 6U] >> (v0 & 63U)) & 1ULL) ^ neg0;
+            uint32_t b1 = (uint32_t)((planted[v1 >> 6U] >> (v1 & 63U)) & 1ULL) ^ neg1;
+            uint32_t b2 = (uint32_t)((planted[v2 >> 6U] >> (v2 & 63U)) & 1ULL) ^ neg2;
+            if ((b0 | b1 | b2) != 0U) break;
+        }
+        uint32_t fb0 = (uint32_t)((planted[v0 >> 6U] >> (v0 & 63U)) & 1ULL) ^ neg0;
+        uint32_t fb1 = (uint32_t)((planted[v1 >> 6U] >> (v1 & 63U)) & 1ULL) ^ neg1;
+        uint32_t fb2 = (uint32_t)((planted[v2 >> 6U] >> (v2 & 63U)) & 1ULL) ^ neg2;
+        if ((fb0 | fb1 | fb2) == 0U) {
+            neg0 ^= 1U;
+        }
+        clauses[ci] = SEARU_SAT3_CLAUSE(v0, neg0, v1, neg1, v2, neg2);
+    }
+
+    arena->map.frame_hdr.width_px = 64U;
+    arena->map.frame_hdr.height_px = 64U;
+    BloomGpuCtx *gpu = bloom_gpu_init(arena, args->shader_path);
+    if (!gpu) {
+        free(clauses);
+        return 1;
+    }
+
+    BloomSearuGpuConfig scfg;
+    scfg.num_universes = args->searu_universes;
+    scfg.iters_per_round = args->searu_iters;
+    scfg.max_rounds = args->searu_rounds;
+    scfg.seed = (args->hunt_seed != 0ULL) ? args->hunt_seed : UINT64_C(0xB100BEEF12345678);
+
+    BloomSearuGpuResult gres;
+    bool gpu_ok = bloom_gpu_searu_solve_3sat(gpu, clauses, n_clauses, n_vars,
+                                             init_canvas, kan_pin, &scfg, &gres);
+    double gpu_msteps = (gres.elapsed_us > 0ULL)
+                            ? ((double)gres.total_steps_eval / (double)gres.elapsed_us)
+                            : 0.0;
+    printf("[BLOOM GPU-SEARU 3SAT] vars=%u clauses=%u unis=%u rounds=%u steps=%" PRIu64
+           " best_e=%" PRIu64 " solved=%s win_uni=%u time=%.2fms (%.2f M_steps/s) cpu_verified=%s GPU=%s\n",
+           n_vars, n_clauses, scfg.num_universes, gres.rounds_run, gres.total_steps_eval,
+           gres.best_energy, gres.solved ? "SOLVED" : "UNSOLVED", gres.winning_universe,
+           (double)gres.elapsed_us / 1000.0, gpu_msteps,
+           gres.cpu_verified ? "EXACT" : "FAIL", bloom_gpu_device_name(gpu));
+
+    if (args->verify_cpu) {
+        searu_result cres;
+        memset(&cres, 0, sizeof(cres));
+        uint64_t t0 = cli_monotonic_us();
+        (void)searu_solve_3sat(&cres, clauses, n_clauses, n_vars,
+                               init_canvas, kan_pin, scfg.seed, UINT32_C(20000));
+        uint64_t dt = cli_monotonic_us() - t0;
+        if (dt == 0ULL) dt = 1ULL;
+        printf("[BLOOM CPU-SEARU 3SAT] vars=%u clauses=%u iters=%u best_e=%" PRIu64
+               " solved=%s time=%.2fms (%.2f k_steps/s)\n",
+               n_vars, n_clauses, cres.iterations_run, cres.best_energy,
+               (cres.best_energy == 0ULL) ? "SOLVED" : "UNSOLVED",
+               (double)dt / 1000.0, (double)cres.iterations_run * 1000.0 / (double)dt);
+    }
+
+    bloom_gpu_destroy(gpu);
+    free(clauses);
+    return (gpu_ok && gres.cpu_verified && gres.solved) ? 0 : 1;
+}
+
+static int cli_run_searu_bench_color(const BloomCliArgs *args, BloomEngineArena *arena) {
+    uint32_t n_nodes = args->searu_color_nodes;
+    uint32_t k_col = args->searu_color_k;
+    uint32_t max_edges = (n_nodes * (n_nodes - 1U)) / 2U;
+    uint16_t *edges = (uint16_t *)calloc((size_t)(max_edges > 0U ? max_edges : 1U), sizeof(uint16_t));
+    if (!edges) return 1;
+
+    uint64_t rng = (args->hunt_seed ^ UINT64_C(0xC010A464FEEDFACE)) | UINT64_C(1);
+    uint64_t planted[4] = { 0ULL, 0ULL, 0ULL, 0ULL };
+    for (uint32_t u = 0U; u < n_nodes; ++u) {
+        uint32_t col = searu_Bounded_u32(searu_rng_next(&rng), k_col);
+        searu_color_set(planted, u, col);
+    }
+    uint64_t kan_pin = 0ULL;
+    uint64_t init_canvas[4] = { 0ULL, 0ULL, 0ULL, 0ULL };
+    uint32_t pin_cnt = n_nodes / 12U;
+    if (pin_cnt > 4U) pin_cnt = 4U;
+    for (uint32_t p = 0U; p < pin_cnt; ++p) {
+        uint32_t u = p * 3U;
+        if (u < n_nodes) {
+            kan_pin |= UINT64_C(1) << u;
+            searu_color_set(init_canvas, u, searu_color_get(planted, u));
+        }
+    }
+
+    uint32_t n_edges = 0U;
+    for (uint32_t u = 0U; u < n_nodes; ++u) {
+        uint32_t cu = searu_color_get(planted, u);
+        for (uint32_t v = u + 1U; v < n_nodes; ++v) {
+            if (cu != searu_color_get(planted, v) && (searu_rng_next(&rng) % 10ULL) < 7ULL) {
+                edges[n_edges++] = SEARU_EDGE_U16(u, v);
+            }
+        }
+    }
+
+    arena->map.frame_hdr.width_px = 64U;
+    arena->map.frame_hdr.height_px = 64U;
+    BloomGpuCtx *gpu = bloom_gpu_init(arena, args->shader_path);
+    if (!gpu) {
+        free(edges);
+        return 1;
+    }
+
+    BloomSearuGpuConfig scfg;
+    scfg.num_universes = args->searu_universes;
+    scfg.iters_per_round = args->searu_iters;
+    scfg.max_rounds = args->searu_rounds;
+    scfg.seed = (args->hunt_seed != 0ULL) ? args->hunt_seed : UINT64_C(0xC010A40112345678);
+
+    BloomSearuGpuResult gres;
+    bool gpu_ok = bloom_gpu_searu_solve_graph_color(gpu, edges, n_edges, n_nodes, k_col,
+                                                    init_canvas, kan_pin, &scfg, &gres);
+    double gpu_msteps = (gres.elapsed_us > 0ULL)
+                            ? ((double)gres.total_steps_eval / (double)gres.elapsed_us)
+                            : 0.0;
+    printf("[BLOOM GPU-SEARU COLOR] nodes=%u colors=%u edges=%u unis=%u rounds=%u steps=%" PRIu64
+           " best_e=%" PRIu64 " solved=%s win_uni=%u time=%.2fms (%.2f M_steps/s) cpu_verified=%s GPU=%s\n",
+           n_nodes, k_col, n_edges, scfg.num_universes, gres.rounds_run, gres.total_steps_eval,
+           gres.best_energy, gres.solved ? "SOLVED" : "UNSOLVED", gres.winning_universe,
+           (double)gres.elapsed_us / 1000.0, gpu_msteps,
+           gres.cpu_verified ? "EXACT" : "FAIL", bloom_gpu_device_name(gpu));
+
+    if (args->verify_cpu) {
+        searu_result cres;
+        memset(&cres, 0, sizeof(cres));
+        uint64_t t0 = cli_monotonic_us();
+        (void)searu_solve_graph_color(&cres, edges, n_edges, n_nodes, k_col,
+                                      init_canvas, kan_pin, scfg.seed, UINT32_C(20000));
+        uint64_t dt = cli_monotonic_us() - t0;
+        if (dt == 0ULL) dt = 1ULL;
+        printf("[BLOOM CPU-SEARU COLOR] nodes=%u colors=%u edges=%u iters=%u best_e=%" PRIu64
+               " solved=%s time=%.2fms (%.2f k_steps/s)\n",
+               n_nodes, k_col, n_edges, cres.iterations_run, cres.best_energy,
+               (cres.best_energy == 0ULL) ? "SOLVED" : "UNSOLVED",
+               (double)dt / 1000.0, (double)cres.iterations_run * 1000.0 / (double)dt);
+    }
+
+    bloom_gpu_destroy(gpu);
+    free(edges);
+    return (gpu_ok && gres.cpu_verified && gres.solved) ? 0 : 1;
+}
+
+static int cli_run_searu_cnf(const BloomCliArgs *args, BloomEngineArena *arena) {
+    FILE *fp = fopen(args->searu_cnf_path, "rb");
+    if (!fp) {
+        fprintf(stderr, "[BLOOM GPU-SEARU CNF] Cannot open %s\n", args->searu_cnf_path);
+        return 1;
+    }
+    uint32_t *clauses = (uint32_t *)calloc(8192U, sizeof(uint32_t));
+    if (!clauses) {
+        fclose(fp);
+        return 1;
+    }
+    uint32_t n_vars = 0U, declared_c = 0U, n_clauses = 0U;
+    uint32_t lits[3] = { 0U, 0U, 0U }, negs[3] = { 0U, 0U, 0U }, lc = 0U;
+    char line[1024];
+    while (fgets(line, (int)sizeof(line), fp)) {
+        if (line[0] == 'c' || line[0] == '\n' || line[0] == '\r' || line[0] == '%') {
+            continue;
+        }
+        if (line[0] == 'p') {
+            (void)sscanf(line, "p cnf %u %u", &n_vars, &declared_c);
+            continue;
+        }
+        const char *p = line;
+        while (*p != '\0') {
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+            if (*p == '\0' || *p == 'c') break;
+            char *endp = NULL;
+            long val = strtol(p, &endp, 10);
+            if (endp == p) break;
+            p = endp;
+            if (val == 0L) {
+                if (lc > 0U && n_clauses < 8192U) {
+                    while (lc < 3U) {
+                        lits[lc] = lits[0];
+                        negs[lc] = negs[0];
+                        lc++;
+                    }
+                    clauses[n_clauses++] = SEARU_SAT3_CLAUSE(lits[0], negs[0], lits[1], negs[1], lits[2], negs[2]);
+                }
+                lc = 0U;
+            } else {
+                long av = (val < 0L) ? -val : val;
+                if (av >= 1L && av <= 256L && lc < 3U) {
+                    uint32_t vid = (uint32_t)(av - 1L);
+                    if (vid + 1U > n_vars) n_vars = vid + 1U;
+                    lits[lc] = vid;
+                    negs[lc] = (val < 0L) ? 1U : 0U;
+                    lc++;
+                }
+            }
+        }
+    }
+    fclose(fp);
+    (void)declared_c;
+
+    if (n_vars == 0U || n_vars > 256U || n_clauses == 0U) {
+        fprintf(stderr, "[BLOOM GPU-SEARU CNF] Invalid or empty 3-SAT CNF: %s (vars=%u clauses=%u)\n",
+                args->searu_cnf_path, n_vars, n_clauses);
+        free(clauses);
+        return 1;
+    }
+
+    arena->map.frame_hdr.width_px = 64U;
+    arena->map.frame_hdr.height_px = 64U;
+    BloomGpuCtx *gpu = bloom_gpu_init(arena, args->shader_path);
+    if (!gpu) {
+        free(clauses);
+        return 1;
+    }
+    BloomSearuGpuConfig scfg;
+    scfg.num_universes = args->searu_universes;
+    scfg.iters_per_round = args->searu_iters;
+    scfg.max_rounds = args->searu_rounds;
+    scfg.seed = (args->hunt_seed != 0ULL) ? args->hunt_seed : UINT64_C(0x5A70C4F012345678);
+
+    uint64_t zero4[4] = { 0ULL, 0ULL, 0ULL, 0ULL };
+    BloomSearuGpuResult gres;
+    bool gpu_ok = bloom_gpu_searu_solve_3sat(gpu, clauses, n_clauses, n_vars,
+                                             zero4, zero4, &scfg, &gres);
+    double gpu_msteps = (gres.elapsed_us > 0ULL)
+                            ? ((double)gres.total_steps_eval / (double)gres.elapsed_us)
+                            : 0.0;
+    printf("[BLOOM GPU-SEARU CNF] file=%s vars=%u clauses=%u unis=%u rounds=%u best_e=%" PRIu64
+           " solved=%s time=%.2fms (%.2f M_steps/s) cpu_verified=%s GPU=%s\n",
+           args->searu_cnf_path, n_vars, n_clauses, scfg.num_universes, gres.rounds_run,
+           gres.best_energy, gres.solved ? "SOLVED" : "UNSOLVED",
+           (double)gres.elapsed_us / 1000.0, gpu_msteps,
+           gres.cpu_verified ? "EXACT" : "FAIL", bloom_gpu_device_name(gpu));
+    bloom_gpu_destroy(gpu);
+    free(clauses);
+    return (gpu_ok && gres.cpu_verified) ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
@@ -1210,12 +1654,44 @@ int main(int argc, char **argv) {
     memset(staging, 0, sizeof(*staging));
     memset(mesh, 0, sizeof(*mesh));
 
+    if (args.compile_fir_in != NULL) {
+        int c_rc = cli_run_compile_fir_wgsl(&args);
+        free(mesh);
+        free(staging);
+        free(arena);
+        return c_rc;
+    }
+
     if (args.hunt_fir_path != NULL) {
         int hunt_rc = cli_run_gpu_hunt_command(&args, arena);
         free(mesh);
         free(staging);
         free(arena);
         return hunt_rc;
+    }
+
+    if (args.searu_bench_3sat) {
+        int s_rc = cli_run_searu_bench_3sat(&args, arena);
+        free(mesh);
+        free(staging);
+        free(arena);
+        return s_rc;
+    }
+
+    if (args.searu_bench_color) {
+        int c_rc = cli_run_searu_bench_color(&args, arena);
+        free(mesh);
+        free(staging);
+        free(arena);
+        return c_rc;
+    }
+
+    if (args.searu_cnf_path != NULL) {
+        int cnf_rc = cli_run_searu_cnf(&args, arena);
+        free(mesh);
+        free(staging);
+        free(arena);
+        return cnf_rc;
     }
 
     bool is_mesh_asset = false;

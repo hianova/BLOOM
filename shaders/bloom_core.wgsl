@@ -3219,3 +3219,601 @@ fn bloom_fir1_hunt(
         bitcast<f32>(xor_hi)
     );
 }
+
+// ============================================================================
+// 6. 32-Way Bit-Sliced SIMT "FIR1" Netlist Evaluator (32 Trials / Lane / Step)
+// ============================================================================
+
+fn mesh_read_u32(idx : u32) -> u32 {
+    let cell = mesh_buf[idx >> 4u];
+    let qi = (idx >> 2u) & 3u;
+    var q = cell.q0;
+    if (qi == 1u) { q = cell.q1; }
+    else if (qi == 2u) { q = cell.q2; }
+    else if (qi == 3u) { q = cell.q3; }
+    return vec4_u32_lane(q, idx & 3u);
+}
+
+fn mesh_read_vec4(idx : u32) -> vec4<u32> {
+    let cell = mesh_buf[idx >> 2u];
+    let qi = idx & 3u;
+    if (qi == 0u) { return cell.q0; }
+    if (qi == 1u) { return cell.q1; }
+    if (qi == 2u) { return cell.q2; }
+    return cell.q3;
+}
+
+fn bs_input_plane(src_bit : u32, pack_id : u32, seed_lo : u32, seed_hi : u32) -> u32 {
+    if (src_bit >= 64u) {
+        return 0u;
+    }
+    let sbit = select((seed_hi >> (src_bit - 32u)) & 1u, (seed_lo >> src_bit) & 1u, src_bit < 32u);
+    let smask = select(0u, 0xFFFFFFFFu, sbit != 0u);
+    if (src_bit == 0u) { return 0xAAAAAAAAu ^ smask; }
+    if (src_bit == 1u) { return 0xCCCCCCCCu ^ smask; }
+    if (src_bit == 2u) { return 0xF0F0F0F0u ^ smask; }
+    if (src_bit == 3u) { return 0xFF00FF00u ^ smask; }
+    if (src_bit == 4u) { return 0xFFFF0000u ^ smask; }
+    if (src_bit < 37u) {
+        let pbit = (pack_id >> (src_bit - 5u)) & 1u;
+        return select(0u, 0xFFFFFFFFu, (pbit ^ sbit) != 0u);
+    }
+    return smask;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn bloom_fir1_bitslice(@builtin(global_invocation_id) gid : vec3<u32>) {
+    if (gid.x == 0xFFFFFFFFu) { textureStore(out_tex, vec2<i32>(0, 0), vec4<f32>(0.0)); }
+    let tid = gid.x;
+    let hdr_q0 = arena[0].q0;
+    let hdr_q1 = arena[0].q1;
+    let hdr_q2 = arena[0].q2;
+    let hdr_q3 = arena[0].q3;
+
+    let num_wires    = min(hdr_q0.y, 512u);
+    let num_in_bits  = min(hdr_q0.z, 256u);
+    let out0_w       = min(hdr_q0.w, 64u);
+    let num_gates    = min(hdr_q1.x, 2048u);
+    let total_packs  = hdr_q1.y;
+    let total_trials = hdr_q1.z;
+    let target_mode  = hdr_q1.w;
+    let seed_lo      = hdr_q2.x;
+    let seed_hi      = hdr_q2.y;
+    let target_val   = vec2<u32>(hdr_q2.z, hdr_q2.w);
+    let num_threads  = min(hdr_q3.z, 32768u);
+    let pack_base    = hdr_q3.w;
+
+    if (hdr_q0.x != 0x46495242u || num_threads == 0u || tid >= num_threads || num_wires < 2u) {
+        return;
+    }
+
+    let out0_mask = w64_mask(out0_w);
+    let high_mismatch = ((target_val.x & (~out0_mask.x)) != 0u) || ((target_val.y & (~out0_mask.y)) != 0u);
+
+    var best_local : u32 = 0xFFFFFFFFu;
+    var hit_acc    : u32 = 0u;
+    var xor_planes : array<u32, 64>;
+    for (var b : u32 = 0u; b < 64u; b = b + 1u) {
+        xor_planes[b] = 0u;
+    }
+
+    var wires : array<u32, 512>;
+    wires[0] = 0u;
+    wires[1] = 0xFFFFFFFFu;
+
+    var local_pack : u32 = tid;
+    while (local_pack < total_packs) {
+        let gpack = pack_base + local_pack;
+        let rem = total_trials - local_pack * 32u;
+        let valid_mask = select((1u << min(rem, 31u)) - 1u, 0xFFFFFFFFu, rem >= 32u);
+
+        for (var k : u32 = 0u; k < num_in_bits; k = k + 1u) {
+            let spec = arena_read_u32(1u, k);
+            let dst = (spec >> 16u) & 0x1FFu;
+            let src_bit = spec & 0xFFu;
+            if ((spec & 0x80000000u) != 0u) {
+                wires[dst] = bs_input_plane(src_bit, gpack, seed_lo, seed_hi);
+            } else {
+                wires[dst] = select(0u, 0xFFFFFFFFu, (src_bit & 1u) != 0u);
+            }
+        }
+
+        for (var g : u32 = 0u; g < num_gates; g = g + 1u) {
+            let gt = mesh_read_vec4(g);
+            let kind = gt.x & 0xFFFFu;
+            let ow = (gt.x >> 16u) & 0x1FFu;
+            let a = wires[gt.y & 0x1FFu];
+            let b = wires[gt.z & 0x1FFu];
+            let c = wires[gt.w & 0x1FFu];
+            var r : u32 = 0u;
+            if (kind == 1u) {
+                r = a & b;
+            } else if (kind == 2u) {
+                r = a | b;
+            } else if (kind == 3u) {
+                r = a ^ b;
+            } else if (kind == 4u) {
+                r = ~a;
+            } else if (kind == 5u) {
+                r = (a & c) | ((~a) & b);
+            }
+            wires[ow] = r;
+        }
+
+        var eq_mask : u32 = select(0xFFFFFFFFu, 0u, high_mismatch);
+        for (var b : u32 = 0u; b < out0_w; b = b + 1u) {
+            let ow_id = min(arena_read_u32(17u, b), 511u);
+            let wv = wires[ow_id];
+            xor_planes[b] = xor_planes[b] ^ (wv & valid_mask);
+            let tbit = select((target_val.y >> (b - 32u)) & 1u, (target_val.x >> b) & 1u, b < 32u);
+            eq_mask = eq_mask & select(~wv, wv, tbit != 0u);
+        }
+
+        var match_mask : u32 = valid_mask;
+        if (target_mode == 0u) {
+            match_mask = eq_mask & valid_mask;
+        } else if (target_mode == 1u) {
+            match_mask = (~eq_mask) & valid_mask;
+        }
+
+        if (match_mask != 0u) {
+            hit_acc = hit_acc + countOneBits(match_mask);
+            let cand = local_pack * 32u + countTrailingZeros(match_mask);
+            if (cand < best_local) {
+                best_local = cand;
+            }
+        }
+
+        if (total_packs - local_pack <= num_threads) {
+            break;
+        }
+        local_pack = local_pack + num_threads;
+    }
+
+    var xor_lo : u32 = 0u;
+    var xor_hi : u32 = 0u;
+    for (var b : u32 = 0u; b < out0_w; b = b + 1u) {
+        if ((countOneBits(xor_planes[b]) & 1u) != 0u) {
+            if (b < 32u) {
+                xor_lo = xor_lo | (1u << b);
+            } else {
+                xor_hi = xor_hi | (1u << (b - 32u));
+            }
+        }
+    }
+
+    rc_buf[tid] = vec4<f32>(
+        bitcast<f32>(best_local),
+        bitcast<f32>(hit_acc),
+        bitcast<f32>(xor_lo),
+        bitcast<f32>(xor_hi)
+    );
+}
+
+// ============================================================================
+// 7. GPU Parallel SEARU Multi-Universe Solver (3-SAT & Graph Coloring)
+// ============================================================================
+
+fn searu_gpu_rng_u32(state : ptr<function, u32>) -> u32 {
+    var x = *state + 0x9E3779B9u;
+    *state = x;
+    x = (x ^ (x >> 16u)) * 0x85EBCA6Bu;
+    x = (x ^ (x >> 13u)) * 0xC2B2AE35u;
+    return x ^ (x >> 16u);
+}
+
+fn searu_sat_bit(c0 : u32, c1 : u32, c2 : u32, c3 : u32, c4 : u32, c5 : u32, c6 : u32, c7 : u32, v : u32) -> u32 {
+    let w = v >> 5u;
+    let b = v & 31u;
+    var word : u32 = c0;
+    if (w == 1u) { word = c1; }
+    else if (w == 2u) { word = c2; }
+    else if (w == 3u) { word = c3; }
+    else if (w == 4u) { word = c4; }
+    else if (w == 5u) { word = c5; }
+    else if (w == 6u) { word = c6; }
+    else if (w == 7u) { word = c7; }
+    return (word >> b) & 1u;
+}
+
+fn searu_sat_flip(c : ptr<function, array<u32, 8>>, pin : array<u32, 8>, v : u32) {
+    let w = v >> 5u;
+    let m = (1u << (v & 31u)) & (~pin[w]);
+    (*c)[w] = (*c)[w] ^ m;
+}
+
+fn searu_gc_get(c : array<u32, 8>, u : u32) -> u32 {
+    let w = (u >> 3u) & 7u;
+    let sh = (u & 7u) * 4u;
+    return (c[w] >> sh) & 0xFu;
+}
+
+fn searu_gc_set(c : ptr<function, array<u32, 8>>, u : u32, col : u32) {
+    let w = (u >> 3u) & 7u;
+    let sh = (u & 7u) * 4u;
+    let mask = 0xFu << sh;
+    (*c)[w] = ((*c)[w] & (~mask)) | ((col & 0xFu) << sh);
+}
+
+fn searu_gc_is_pinned(pin0 : u32, pin1 : u32, u : u32) -> bool {
+    let pw = select(pin0, pin1, u >= 32u);
+    return ((pw >> (u & 31u)) & 1u) != 0u;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn bloom_searu_solve(@builtin(global_invocation_id) gid : vec3<u32>) {
+    if (gid.x == 0xFFFFFFFFu) { textureStore(out_tex, vec2<i32>(0, 0), vec4<f32>(0.0)); }
+    let tid = gid.x;
+    let h0 = arena[0].q0;
+    let h1 = arena[0].q1;
+    let h2 = arena[0].q2;
+    let h3 = arena[0].q3;
+
+    let mode        = h0.y;
+    let n_items     = h0.z;
+    let n_cons      = h0.w;
+    let n_colors    = clamp(h1.x, 2u, 16u);
+    let n_unis      = min(h1.y, 8192u);
+    let max_iters   = min(h1.z, 4096u);
+    let round_idx   = h1.w;
+    let seed_lo     = h2.x;
+    let seed_hi     = h2.y;
+    let num_elites  = min(h2.z, 16u);
+    let init_temp   = h3.x;
+    let cool_q16    = h3.y;
+
+    if (h0.x != 0x53454152u || tid >= n_unis) {
+        return;
+    }
+
+    var init_c : array<u32, 8>;
+    var pin    : array<u32, 8>;
+    for (var w : u32 = 0u; w < 8u; w = w + 1u) {
+        init_c[w] = arena_read_u32(1u, w);
+        pin[w]    = arena_read_u32(1u, 8u + w);
+    }
+
+    var rng : u32 = fmix32(seed_lo ^ (tid * 0x9E3779B9u) ^ (round_idx * 0x85EBCA6Bu)) ^ seed_hi;
+    if (rng == 0u) { rng = 1u; }
+
+    var cur : array<u32, 8>;
+    let from_elite = (round_idx > 0u) && (num_elites > 0u) && ((tid & 1u) == 0u);
+    if (from_elite) {
+        let e_idx = (tid >> 1u) % num_elites;
+        for (var w : u32 = 0u; w < 8u; w = w + 1u) {
+            cur[w] = arena_read_u32(2u, e_idx * 8u + w);
+        }
+        if (mode == 0u) {
+            let pert = 1u + (searu_gpu_rng_u32(&rng) % 3u);
+            for (var p : u32 = 0u; p < pert; p = p + 1u) {
+                let rv = searu_gpu_rng_u32(&rng) % max(n_items, 1u);
+                searu_sat_flip(&cur, pin, rv);
+            }
+        } else {
+            let pert = 1u + (searu_gpu_rng_u32(&rng) & 1u);
+            for (var p : u32 = 0u; p < pert; p = p + 1u) {
+                let ru = searu_gpu_rng_u32(&rng) % max(n_items, 1u);
+                if (!searu_gc_is_pinned(pin[0], pin[1], ru)) {
+                    let rc = searu_gpu_rng_u32(&rng) % n_colors;
+                    searu_gc_set(&cur, ru, rc);
+                }
+            }
+        }
+    } else {
+        if (mode == 0u) {
+            for (var w : u32 = 0u; w < 8u; w = w + 1u) {
+                let r = searu_gpu_rng_u32(&rng);
+                cur[w] = (r & (~pin[w])) | (init_c[w] & pin[w]);
+            }
+        } else {
+            for (var w : u32 = 0u; w < 8u; w = w + 1u) { cur[w] = 0u; }
+            let nn = min(n_items, 64u);
+            for (var u : u32 = 0u; u < nn; u = u + 1u) {
+                let c_val = select(searu_gpu_rng_u32(&rng) % n_colors,
+                                   searu_gc_get(init_c, u),
+                                   searu_gc_is_pinned(pin[0], pin[1], u));
+                searu_gc_set(&cur, u, c_val);
+            }
+        }
+    }
+
+    var best : array<u32, 8>;
+    for (var w : u32 = 0u; w < 8u; w = w + 1u) { best[w] = cur[w]; }
+    var best_e    : u32 = 0xFFFFFFFFu;
+    var iters_run : u32 = 0u;
+    var swans     : u32 = 0u;
+    let stratum   = tid & 7u;
+
+    if (mode == 0u) {
+        // Mode 0: 3-SAT (Pure Parallel Tempering + WalkSAT + SEARU CLZ Levy-Flight)
+        let n_vars = min(n_items, 256u);
+        let n_clauses = min(n_cons, 8192u);
+        var cur_e : u32 = 0u;
+        var picked_c : u32 = 0u;
+        var pick_h : u32 = 0xFFFFFFFFu;
+
+        for (var ci : u32 = 0u; ci < n_clauses; ci = ci + 1u) {
+            let c = mesh_read_u32(ci);
+            let v0 = c & 0xFFu;
+            let v1 = (c >> 8u) & 0xFFu;
+            let v2 = (c >> 16u) & 0xFFu;
+            let b0 = searu_sat_bit(cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7], v0) ^ ((c >> 24u) & 1u);
+            let b1 = searu_sat_bit(cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7], v1) ^ ((c >> 25u) & 1u);
+            let b2 = searu_sat_bit(cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7], v2) ^ ((c >> 26u) & 1u);
+            if ((b0 | b1 | b2) == 0u) {
+                cur_e = cur_e + 1u;
+                let h = searu_gpu_rng_u32(&rng);
+                if (h <= pick_h) {
+                    pick_h = h;
+                    picked_c = c;
+                }
+            }
+        }
+        best_e = cur_e;
+
+        var temp : u32 = init_temp;
+        var stag : u32 = 0u;
+        let swan_lz_thr : u32 = select(7u, 5u, stratum >= 6u);
+        let noise_thr   : u32 = select(select(85u, 22u, stratum < 2u), 128u, stratum >= 6u);
+
+        for (var it : u32 = 0u; it < max_iters; it = it + 1u) {
+            if (best_e == 0u || n_vars == 0u || n_clauses == 0u) { break; }
+            iters_run = it + 1u;
+
+            let v0 = picked_c & 0xFFu;
+            let v1 = (picked_c >> 8u) & 0xFFu;
+            let v2 = (picked_c >> 16u) & 0xFFu;
+            let p0_free = (v0 < n_vars) && (((pin[v0 >> 5u] >> (v0 & 31u)) & 1u) == 0u);
+            let p1_free = (v1 < n_vars) && (((pin[v1 >> 5u] >> (v1 & 31u)) & 1u) == 0u);
+            let p2_free = (v2 < n_vars) && (((pin[v2 >> 5u] >> (v2 & 31u)) & 1u) == 0u);
+
+            let lz = countLeadingZeros(searu_gpu_rng_u32(&rng));
+            let do_swan = (stag >= 12u) && (lz >= swan_lz_thr);
+
+            if (do_swan || (!p0_free && !p1_free && !p2_free)) {
+                swans = swans + 1u;
+                var cand = cur;
+                let k_flips = 2u + (lz & 3u);
+                for (var f : u32 = 0u; f < k_flips; f = f + 1u) {
+                    let rv = searu_gpu_rng_u32(&rng) % n_vars;
+                    searu_sat_flip(&cand, pin, rv);
+                }
+                var cand_e : u32 = 0u;
+                var cand_pick : u32 = 0u;
+                var cand_ph : u32 = 0xFFFFFFFFu;
+                for (var ci : u32 = 0u; ci < n_clauses; ci = ci + 1u) {
+                    let c = mesh_read_u32(ci);
+                    let cv0 = c & 0xFFu;
+                    let cv1 = (c >> 8u) & 0xFFu;
+                    let cv2 = (c >> 16u) & 0xFFu;
+                    let b0 = searu_sat_bit(cand[0], cand[1], cand[2], cand[3], cand[4], cand[5], cand[6], cand[7], cv0) ^ ((c >> 24u) & 1u);
+                    let b1 = searu_sat_bit(cand[0], cand[1], cand[2], cand[3], cand[4], cand[5], cand[6], cand[7], cv1) ^ ((c >> 25u) & 1u);
+                    let b2 = searu_sat_bit(cand[0], cand[1], cand[2], cand[3], cand[4], cand[5], cand[6], cand[7], cv2) ^ ((c >> 26u) & 1u);
+                    if ((b0 | b1 | b2) == 0u) {
+                        cand_e = cand_e + 1u;
+                        let h = searu_gpu_rng_u32(&rng);
+                        if (h <= cand_ph) {
+                            cand_ph = h;
+                            cand_pick = c;
+                        }
+                    }
+                }
+                var accept = cand_e <= cur_e;
+                if (!accept && temp > 0u) {
+                    let delta = cand_e - cur_e;
+                    if (delta <= (temp >> 8u) + 2u) {
+                        let u8_r = searu_gpu_rng_u32(&rng) & 0xFFu;
+                        accept = (temp * 4u) > ((temp + delta * 512u) * (u8_r + 1u));
+                    }
+                }
+                if (accept) {
+                    cur = cand;
+                    cur_e = cand_e;
+                    picked_c = cand_pick;
+                    if (cand_e < best_e) {
+                        best = cand;
+                        best_e = cand_e;
+                        stag = 0u;
+                        temp = min(init_temp, max(temp << 1u, 1024u));
+                    } else {
+                        stag = stag + 1u;
+                    }
+                } else {
+                    stag = stag + 1u;
+                }
+            } else {
+                var e0 : u32 = 0u; var pc0 : u32 = 0u; var ph0 : u32 = 0xFFFFFFFFu;
+                var e1 : u32 = 0u; var pc1 : u32 = 0u; var ph1 : u32 = 0xFFFFFFFFu;
+                var e2 : u32 = 0u; var pc2 : u32 = 0u; var ph2 : u32 = 0xFFFFFFFFu;
+
+                for (var ci : u32 = 0u; ci < n_clauses; ci = ci + 1u) {
+                    let c = mesh_read_u32(ci);
+                    let cv0 = c & 0xFFu;
+                    let cv1 = (c >> 8u) & 0xFFu;
+                    let cv2 = (c >> 16u) & 0xFFu;
+                    let b0 = searu_sat_bit(cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7], cv0) ^ ((c >> 24u) & 1u);
+                    let b1 = searu_sat_bit(cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7], cv1) ^ ((c >> 25u) & 1u);
+                    let b2 = searu_sat_bit(cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7], cv2) ^ ((c >> 26u) & 1u);
+                    let h = searu_gpu_rng_u32(&rng);
+
+                    let u0 = ((b0 ^ u32(cv0 == v0)) | (b1 ^ u32(cv1 == v0)) | (b2 ^ u32(cv2 == v0))) == 0u;
+                    if (u0) {
+                        e0 = e0 + 1u;
+                        if (h <= ph0) { ph0 = h; pc0 = c; }
+                    }
+                    let u1 = ((b0 ^ u32(cv0 == v1)) | (b1 ^ u32(cv1 == v1)) | (b2 ^ u32(cv2 == v1))) == 0u;
+                    if (u1) {
+                        e1 = e1 + 1u;
+                        if (h <= ph1) { ph1 = h; pc1 = c; }
+                    }
+                    let u2 = ((b0 ^ u32(cv0 == v2)) | (b1 ^ u32(cv1 == v2)) | (b2 ^ u32(cv2 == v2))) == 0u;
+                    if (u2) {
+                        e2 = e2 + 1u;
+                        if (h <= ph2) { ph2 = h; pc2 = c; }
+                    }
+                }
+
+                if (!p0_free) { e0 = 0xFFFFFFFFu; }
+                if (!p1_free) { e1 = 0xFFFFFFFFu; }
+                if (!p2_free) { e2 = 0xFFFFFFFFu; }
+
+                var chosen : u32 = 0u;
+                var min_e = min(e0, min(e1, e2));
+                if (min_e > 0u && ((searu_gpu_rng_u32(&rng) & 0xFFu) < noise_thr)) {
+                    let r3 = searu_gpu_rng_u32(&rng) % 3u;
+                    if (r3 == 0u && p0_free) { chosen = 0u; }
+                    else if (r3 == 1u && p1_free) { chosen = 1u; }
+                    else if (r3 == 2u && p2_free) { chosen = 2u; }
+                    else if (e0 <= e1 && e0 <= e2) { chosen = 0u; }
+                    else if (e1 <= e2) { chosen = 1u; }
+                    else { chosen = 2u; }
+                } else {
+                    let tie = searu_gpu_rng_u32(&rng) % 3u;
+                    if (tie == 1u && e1 == min_e) { chosen = 1u; }
+                    else if (tie == 2u && e2 == min_e) { chosen = 2u; }
+                    else if (e0 == min_e) { chosen = 0u; }
+                    else if (e1 == min_e) { chosen = 1u; }
+                    else { chosen = 2u; }
+                }
+
+                if (chosen == 0u) {
+                    searu_sat_flip(&cur, pin, v0);
+                    cur_e = e0;
+                    picked_c = pc0;
+                } else if (chosen == 1u) {
+                    searu_sat_flip(&cur, pin, v1);
+                    cur_e = e1;
+                    picked_c = pc1;
+                } else {
+                    searu_sat_flip(&cur, pin, v2);
+                    cur_e = e2;
+                    picked_c = pc2;
+                }
+
+                if (cur_e < best_e) {
+                    best = cur;
+                    best_e = cur_e;
+                    stag = 0u;
+                } else {
+                    stag = stag + 1u;
+                }
+            }
+            temp = (temp * cool_q16) >> 16u;
+        }
+    } else {
+        // Mode 1: Graph Coloring (<= 64 nodes, 2..16 colors, Min-Conflicts + Parallel Tempering)
+        let n_nodes = min(n_items, 64u);
+        let n_edges = min(n_cons, 16384u);
+        var stag : u32 = 0u;
+        let noise_thr : u32 = select(select(64u, 16u, stratum < 2u), 112u, stratum >= 6u);
+
+        for (var it : u32 = 0u; it < max_iters; it = it + 1u) {
+            if (n_nodes == 0u) { break; }
+            iters_run = it + 1u;
+
+            var cur_e : u32 = 0u;
+            var bad_u : u32 = 0xFFFFFFFFu;
+            var bad_h : u32 = 0xFFFFFFFFu;
+
+            for (var u : u32 = 0u; u < n_nodes; u = u + 1u) {
+                if (searu_gc_get(cur, u) >= n_colors) {
+                    cur_e = cur_e + 1u;
+                    if (!searu_gc_is_pinned(pin[0], pin[1], u)) {
+                        let h = searu_gpu_rng_u32(&rng);
+                        if (h <= bad_h) { bad_h = h; bad_u = u; }
+                    }
+                }
+            }
+            for (var ei : u32 = 0u; ei < n_edges; ei = ei + 1u) {
+                let packed = mesh_read_u32(ei >> 1u);
+                let ev = (packed >> ((ei & 1u) * 16u)) & 0xFFFFu;
+                let u = (ev >> 8u) & 0x3Fu;
+                let v = ev & 0x3Fu;
+                if (u < n_nodes && v < n_nodes && searu_gc_get(cur, u) == searu_gc_get(cur, v)) {
+                    cur_e = cur_e + 1u;
+                    let u_free = !searu_gc_is_pinned(pin[0], pin[1], u);
+                    let v_free = !searu_gc_is_pinned(pin[0], pin[1], v);
+                    if (u_free || v_free) {
+                        var cand_u = u;
+                        if (u_free && v_free) {
+                            cand_u = select(v, u, (searu_gpu_rng_u32(&rng) & 1u) == 0u);
+                        } else if (!u_free) {
+                            cand_u = v;
+                        }
+                        let h = searu_gpu_rng_u32(&rng);
+                        if (h <= bad_h) { bad_h = h; bad_u = cand_u; }
+                    }
+                }
+            }
+
+            if (cur_e < best_e) {
+                best = cur;
+                best_e = cur_e;
+                stag = 0u;
+                if (best_e == 0u) { break; }
+            } else {
+                stag = stag + 1u;
+            }
+
+            if (bad_u >= n_nodes) {
+                let ru = searu_gpu_rng_u32(&rng) % n_nodes;
+                if (!searu_gc_is_pinned(pin[0], pin[1], ru)) {
+                    searu_gc_set(&cur, ru, searu_gpu_rng_u32(&rng) % n_colors);
+                }
+                continue;
+            }
+
+            let lz = countLeadingZeros(searu_gpu_rng_u32(&rng));
+            if (stag >= 10u && lz >= 6u) {
+                swans = swans + 1u;
+                let k_sw = 2u + (lz & 1u);
+                searu_gc_set(&cur, bad_u, searu_gpu_rng_u32(&rng) % n_colors);
+                for (var s : u32 = 1u; s < k_sw; s = s + 1u) {
+                    let ru = searu_gpu_rng_u32(&rng) % n_nodes;
+                    if (!searu_gc_is_pinned(pin[0], pin[1], ru)) {
+                        searu_gc_set(&cur, ru, searu_gpu_rng_u32(&rng) % n_colors);
+                    }
+                }
+                continue;
+            }
+
+            var chits : array<u32, 16>;
+            for (var c : u32 = 0u; c < 16u; c = c + 1u) { chits[c] = 0u; }
+            for (var ei : u32 = 0u; ei < n_edges; ei = ei + 1u) {
+                let packed = mesh_read_u32(ei >> 1u);
+                let ev = (packed >> ((ei & 1u) * 16u)) & 0xFFFFu;
+                let u = (ev >> 8u) & 0x3Fu;
+                let v = ev & 0x3Fu;
+                if (u == bad_u && v < n_nodes) {
+                    let cv = searu_gc_get(cur, v);
+                    if (cv < n_colors) { chits[cv] = chits[cv] + 1u; }
+                } else if (v == bad_u && u < n_nodes) {
+                    let cu = searu_gc_get(cur, u);
+                    if (cu < n_colors) { chits[cu] = chits[cu] + 1u; }
+                }
+            }
+
+            var new_c : u32 = searu_gpu_rng_u32(&rng) % n_colors;
+            if ((searu_gpu_rng_u32(&rng) & 0xFFu) >= noise_thr) {
+                var min_c : u32 = 0xFFFFFFFFu;
+                var best_ch : u32 = 0xFFFFFFFFu;
+                for (var c : u32 = 0u; c < n_colors; c = c + 1u) {
+                    if (chits[c] < min_c) {
+                        min_c = chits[c];
+                        new_c = c;
+                        best_ch = searu_gpu_rng_u32(&rng);
+                    } else if (chits[c] == min_c) {
+                        let rh = searu_gpu_rng_u32(&rng);
+                        if (rh <= best_ch) { best_ch = rh; new_c = c; }
+                    }
+                }
+            }
+            searu_gc_set(&cur, bad_u, new_c);
+        }
+    }
+
+    let rbase = tid * 3u;
+    rc_buf[rbase + 0u] = vec4<f32>(bitcast<f32>(best_e), bitcast<f32>(iters_run), bitcast<f32>(swans), bitcast<f32>(tid));
+    rc_buf[rbase + 1u] = vec4<f32>(bitcast<f32>(best[0]), bitcast<f32>(best[1]), bitcast<f32>(best[2]), bitcast<f32>(best[3]));
+    rc_buf[rbase + 2u] = vec4<f32>(bitcast<f32>(best[4]), bitcast<f32>(best[5]), bitcast<f32>(best[6]), bitcast<f32>(best[7]));
+}
