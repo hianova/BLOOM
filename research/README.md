@@ -18,12 +18,14 @@ make -C /Users/kuangtalin/Documents/BLOOM/research/probes clean && make -C /User
 | **[`02_memory_cache_tbdr.md`](./02_memory_cache_tbdr.md)** | **快取與 TBDR 架構**：`Shared_WC` CPU 回讀崩崖 (`30.62 → 0.33 GB/s`, 慢 `93×`)、`Private+Optimized` 貼圖快 `1.83×`、分散 UI (`256 widgets`) **TBDR `0.612 ms` vs Compute `78.047 ms` (`127.54×`!)** vs 滿版 16 層 Compute 暫存器累積 (`6.795 vs 12.574 ms`) |
 | **[`03_gpu_data_structures.md`](./03_gpu_data_structures.md)** | **純 GPU 原生資料結構**：發現 **TBDR Parameter Buffer 定律 (`Refetch20B`)**——`32 B` `BloomQuadHot` 僅傳 `20 B StageIn` (`pos + quad_id`) 再由 L1 重讀，`4K 2k Quads = 0.581 ms` (`1,721 fps`) / `20k Quads = 4.806 ms`，擊敗 GPUI-like `176 B` (`1.087 / 10.424 ms`) 與肥大 StageIn (`1.440–1.541 ms`) |
 | **[`04_transfer_and_pipeline_order.md`](./04_transfer_and_pipeline_order.md)** | **傳輸與管線排序**：Triple-Buffer (`154.7 µs/f`, CPU `21.5 µs`)、Apple TBDR HSR 與 **`discard_fragment()` 摧毀 HSR 實測 (`4.36 ms → 68.13 ms`, 暴慢 `15.8×`)**、同 CB 2 MB SLC 接力 vs 24 MB 溢位 DRAM (`1.018 → 2.156 ms`, `SplitCB` 再多損失 `+0.28–0.44 ms`) |
-| **[`05_architecture_synthesis.md`](./05_architecture_synthesis.md)** | **BLOOM vNext 藍圖與討論題**：7 條硬體鐵律 (CI Gates)、4 層零耦合結構、**5 項開放架構決策**準備討論 |
+| **[`05_architecture_synthesis.md`](./05_architecture_synthesis.md)** | **BLOOM vNext 藍圖與決策狀態**：7 條硬體鐵律 (CI Gates)、4 層零耦合結構、**4 項架構決策已定案（#3 進入 3D 物件語法討論）** |
 | **[`06_gpui_component_benchmark.md`](./06_gpui_component_benchmark.md)** | **`zed-main` GPUI 全元件實證對標**：6 大元件實測對決——**4K IDE+HUD 綜合幀 BLOOM `0.671 ms` (`1,491 fps`, `360 KB`) vs GPUI `1.274 ms` (`785 fps`, `1,677 KB`) 快 `1.90×`**；陰影快 `2.13×`；Atlas 圖示快 `5.0×` vs Slug；揭露 `BoundsTree overlap-4096` `21.19 ms` 病理與 Adopt/Beat/Skip 矩陣 |
 | **[`07_svg_ssot_fusion.md`](./07_svg_ssot_fusion.md)** | **SVG-SSOT 融合架構與 Git 法醫審計**：拆解 `v1→v2→v9` 成敗、實證 Tri-Layer (`Blueprint[2]` + `NodeKey` `StateStore` + `WC Ring` `TBDR`)——**`497` 節點 `.svg` 編譯 `778 µs`、熱重載完整保狀態 (`62.29 µs`)、1 萬列虛擬清單僅 `45 KB`、4K UI `1.087 ms` (`920 fps`) 比 `v9_compute_256` (`47.11 ms`) 快 `43.3×`** |
+| **[`08_object_ssot_3d.md`](./08_object_ssot_3d.md)** | **3D Constraint-Native Object SSOT 實測**：準確幾何只於 `init` 烘焙（`12 B/vtx`, `6.42×` 壓縮），Runtime 只傳 `48 B/obj` 約束狀態（**`3.65×` GPU / `10.7×` WC 勝過業界 `64B+512B` 蒙皮**）；**`ComputeCull+Indirect` (`0.419 ms`) 勝過 Metal 3 Object+Mesh (`0.812 ms`)**；Track B `Tight-Proxy O(1)` (`0.376 ms`) 與 `[[clip_distance]]` 單 CB 完成 **4K 3D+HUD 僅 `0.959 ms` (`1,042.5 fps`)** |
 | **[`probes/m1_silicon_probe.mm`](./probes/m1_silicon_probe.mm)** | 原生 Metal 矽片物理探針（輸出 `build/m1_probe_results.json`） |
 | **[`probes/gpui_component_bench.mm`](./probes/gpui_component_bench.mm)** | `zed-main` GPUI vs BLOOM 元件對標探針（輸出 `build/gpui_bench_results.json`） |
 | **[`probes/svg_ssot_bench.mm`](./probes/svg_ssot_bench.mm)** | Tri-Layer SVG-SSOT 編譯、熱重載保狀態與 4K TBDR 對標探針（輸出 `build/svg_ssot_results.json`） |
+| **[`probes/object_ssot_bench.mm`](./probes/object_ssot_bench.mm)** | 3D Constraint-Native Object SSOT 壓縮、Cluster Cull (Compute vs Mesh Shader)、Tight-Proxy、剖切與 4K 合成探針（輸出 `build/object_ssot_results.json`） |
 
 ---
 
