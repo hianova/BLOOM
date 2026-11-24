@@ -166,26 +166,64 @@ def _read_accessor(gltf: Dict[str, Any], bin_blob: bytes, acc_idx: int) -> List[
     return out
 
 
-def parse_glb_to_template(glb_path: Path, tpl_idx: int) -> Dict[str, Any]:
-    data = glb_path.read_bytes()
-    if len(data) < 20 or data[:4] != b"glTF":
-        raise ValueError(f"Invalid GLB header in {glb_path}")
-    pos = 12
-    json_blob = b""
-    bin_blob = b""
-    while pos + 8 <= len(data):
-        clen, ctype = struct.unpack_from("<II", data, pos)
-        pos += 8
-        chunk = data[pos : pos + clen]
-        pos += clen
-        if ctype == 0x4E4F534A:  # JSON
-            json_blob = chunk
-        elif ctype == 0x004E4942:  # BIN
-            bin_blob = chunk
+def _morton3d(x: float, y: float, z: float) -> int:
+    def _part1(n: int) -> int:
+        n &= 0x3FF
+        n = (n ^ (n << 16)) & 0x030000FF
+        n = (n ^ (n << 8)) & 0x0300F00F
+        n = (n ^ (n << 4)) & 0x030C30C3
+        n = (n ^ (n << 2)) & 0x09249249
+        return n
+    ix = max(0, min(1023, int(((x - LOCAL_BOX_LO) / LOCAL_BOX_SPAN) * 1023.0)))
+    iy = max(0, min(1023, int(((y - LOCAL_BOX_LO) / LOCAL_BOX_SPAN) * 1023.0)))
+    iz = max(0, min(1023, int(((z - LOCAL_BOX_LO) / LOCAL_BOX_SPAN) * 1023.0)))
+    return _part1(ix) | (_part1(iy) << 1) | (_part1(iz) << 2)
 
-    gltf = json.loads(json_blob.decode("utf-8"))
-    mesh = gltf["meshes"][0]
-    prim = mesh["primitives"][0]
+
+def _quat_mul(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+def _quat_rot(q: Tuple[float, float, float, float], v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    qx, qy, qz, qw = q
+    vx, vy, vz = v
+    tx = 2.0 * (qy * vz - qz * vy)
+    ty = 2.0 * (qz * vx - qx * vz)
+    tz = 2.0 * (qx * vy - qy * vx)
+    return (
+        vx + qw * tx + (qy * tz - qz * ty),
+        vy + qw * ty + (qz * tx - qx * tz),
+        vz + qw * tz + (qx * ty - qy * tx),
+    )
+
+
+def _node_local_trs(node: Dict[str, Any]) -> Tuple[Tuple[float, float, float], Tuple[float, float, float, float], Tuple[float, float, float]]:
+    if "matrix" in node and len(node["matrix"]) == 16:
+        m = node["matrix"]
+        t = (float(m[12]), float(m[13]), float(m[14]))
+        sx = math.sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]) or 1.0
+        sy = math.sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]) or 1.0
+        sz = math.sqrt(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]) or 1.0
+        return t, (0.0, 0.0, 0.0, 1.0), (sx, sy, sz)
+    tv = node.get("translation", [0.0, 0.0, 0.0])
+    rv = node.get("rotation", [0.0, 0.0, 0.0, 1.0])
+    sv = node.get("scale", [1.0, 1.0, 1.0])
+    ql = math.sqrt(rv[0] * rv[0] + rv[1] * rv[1] + rv[2] * rv[2] + rv[3] * rv[3]) or 1.0
+    return (
+        (float(tv[0]), float(tv[1]), float(tv[2])),
+        (float(rv[0]) / ql, float(rv[1]) / ql, float(rv[2]) / ql, float(rv[3]) / ql),
+        (float(sv[0]), float(sv[1]), float(sv[2])),
+    )
+
+
+def _bake_primitive(gltf: Dict[str, Any], bin_blob: bytes, prim: Dict[str, Any], tpl_idx: int, name: str) -> Tuple[Dict[str, Any], int]:
     attrs = prim["attributes"]
     positions = _read_accessor(gltf, bin_blob, attrs["POSITION"])
     normals = _read_accessor(gltf, bin_blob, attrs["NORMAL"]) if "NORMAL" in attrs else None
@@ -196,7 +234,6 @@ def parse_glb_to_template(glb_path: Path, tpl_idx: int) -> Dict[str, Any]:
     else:
         raw_idx = list(range(len(positions)))
 
-    # Compute missing flat normals if glTF lacks NORMAL attribute
     if normals is None:
         acc_n = [[0.0, 0.0, 0.0] for _ in range(len(positions))]
         for t in range(0, len(raw_idx) - 2, 3):
@@ -216,17 +253,25 @@ def parse_glb_to_template(glb_path: Path, tpl_idx: int) -> Dict[str, Any]:
             l = math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) or 1.0
             normals.append((n[0] / l, n[1] / l, n[2] / l))
 
-    # Fit positions cleanly inside [-1.4, +1.4] domain if needed
     max_abs = max((max(abs(p[0]), abs(p[1]), abs(p[2])) for p in positions), default=1.0)
     norm_scale = (1.35 / max_abs) if max_abs > 1.45 else 1.0
 
-    # Greedy partition triangles into meshlets (<=64 local vertices, <=96 tris)
+    # Morton-sort triangles by centroid for spatially coherent meshlets
+    tris: List[Tuple[int, int, int, int]] = []
+    for t in range(0, len(raw_idx) - 2, 3):
+        ia, ib, ic = raw_idx[t], raw_idx[t + 1], raw_idx[t + 2]
+        cx = (positions[ia][0] + positions[ib][0] + positions[ic][0]) * (norm_scale / 3.0)
+        cy = (positions[ia][1] + positions[ib][1] + positions[ic][1]) * (norm_scale / 3.0)
+        cz = (positions[ia][2] + positions[ib][2] + positions[ic][2]) * (norm_scale / 3.0)
+        tris.append((_morton3d(cx, cy, cz), ia, ib, ic))
+    tris.sort(key=lambda item: item[0])
+
     meshlets: List[Tuple[List[int], List[int]]] = []
     cur_global_verts: List[int] = []
     cur_map: Dict[int, int] = {}
     cur_local_idx: List[int] = []
-    for t in range(0, len(raw_idx) - 2, 3):
-        tri = (raw_idx[t], raw_idx[t + 1], raw_idx[t + 2])
+    for _, ia, ib, ic in tris:
+        tri = (ia, ib, ic)
         new_needed = sum(1 for gi in tri if gi not in cur_map)
         if (len(cur_local_idx) // 3 >= CLUSTER_TRI) or (len(cur_global_verts) + new_needed > CLUSTER_VTX):
             meshlets.append((cur_global_verts, cur_local_idx))
@@ -290,14 +335,122 @@ def parse_glb_to_template(glb_path: Path, tpl_idx: int) -> Dict[str, Any]:
             "aabb_scale_tag": 0,
         })
 
-    return {
-        "name": glb_path.stem[:60],
+    rgba8 = 0xFF40D8F0
+    if "material" in prim and "materials" in gltf:
+        mat = gltf["materials"][prim["material"]]
+        bcf = mat.get("pbrMetallicRoughness", {}).get("baseColorFactor")
+        if bcf and len(bcf) >= 4:
+            r = max(0, min(255, int(round(bcf[0] * 255.0))))
+            g = max(0, min(255, int(round(bcf[1] * 255.0))))
+            b = max(0, min(255, int(round(bcf[2] * 255.0))))
+            a = max(0, min(255, int(round(bcf[3] * 255.0))))
+            rgba8 = (a << 24) | (b << 16) | (g << 8) | r
+
+    tpl = {
+        "name": name[:60],
         "meshlet_cnt": len(meshlets),
         "hdrs": hdrs,
         "verts": verts,
         "local_idx": bytes(local_idx_stream),
         "world_scale": 1.0 / norm_scale,
     }
+    return tpl, rgba8
+
+
+def parse_glb_scene(glb_path: Path, tpl_offset: int = 0, x_offset: float = 0.0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    data = glb_path.read_bytes()
+    if len(data) < 20 or data[:4] != b"glTF":
+        raise ValueError(f"Invalid GLB header in {glb_path}")
+    pos = 12
+    json_blob = b""
+    bin_blob = b""
+    while pos + 8 <= len(data):
+        clen, ctype = struct.unpack_from("<II", data, pos)
+        pos += 8
+        chunk = data[pos : pos + clen]
+        pos += clen
+        if ctype == 0x4E4F534A:
+            json_blob = chunk
+        elif ctype == 0x004E4942:
+            bin_blob = chunk
+
+    gltf = json.loads(json_blob.decode("utf-8"))
+    meshes = gltf.get("meshes", [])
+    tpls: List[Dict[str, Any]] = []
+    prim_cache: Dict[Tuple[int, int], Tuple[int, float, int]] = {}
+
+    def _get_prim_tpl(m_idx: int, p_idx: int) -> Tuple[int, float, int]:
+        key = (m_idx, p_idx)
+        if key in prim_cache:
+            return prim_cache[key]
+        mesh_name = meshes[m_idx].get("name", f"{glb_path.stem}_{m_idx}")
+        tname = mesh_name if p_idx == 0 else f"{mesh_name}_p{p_idx}"
+        global_tid = tpl_offset + len(tpls)
+        tpl, rgba8 = _bake_primitive(gltf, bin_blob, meshes[m_idx]["primitives"][p_idx], global_tid, tname)
+        tpls.append(tpl)
+        prim_cache[key] = (global_tid, tpl["world_scale"], rgba8)
+        return prim_cache[key]
+
+    objs: List[Dict[str, Any]] = []
+
+    def _make_obj(oid: str, tid: int, pos3: Tuple[float, float, float], quat4: Tuple[float, float, float, float],
+                  sc3: Tuple[float, float, float], rgba8: int) -> Dict[str, Any]:
+        return {
+            "id": oid[:60],
+            "pos": pos3,
+            "quat": (f32_to_f16(quat4[0]), f32_to_f16(quat4[1]), f32_to_f16(quat4[2]), f32_to_f16(quat4[3])),
+            "scale": (f32_to_f16(sc3[0]), f32_to_f16(sc3[1]), f32_to_f16(sc3[2])),
+            "dof": (0, 0, 0),
+            "clip": (f32_to_f16(0.70703125), 0, f32_to_f16(0.70703125), 0),
+            "rgba8": rgba8,
+            "flags": 0,
+            "dof_min": (f32_to_f16(-1.5), f32_to_f16(-1.5), f32_to_f16(-1.5)),
+            "dof_max": (f32_to_f16(1.5), f32_to_f16(1.5), f32_to_f16(1.5)),
+            "template_id": tid,
+            "joint_mask": 7,
+        }
+
+    nodes = gltf.get("nodes")
+    if nodes:
+        scenes = gltf.get("scenes", [])
+        if scenes:
+            sc_idx = gltf.get("scene", 0)
+            roots = scenes[sc_idx].get("nodes", [])
+        else:
+            children_set = {c for nd in nodes for c in nd.get("children", [])}
+            roots = [idx for idx in range(len(nodes)) if idx not in children_set]
+
+        def _visit(n_idx: int, pt: Tuple[float, float, float], pq: Tuple[float, float, float, float],
+                   ps: Tuple[float, float, float]) -> None:
+            nd = nodes[n_idx]
+            lt, lq, ls = _node_local_trs(nd)
+            scaled_lt = (ps[0] * lt[0], ps[1] * lt[1], ps[2] * lt[2])
+            rl = _quat_rot(pq, scaled_lt)
+            wt = (pt[0] + rl[0], pt[1] + rl[1], pt[2] + rl[2])
+            wq = _quat_mul(pq, lq)
+            ws = (ps[0] * ls[0], ps[1] * ls[1], ps[2] * ls[2])
+            if "mesh" in nd:
+                m_idx = int(nd["mesh"])
+                prims = meshes[m_idx].get("primitives", [])
+                nname = nd.get("name", f"{glb_path.stem}_n{n_idx}")
+                for p_i in range(len(prims)):
+                    tid, wscale, rgba8 = _get_prim_tpl(m_idx, p_i)
+                    oid = nname if len(prims) == 1 else f"{nname}_p{p_i}"
+                    objs.append(_make_obj(oid, tid, wt, wq, (ws[0] * wscale, ws[1] * wscale, ws[2] * wscale), rgba8))
+            for ch in nd.get("children", []):
+                _visit(int(ch), wt, wq, ws)
+
+        for r in roots:
+            _visit(int(r), (x_offset, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0))
+    else:
+        for m_i, mesh in enumerate(meshes):
+            for p_i in range(len(mesh.get("primitives", []))):
+                tid, wscale, rgba8 = _get_prim_tpl(m_i, p_i)
+                mname = mesh.get("name", glb_path.stem)
+                oid = f"imported_{mname}" if len(meshes) == 1 and p_i == 0 else f"imported_{mname}_{m_i}_{p_i}"
+                objs.append(_make_obj(oid, tid, (x_offset, 0.0, 12.0), (0.0, 0.0, 0.0, 1.0), (wscale, wscale, wscale), rgba8))
+
+    return tpls, objs
 
 
 def parse_svg_huds(svg_path: Path) -> List[Dict[str, Any]]:
@@ -496,6 +649,65 @@ def write_sample_glb(path: Path) -> None:
                      struct.pack("<II", len(bin_chunk), 0x004E4942) + bin_chunk)
 
 
+def write_multi_glb(path: Path) -> None:
+    # 2 meshes, 2 PBR materials, 3 hierarchical parent-child nodes
+    oct_pts = [(0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (-1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, -1.0, 0.0)]
+    oct_tris = [(0, 2, 1), (0, 3, 2), (0, 4, 3), (0, 1, 4), (5, 1, 2), (5, 2, 3), (5, 3, 4), (5, 4, 1)]
+    box_pts = [(-0.6, -0.4, 0.6), (0.6, -0.4, 0.6), (0.6, 0.4, 0.6), (-0.6, 0.4, 0.6),
+               (-0.6, -0.4, -0.6), (0.6, -0.4, -0.6), (0.6, 0.4, -0.6), (-0.6, 0.4, -0.6)]
+    box_tris = [(0,1,2),(0,2,3),(5,4,7),(5,7,6),(1,5,6),(1,6,2),(4,0,3),(4,3,7),(3,2,6),(3,6,7),(4,5,1),(4,1,0)]
+    v1 = b"".join(struct.pack("<fff", *p) for p in oct_pts)
+    i1 = b"".join(struct.pack("<HHH", *t) for t in oct_tris)
+    v2 = b"".join(struct.pack("<fff", *p) for p in box_pts)
+    i2 = b"".join(struct.pack("<HHH", *t) for t in box_tris)
+    bin_chunk = v1 + i1 + v2 + i2
+    while len(bin_chunk) % 4 != 0:
+        bin_chunk += b"\x00"
+    o0 = 0
+    o1 = len(v1)
+    o2 = o1 + len(i1)
+    o3 = o2 + len(v2)
+    gltf = {
+        "asset": {"version": "2.0"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [
+            {"name": "hub_core", "mesh": 0, "translation": [0.0, 0.0, 8.0], "children": [1, 2]},
+            {"name": "wing_left", "mesh": 1, "translation": [-2.0, 0.3, 0.0], "scale": [0.7, 0.7, 0.7]},
+            {"name": "wing_right", "mesh": 0, "translation": [2.0, -0.2, 0.0], "scale": [0.55, 0.55, 0.55]},
+        ],
+        "materials": [
+            {"pbrMetallicRoughness": {"baseColorFactor": [0.25, 0.85, 0.96, 1.0]}},
+            {"pbrMetallicRoughness": {"baseColorFactor": [0.95, 0.58, 0.22, 1.0]}},
+        ],
+        "meshes": [
+            {"name": "octa_crystal", "primitives": [{"attributes": {"POSITION": 0}, "indices": 1, "material": 0}]},
+            {"name": "box_module", "primitives": [{"attributes": {"POSITION": 2}, "indices": 3, "material": 1}]},
+        ],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": len(oct_pts), "type": "VEC3"},
+            {"bufferView": 1, "componentType": 5123, "count": len(oct_tris) * 3, "type": "SCALAR"},
+            {"bufferView": 2, "componentType": 5126, "count": len(box_pts), "type": "VEC3"},
+            {"bufferView": 3, "componentType": 5123, "count": len(box_tris) * 3, "type": "SCALAR"},
+        ],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": o0, "byteLength": len(v1)},
+            {"buffer": 0, "byteOffset": o1, "byteLength": len(i1)},
+            {"buffer": 0, "byteOffset": o2, "byteLength": len(v2)},
+            {"buffer": 0, "byteOffset": o3, "byteLength": len(i2)},
+        ],
+        "buffers": [{"byteLength": len(bin_chunk)}],
+    }
+    jbytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+    while len(jbytes) % 4 != 0:
+        jbytes += b" "
+    total = 12 + 8 + len(jbytes) + 8 + len(bin_chunk)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(struct.pack("<III", 0x46546C67, 2, total) +
+                     struct.pack("<II", len(jbytes), 0x4E4F534A) + jbytes +
+                     struct.pack("<II", len(bin_chunk), 0x004E4942) + bin_chunk)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="BLOOM build-time GLB/SVG -> BOBC/BOBR importer")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -512,10 +724,18 @@ def main() -> None:
     samp = sub.add_parser("emit-sample-glb", help="Emit a valid minimal glTF 2.0 .glb for CI testing")
     samp.add_argument("out", type=Path)
 
+    mult = sub.add_parser("emit-multi-glb", help="Emit a multi-mesh multi-node glTF 2.0 .glb for CI testing")
+    mult.add_argument("out", type=Path)
+
     args = ap.parse_args()
     if args.cmd == "emit-sample-glb":
         write_sample_glb(args.out)
         print(f"Wrote sample GLB -> {args.out}")
+        return
+
+    if args.cmd == "emit-multi-glb":
+        write_multi_glb(args.out)
+        print(f"Wrote multi-node GLB -> {args.out}")
         return
 
     if args.cmd == "inspect":
@@ -528,23 +748,9 @@ def main() -> None:
     tpls: List[Dict[str, Any]] = []
     objs: List[Dict[str, Any]] = []
     for i, gp in enumerate(args.glb):
-        t = parse_glb_to_template(gp, i)
-        tpls.append(t)
-        sc = f32_to_f16(t["world_scale"])
-        objs.append({
-            "id": f"imported_{t['name']}",
-            "pos": (float(i) * 3.0, 0.0, 12.0),
-            "quat": (0, 0, 0, f32_to_f16(1.0)),
-            "scale": (sc, sc, sc),
-            "dof": (0, 0, 0),
-            "clip": (f32_to_f16(0.70703125), 0, f32_to_f16(0.70703125), 0),
-            "rgba8": 0xFF40D8F0,
-            "flags": 0,
-            "dof_min": (f32_to_f16(-1.5), f32_to_f16(-1.5), f32_to_f16(-1.5)),
-            "dof_max": (f32_to_f16(1.5), f32_to_f16(1.5), f32_to_f16(1.5)),
-            "template_id": i,
-            "joint_mask": 7,
-        })
+        st, so = parse_glb_scene(gp, len(tpls), float(i) * 4.0)
+        tpls.extend(st)
+        objs.extend(so)
     huds = parse_svg_huds(args.svg) if args.svg else []
     blob = encode_bobc(tpls, objs, huds) if args.format == "bobc" else encode_bobr(tpls, objs, huds)
     args.out.parent.mkdir(parents=True, exist_ok=True)

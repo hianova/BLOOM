@@ -248,7 +248,9 @@ static void run_test1_ui_sdk_and_modal(BloomGpu *gpu) {
 
     assert(e_mbtn->actionable == true);
     /* Tab roving focus stays trapped inside modal */
-    BloomInputEvent tab{BLOOM_EVENT_KEY_DOWN, 0.0f, 0.0f, 0.0f, 0.0f, 0u, 48u, 0u, 0u};
+    BloomInputEvent tab{};
+    tab.type = BLOOM_EVENT_KEY_DOWN;
+    tab.key_code = 48u;
     assert(bloom_scene_handle_input(sc, &tab));
     assert(bloom_scene_get_focused_ui(sc) == modal_btn);
 

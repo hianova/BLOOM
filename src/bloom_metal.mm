@@ -15,6 +15,9 @@
 
 static constexpr uint32_t kRingSlots = 3u;
 static constexpr uint32_t kAtlasDim = 1024u;
+static constexpr uint32_t kSpriteAtlasDim = 512u;
+static constexpr uint32_t kPbrTexDim = 512u;
+static constexpr uint32_t kPbrTexSlices = 32u;
 static constexpr uint32_t kMaxGlyphsPerFrame = 32768u;
 
 struct GroundParamsGpu {
@@ -61,6 +64,7 @@ struct BloomGpu {
     id<MTLBuffer> wc_ring[kRingSlots]{};
     id<MTLBuffer> stg_geom[kRingSlots]{};
     id<MTLBuffer> stg_atlas[kRingSlots]{};
+    id<MTLBuffer> stg_sprite[kRingSlots]{};
     id<MTLBuffer> ind_args[kRingSlots]{};
 
     /* Private static meshlet & identity index buffers + culling survivors */
@@ -69,11 +73,22 @@ struct BloomGpu {
     id<MTLBuffer> priv_id_idx16 = nil;
     id<MTLBuffer> priv_surv_ids = nil;
 
-    /* Private+Opt R8Unorm font atlas + Memoryless Depth32Float + optional headless RT */
+    /* Private+Opt R8Unorm font atlas + RGBA8 sprite atlas + Memoryless Depth32Float */
     id<MTLTexture> atlas_tex = nil;
+    id<MTLTexture> sprite_atlas_tex = nil;
     id<MTLTexture> depth_tex = nil;
     id<MTLTexture> hl_color_tex = nil;
     uint32_t cur_w = 0u, cur_h = 0u;
+
+    /* Lazy on-demand M2 PBR & Sprite pipelines */
+    std::string pbr_shader_path;
+    std::string sprite_shader_path;
+    id<MTLLibrary> pbr_lib = nil;
+    id<MTLLibrary> sprite_lib = nil;
+    id<MTLRenderPipelineState> p_mesh_pbr = nil;
+    id<MTLRenderPipelineState> p_hud_sprite = nil;
+    id<MTLTexture> pbr_tex_array = nil;
+    uint32_t pbr_tex_used = 0u;
 
     /* Lazy on-demand Adaptive Half-Res Grounding & Picking resources */
     std::string ground_shader_path;
@@ -196,9 +211,10 @@ BloomGpu *bloom_gpu_create(void *ca_metal_layer, const char *shader_path) {
     {
         std::string sp(spath);
         size_t pos = sp.rfind("bloom_core.metal");
-        g->ground_shader_path = (pos != std::string::npos)
-                                    ? (sp.substr(0, pos) + "bloom_grounding.metal")
-                                    : "shaders/bloom_grounding.metal";
+        std::string dir = (pos != std::string::npos) ? sp.substr(0, pos) : "shaders/";
+        g->ground_shader_path = dir + "bloom_grounding.metal";
+        g->pbr_shader_path = dir + "bloom_pbr.metal";
+        g->sprite_shader_path = dir + "bloom_sprite.metal";
     }
     g->dev = MTLCreateSystemDefaultDevice();
     if (!g->dev) { delete g; return nullptr; }
@@ -255,6 +271,8 @@ BloomGpu *bloom_gpu_create(void *ca_metal_layer, const char *shader_path) {
                                             options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
         g->stg_atlas[s] = [g->dev newBufferWithLength:(kAtlasDim * kAtlasDim)
                                               options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
+        g->stg_sprite[s] = [g->dev newBufferWithLength:(kSpriteAtlasDim * kSpriteAtlasDim * 4u)
+                                               options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
         g->ind_args[s] = [g->dev newBufferWithLength:32u options:MTLResourceStorageModeShared];
     }
 
@@ -271,7 +289,7 @@ BloomGpu *bloom_gpu_create(void *ca_metal_layer, const char *shader_path) {
     [cb commit];
     [cb waitUntilCompleted];
 
-    /* Private+Opt R8Unorm CoreText Atlas */
+    /* Private+Opt R8Unorm CoreText Atlas + RGBA8 Sprite Atlas */
     g->atlas = bloom_atlas_create(kAtlasDim, kAtlasDim);
     MTLTextureDescriptor *ad = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
                                                                                   width:kAtlasDim height:kAtlasDim mipmapped:NO];
@@ -279,6 +297,13 @@ BloomGpu *bloom_gpu_create(void *ca_metal_layer, const char *shader_path) {
     ad.storageMode = MTLStorageModePrivate;
     ad.allowGPUOptimizedContents = YES;
     g->atlas_tex = [g->dev newTextureWithDescriptor:ad];
+
+    MTLTextureDescriptor *sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                  width:kSpriteAtlasDim height:kSpriteAtlasDim mipmapped:NO];
+    sd.usage = MTLTextureUsageShaderRead;
+    sd.storageMode = MTLStorageModePrivate;
+    sd.allowGPUOptimizedContents = YES;
+    g->sprite_atlas_tex = [g->dev newTextureWithDescriptor:sd];
 
     g->scratch_glyphs.resize(kMaxGlyphsPerFrame);
     g->stats.max_tg_cull = (uint32_t)g->p_cull.maxTotalThreadsPerThreadgroup;
@@ -362,6 +387,60 @@ static bool ensure_grounding_ready(BloomGpu *g, uint32_t id_w, uint32_t id_h, ui
     return true;
 }
 
+static id<MTLLibrary> compile_aux_lib(id<MTLDevice> dev, const std::string &path) {
+    NSError *err = nil;
+    NSString *src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:path.c_str()]
+                                              encoding:NSUTF8StringEncoding error:&err];
+    if (!src || err) {
+        fprintf(stderr, "Cannot read shader %s: %s\n", path.c_str(), err ? err.localizedDescription.UTF8String : "?");
+        return nil;
+    }
+    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    opts.languageVersion = MTLLanguageVersion3_0;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opts error:&err];
+    if (!lib || err) {
+        fprintf(stderr, "Shader %s compile failed: %s\n", path.c_str(), err ? err.localizedDescription.UTF8String : "?");
+        return nil;
+    }
+    return lib;
+}
+
+static bool ensure_pbr_tex_array(BloomGpu *g) {
+    if (g->pbr_tex_array) return true;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                  width:kPbrTexDim height:kPbrTexDim mipmapped:YES];
+    td.textureType = MTLTextureType2DArray;
+    td.arrayLength = kPbrTexSlices;
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModePrivate;
+    td.allowGPUOptimizedContents = YES;
+    g->pbr_tex_array = [g->dev newTextureWithDescriptor:td];
+    return g->pbr_tex_array != nil;
+}
+
+static bool ensure_pbr_ready(BloomGpu *g) {
+    if (!ensure_pbr_tex_array(g)) return false;
+    if (!g->pbr_lib) {
+        g->pbr_lib = compile_aux_lib(g->dev, g->pbr_shader_path);
+        if (!g->pbr_lib) return false;
+        g->p_mesh_pbr = make_rpso(g->dev, g->pbr_lib, "v_meshlet_pbr", "f_meshlet_pbr", false, false);
+        if (!g->p_mesh_pbr) return false;
+        g->stats.pbr_active = true;
+    }
+    return true;
+}
+
+static bool ensure_sprite_ready(BloomGpu *g) {
+    if (!g->sprite_lib) {
+        g->sprite_lib = compile_aux_lib(g->dev, g->sprite_shader_path);
+        if (!g->sprite_lib) return false;
+        g->p_hud_sprite = make_rpso(g->dev, g->sprite_lib, "v_hud_sprite", "f_hud_sprite", true, false);
+        if (!g->p_hud_sprite) return false;
+        g->stats.sprite_active = true;
+    }
+    return true;
+}
+
 static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint32_t vp_h,
                             bool force, bool headless, const GroundRequest *greq) {
     if (!g || !scene || vp_w == 0u || vp_h == 0u) return false;
@@ -387,6 +466,9 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
     const BloomShadowHot *sh_ptr = nullptr;
     const BloomClipRect *cl_ptr = nullptr;
     const BloomTextRun *tr_ptr = nullptr;
+    const BloomSpriteInst *sp_ptr = nullptr;
+    const BloomMaterial32 *mat_ptr = nullptr;
+    const BloomLight32 *lt_ptr = nullptr;
 
     uint32_t st_cnt = bloom_scene_get_gpu_states(scene, &st_ptr);
     uint32_t mh_cnt = bloom_scene_get_gpu_meshlets(scene, &mh_ptr);
@@ -396,6 +478,12 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
     uint32_t sh_cnt = bloom_scene_get_shadows(scene, &sh_ptr);
     uint32_t cl_cnt = bloom_scene_get_clips(scene, &cl_ptr);
     uint32_t tr_cnt = bloom_scene_get_text_runs(scene, &tr_ptr);
+    uint32_t sp_cnt = bloom_scene_get_sprites(scene, &sp_ptr);
+    uint32_t mat_cnt = bloom_scene_get_materials(scene, &mat_ptr);
+    uint32_t lt_cnt = bloom_scene_get_lights(scene, &lt_ptr);
+    bool use_pbr = bloom_scene_has_pbr_objects(scene);
+    if (use_pbr && !ensure_pbr_ready(g)) use_pbr = false;
+    if (sp_cnt > 0u && !ensure_sprite_ready(g)) sp_cnt = 0u;
 
     uint32_t gl_cnt = bloom_atlas_pack_runs(g->atlas, tr_ptr, tr_cnt,
                                             g->scratch_glyphs.data(), kMaxGlyphsPerFrame);
@@ -416,7 +504,13 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
     size_t sz_sh = align256(std::max<size_t>(1u, sh_cnt) * sizeof(BloomShadowHot));
     size_t off_gl = off_sh + sz_sh;
     size_t sz_gl = align256(std::max<size_t>(1u, gl_cnt) * sizeof(BloomGlyphInst));
-    size_t total_wc = off_gl + sz_gl;
+    size_t off_sp = off_gl + sz_gl;
+    size_t sz_sp = align256(std::max<size_t>(1u, sp_cnt) * sizeof(BloomSpriteInst));
+    size_t off_mat = off_sp + sz_sp;
+    size_t sz_mat = align256(std::max<size_t>(1u, mat_cnt) * sizeof(BloomMaterial32));
+    size_t off_lt = off_mat + sz_mat;
+    size_t sz_lt = align256(std::max<size_t>(1u, lt_cnt) * sizeof(BloomLight32));
+    size_t total_wc = off_lt + sz_lt;
 
     if (total_wc > g->wc_ring[s].length) {
         g->wc_ring[s] = [g->dev newBufferWithLength:(total_wc * 2u)
@@ -431,6 +525,9 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
     if (alp_cnt) memcpy(ring + off_aq, alp_ptr, alp_cnt * sizeof(BloomQuadHot));
     if (sh_cnt) memcpy(ring + off_sh, sh_ptr, sh_cnt * sizeof(BloomShadowHot));
     if (gl_cnt) memcpy(ring + off_gl, g->scratch_glyphs.data(), gl_cnt * sizeof(BloomGlyphInst));
+    if (sp_cnt) memcpy(ring + off_sp, sp_ptr, sp_cnt * sizeof(BloomSpriteInst));
+    if (mat_cnt) memcpy(ring + off_mat, mat_ptr, mat_cnt * sizeof(BloomMaterial32));
+    if (lt_cnt) memcpy(ring + off_lt, lt_ptr, lt_cnt * sizeof(BloomLight32));
 
     /* Check static template geometry upload */
     bool upload_geom = false;
@@ -459,8 +556,8 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
         bloom_scene_clear_geom_dirty(scene);
     }
 
-    /* Check incremental CoreText atlas upload */
-    const uint8_t *atl_px = nullptr;
+    /* Check incremental CoreText atlas & RGBA8 Sprite Atlas uploads */
+    const uint8_t *atl_px = nullptr, *sp_px = nullptr;
     uint32_t atl_w = 0u, atl_h = 0u, ay0 = 0u, ay1 = 0u;
     bool upload_atlas = bloom_atlas_take_dirty(g->atlas, &atl_px, &atl_w, &atl_h, &ay0, &ay1);
     if (upload_atlas && ay1 > ay0) {
@@ -468,6 +565,15 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
         memcpy(g->stg_atlas[s].contents, atl_px + (size_t)ay0 * atl_w, copy_bytes);
     } else {
         upload_atlas = false;
+    }
+
+    uint32_t spr_w = 0u, spr_h = 0u, sy0 = 0u, sy1 = 0u;
+    bool upload_sprite = bloom_atlas_take_sprite_dirty(g->atlas, &sp_px, &spr_w, &spr_h, &sy0, &sy1);
+    if (upload_sprite && sy1 > sy0) {
+        size_t copy_bytes = (size_t)(sy1 - sy0) * spr_w * 4u;
+        memcpy(g->stg_sprite[s].contents, sp_px + (size_t)sy0 * spr_w * 4u, copy_bytes);
+    } else {
+        upload_sprite = false;
     }
 
     if (mh_cnt > 0u && (!g->priv_surv_ids || g->priv_surv_ids.length < mh_cnt * sizeof(uint32_t))) {
@@ -486,7 +592,7 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
     /* Single CommandBuffer for Blit + Compute Cull + Single TBDR RenderPass */
     id<MTLCommandBuffer> cmd = [g->q commandBuffer];
 
-    if (upload_geom || upload_atlas) {
+    if (upload_geom || upload_atlas || upload_sprite) {
         id<MTLBlitCommandEncoder> bl = [cmd blitCommandEncoder];
         if (upload_geom) {
             [bl copyFromBuffer:g->stg_geom[s] sourceOffset:0 toBuffer:g->priv_vtx destinationOffset:0 size:geom_v_bytes];
@@ -497,6 +603,12 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
                     sourceSize:MTLSizeMake(atl_w, ay1 - ay0, 1)
                      toTexture:g->atlas_tex destinationSlice:0 destinationLevel:0
              destinationOrigin:MTLOriginMake(0, ay0, 0)];
+        }
+        if (upload_sprite) {
+            [bl copyFromBuffer:g->stg_sprite[s] sourceOffset:0 sourceBytesPerRow:(spr_w * 4u) sourceBytesPerImage:0
+                    sourceSize:MTLSizeMake(spr_w, sy1 - sy0, 1)
+                     toTexture:g->sprite_atlas_tex destinationSlice:0 destinationLevel:0
+             destinationOrigin:MTLOriginMake(0, sy0, 0)];
         }
         [bl endEncoding];
     }
@@ -539,13 +651,21 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
     if (mh_cnt > 0u && g->priv_vtx && g->priv_lidx) {
         [enc setDepthStencilState:g->ds_3d_write];
         [enc setCullMode:MTLCullModeBack];
-        [enc setRenderPipelineState:g->p_mesh_cut];
+        [enc setRenderPipelineState:(use_pbr ? g->p_mesh_pbr : g->p_mesh_cut)];
         [enc setVertexBuffer:g->priv_surv_ids offset:0 atIndex:0];
         [enc setVertexBuffer:g->wc_ring[s] offset:off_mh atIndex:1];
         [enc setVertexBuffer:g->priv_vtx offset:0 atIndex:2];
         [enc setVertexBuffer:g->priv_lidx offset:0 atIndex:3];
         [enc setVertexBuffer:g->wc_ring[s] offset:off_st atIndex:4];
         [enc setVertexBytes:&u length:sizeof(u) atIndex:5];
+        if (use_pbr) {
+            uint32_t lmeta[4] = {lt_cnt, 0u, 0u, 0u};
+            [enc setFragmentBuffer:g->wc_ring[s] offset:off_mat atIndex:0];
+            [enc setFragmentBuffer:g->wc_ring[s] offset:off_lt atIndex:1];
+            [enc setFragmentBytes:lmeta length:sizeof(lmeta) atIndex:2];
+            [enc setFragmentBytes:&u length:sizeof(u) atIndex:3];
+            [enc setFragmentTexture:g->pbr_tex_array atIndex:0];
+        }
         [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexType:MTLIndexTypeUInt16
                        indexBuffer:g->priv_id_idx16 indexBufferOffset:0
                     indirectBuffer:g->ind_args[s] indirectBufferOffset:0];
@@ -596,6 +716,16 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
         [enc setFragmentBuffer:g->wc_ring[s] offset:off_gl atIndex:0];
         [enc setFragmentTexture:g->atlas_tex atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:gl_cnt];
+    }
+    if (sp_cnt > 0u && g->p_hud_sprite) {
+        [enc setDepthStencilState:g->ds_ui_blend];
+        [enc setRenderPipelineState:g->p_hud_sprite];
+        [enc setVertexBuffer:g->wc_ring[s] offset:off_sp atIndex:0];
+        [enc setVertexBuffer:g->wc_ring[s] offset:off_cl atIndex:1];
+        [enc setVertexBytes:&u length:sizeof(u) atIndex:2];
+        [enc setFragmentBuffer:g->wc_ring[s] offset:off_sp atIndex:0];
+        [enc setFragmentTexture:g->sprite_atlas_tex atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:sp_cnt];
     }
     [enc endEncoding];
 
@@ -826,6 +956,62 @@ bool bloom_gpu_readback_headless_rgba8(BloomGpu *g, uint8_t *out_rgba8, uint32_t
     if (out_w) *out_w = w;
     if (out_h) *out_h = h;
     return true;
+}
+
+BloomAtlas *bloom_gpu_get_atlas(BloomGpu *gpu) {
+    return gpu ? gpu->atlas : nullptr;
+}
+
+uint16_t bloom_gpu_upload_texture_rgba8(BloomGpu *g, const uint8_t *rgba8,
+                                        uint32_t w, uint32_t h, bool generate_mips) {
+    if (!g || !rgba8 || w == 0u || h == 0u || !ensure_pbr_tex_array(g)) return 0u;
+    if (g->pbr_tex_used >= kPbrTexSlices) return 0u;
+
+    uint32_t slice = g->pbr_tex_used++;
+    size_t row_bytes = (size_t)kPbrTexDim * 4u;
+    size_t tot_bytes = row_bytes * (size_t)kPbrTexDim;
+    id<MTLBuffer> stg = [g->dev newBufferWithLength:tot_bytes
+                                            options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
+    uint8_t *dst = static_cast<uint8_t *>(stg.contents);
+    for (uint32_t y = 0u; y < kPbrTexDim; ++y) {
+        uint32_t sy = (y * h) / kPbrTexDim;
+        for (uint32_t x = 0u; x < kPbrTexDim; ++x) {
+            uint32_t sx = (x * w) / kPbrTexDim;
+            memcpy(dst + ((size_t)y * kPbrTexDim + x) * 4u,
+                   rgba8 + ((size_t)sy * w + sx) * 4u, 4u);
+        }
+    }
+    id<MTLCommandBuffer> cb = [g->q commandBuffer];
+    id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+    [bl copyFromBuffer:stg sourceOffset:0 sourceBytesPerRow:row_bytes sourceBytesPerImage:tot_bytes
+            sourceSize:MTLSizeMake(kPbrTexDim, kPbrTexDim, 1)
+             toTexture:g->pbr_tex_array destinationSlice:slice destinationLevel:0
+     destinationOrigin:MTLOriginMake(0, 0, 0)];
+    if (generate_mips) [bl generateMipmapsForTexture:g->pbr_tex_array];
+    [bl endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    g->stats.uploaded_textures = g->pbr_tex_used;
+    return (uint16_t)(slice + 1u);
+}
+
+uint16_t bloom_gpu_upload_ktx2(BloomGpu *gpu, const uint8_t *ktx2_bytes, size_t len) {
+    if (!gpu || !ktx2_bytes || len < 104u) return 0u;
+    static const uint8_t kMagic[12] = {0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
+    if (memcmp(ktx2_bytes, kMagic, 12u) != 0) return 0u;
+    uint32_t vk_fmt = 0u, px_w = 0u, px_h = 0u, lvl_cnt = 0u, sc = 0u;
+    memcpy(&vk_fmt, ktx2_bytes + 12u, 4u);
+    memcpy(&px_w, ktx2_bytes + 20u, 4u);
+    memcpy(&px_h, ktx2_bytes + 24u, 4u);
+    memcpy(&lvl_cnt, ktx2_bytes + 40u, 4u);
+    memcpy(&sc, ktx2_bytes + 44u, 4u);
+    if ((vk_fmt != 37u && vk_fmt != 43u) || sc != 0u || px_w == 0u || px_h == 0u || lvl_cnt == 0u) return 0u;
+    uint64_t lvl0_off = 0u, lvl0_len = 0u;
+    memcpy(&lvl0_off, ktx2_bytes + 80u, 8u);
+    memcpy(&lvl0_len, ktx2_bytes + 88u, 8u);
+    size_t req = (size_t)px_w * (size_t)px_h * 4u;
+    if (lvl0_off + lvl0_len > len || lvl0_len < req) return 0u;
+    return bloom_gpu_upload_texture_rgba8(gpu, ktx2_bytes + lvl0_off, px_w, px_h, true);
 }
 
 BloomGpuStats bloom_gpu_get_stats(const BloomGpu *gpu) {

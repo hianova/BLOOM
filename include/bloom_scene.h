@@ -11,13 +11,40 @@ typedef uint32_t BloomHandle;
 #define BLOOM_HANDLE_NULL UINT32_C(0)
 
 typedef enum {
-    BLOOM_UI_PANEL  = 0,
-    BLOOM_UI_BUTTON = 1,
-    BLOOM_UI_SLIDER = 2,
-    BLOOM_UI_TEXT   = 3,
-    BLOOM_UI_VLIST  = 4,
-    BLOOM_UI_MODAL  = 5
+    BLOOM_UI_PANEL      = 0,
+    BLOOM_UI_BUTTON     = 1,
+    BLOOM_UI_SLIDER     = 2,
+    BLOOM_UI_TEXT       = 3,
+    BLOOM_UI_VLIST      = 4,
+    BLOOM_UI_MODAL      = 5,
+    BLOOM_UI_TEXT_INPUT = 6,
+    BLOOM_UI_CHECKBOX   = 7,
+    BLOOM_UI_SWITCH     = 8,
+    BLOOM_UI_SELECT     = 9,
+    BLOOM_UI_TABS       = 10,
+    BLOOM_UI_SCROLLVIEW = 11,
+    BLOOM_UI_PROGRESS   = 12,
+    BLOOM_UI_TOAST      = 13,
+    BLOOM_UI_SPRITE     = 14
 } BloomUiKind;
+
+typedef enum {
+    BLOOM_JUSTIFY_START         = 0,
+    BLOOM_JUSTIFY_CENTER        = 1,
+    BLOOM_JUSTIFY_END           = 2,
+    BLOOM_JUSTIFY_SPACE_BETWEEN = 3,
+    BLOOM_JUSTIFY_SPACE_AROUND  = 4
+} BloomFlexJustify;
+
+typedef enum {
+    BLOOM_ALIGN_STRETCH = 0,
+    BLOOM_ALIGN_START   = 1,
+    BLOOM_ALIGN_CENTER  = 2,
+    BLOOM_ALIGN_END     = 3
+} BloomFlexAlign;
+
+typedef void (*BloomTextMeasureFn)(void *userdata, const char *utf8, float font_px,
+                                   float max_width, float *out_w, float *out_h);
 
 enum {
     BLOOM_ACT_NONE    = 0u,
@@ -83,6 +110,21 @@ typedef struct {
     bool disabled;
     bool modal_trap;
     uint32_t action_mask;
+
+    /* Milestone 2 Track 2A Extended Flexbox, Widgets & Sprites (zero-init compatible) */
+    BloomFlexJustify justify;
+    BloomFlexAlign align;
+    bool flex_wrap;
+    bool pos_absolute;
+    float flex_grow;
+    float min_w, min_h, max_w, max_h;
+    float pct_w, pct_h;
+    bool text_wrap;
+    float progress_t;
+    const char *placeholder;
+    const char *options_pipe;
+    uint16_t sprite_uv_unorm16[4];
+    uint32_t sprite_tint_rgba8;
 } BloomUiNodeDesc;
 
 typedef struct {
@@ -104,6 +146,9 @@ typedef struct {
     uint32_t    action_mask;
     uint64_t    bind_obj_key;
     uint8_t     bind_dof_slot;
+    int32_t     selected_idx;
+    const char *text_value;
+    const char *preedit_text;
 } BloomUiMeta;
 
 typedef struct {
@@ -128,6 +173,7 @@ typedef struct {
     uint32_t rgba8;
     uint16_t clip_id;
     uint16_t z_order;
+    bool wrap;
     char text[128];
 } BloomTextRun;
 
@@ -201,12 +247,19 @@ uint32_t bloom_scene_get_analytics(const BloomScene *scene, const BloomAnalyticP
 BloomHandle bloom_scene_add_ui(BloomScene *scene, const BloomUiNodeDesc *desc);
 bool bloom_scene_destroy_ui(BloomScene *scene, BloomHandle ui);
 void bloom_scene_clear_ui(BloomScene *scene);
+void bloom_scene_set_text_measurer(BloomScene *scene, BloomTextMeasureFn fn, void *userdata);
 bool bloom_scene_set_ui_label(BloomScene *scene, BloomHandle ui, const char *label);
 bool bloom_scene_set_ui_scroll(BloomScene *scene, BloomHandle ui, float scroll_y);
 bool bloom_scene_set_ui_focused(BloomScene *scene, BloomHandle ui);
 BloomHandle bloom_scene_get_focused_ui(const BloomScene *scene);
 float bloom_scene_get_ui_slider(const BloomScene *scene, BloomHandle ui);
 bool bloom_scene_get_ui_toggle(const BloomScene *scene, BloomHandle ui);
+const char *bloom_scene_get_ui_text(const BloomScene *scene, BloomHandle ui);
+bool bloom_scene_set_ui_text(BloomScene *scene, BloomHandle ui, const char *utf8);
+const char *bloom_scene_get_ui_preedit(const BloomScene *scene, BloomHandle ui);
+int32_t bloom_scene_get_ui_selected(const BloomScene *scene, BloomHandle ui);
+bool bloom_scene_set_ui_selected(BloomScene *scene, BloomHandle ui, int32_t idx);
+bool bloom_scene_set_ui_progress(BloomScene *scene, BloomHandle ui, float t);
 
 /** Unified Embodied Inspection Getters (for SDK & Vision Modules) */
 uint32_t bloom_scene_get_object_slot_count(const BloomScene *scene);
@@ -228,6 +281,16 @@ uint32_t bloom_scene_get_alpha_quads(const BloomScene *scene, const BloomQuadHot
 uint32_t bloom_scene_get_shadows(const BloomScene *scene, const BloomShadowHot **out_ptr);
 uint32_t bloom_scene_get_clips(const BloomScene *scene, const BloomClipRect **out_ptr);
 uint32_t bloom_scene_get_text_runs(const BloomScene *scene, const BloomTextRun **out_ptr);
+uint32_t bloom_scene_get_sprites(const BloomScene *scene, const BloomSpriteInst **out_ptr);
+
+/** Milestone 2 Track 2B Materials & Lights */
+uint16_t bloom_scene_add_material(BloomScene *scene, const BloomMaterial32 *mat);
+bool bloom_scene_set_object_material(BloomScene *scene, BloomHandle obj, uint16_t mat_id);
+uint32_t bloom_scene_add_light(BloomScene *scene, const BloomLight32 *light);
+void bloom_scene_clear_lights(BloomScene *scene);
+uint32_t bloom_scene_get_materials(const BloomScene *scene, const BloomMaterial32 **out_ptr);
+uint32_t bloom_scene_get_lights(const BloomScene *scene, const BloomLight32 **out_ptr);
+bool bloom_scene_has_pbr_objects(const BloomScene *scene);
 
 /** Visual Presentation Timeline */
 void bloom_timeline_clear(BloomScene *scene);

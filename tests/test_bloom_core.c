@@ -178,7 +178,8 @@ static void test_scene_handles_hierarchy_projections_and_ui(void) {
     assert(n_opq + n_alp < 30u); /* 10k rows virtualized to ~8 visible rows! */
 
     /* Simulate slider drag near left edge (x=50, y=50 inside dof_slider) */
-    BloomInputEvent down = {BLOOM_EVENT_POINTER_DOWN, 50.0f, 50.0f, 0, 0, 0, 0, 0, 0};
+    BloomInputEvent down = {0};
+    down.type = BLOOM_EVENT_POINTER_DOWN; down.x = 50.0f; down.y = 50.0f;
     assert(bloom_scene_handle_input(sc, &down));
     assert(bloom_scene_get_ui_slider(sc, h_sld) < 0.15f);
 

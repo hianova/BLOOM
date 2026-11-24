@@ -1,6 +1,7 @@
 #ifndef BLOOM_GPU_H
 #define BLOOM_GPU_H
 
+#include "bloom_atlas.h"
 #include "bloom_scene.h"
 
 #ifdef __cplusplus
@@ -25,6 +26,9 @@ typedef struct {
     bool     grounding_active;
     uint32_t max_tg_ground;
     double   last_ground_ms;
+    bool     pbr_active;
+    bool     sprite_active;
+    uint32_t uploaded_textures;
 } BloomGpuStats;
 
 /**
@@ -33,6 +37,16 @@ typedef struct {
  */
 BloomGpu *bloom_gpu_create(void *ca_metal_layer, const char *shader_path);
 void bloom_gpu_destroy(BloomGpu *gpu);
+
+/** Access CoreText + RGBA8 Sprite Atlas owned by the GPU backend. */
+BloomAtlas *bloom_gpu_get_atlas(BloomGpu *gpu);
+
+/** Upload RGBA8 texture into Private+Opt 2D texture array (returns 1-based slice ID 1..32, 0 on error). */
+uint16_t bloom_gpu_upload_texture_rgba8(BloomGpu *gpu, const uint8_t *rgba8,
+                                        uint32_t w, uint32_t h, bool generate_mips);
+
+/** Decode uncompressed KTX2 R8G8B8A8 payload and upload into Private+Opt texture array. */
+uint16_t bloom_gpu_upload_ktx2(BloomGpu *gpu, const uint8_t *ktx2_bytes, size_t len);
 
 /** Triple-buffered Single-CB render into CAMetalLayer drawable (skips if idle and !force). */
 bool bloom_gpu_render_drawable(BloomGpu *gpu, BloomScene *scene,

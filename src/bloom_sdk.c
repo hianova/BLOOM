@@ -376,8 +376,10 @@ bool bloom_sdk_dispatch_action(BloomScene *scene, const BloomSdkSnapshot *snap,
 
     if (action == BLOOM_SDK_ACT_CLICK) {
         if (e->domain != BLOOM_GROUND_UI || (e->action_mask & BLOOM_ACT_CLICK) == 0u) return false;
-        BloomInputEvent down = {BLOOM_EVENT_POINTER_DOWN, e->anchor_x, e->anchor_y, 0.0f, 0.0f, 0u, 0u, 0u, 0u};
-        BloomInputEvent up   = {BLOOM_EVENT_POINTER_UP,   e->anchor_x, e->anchor_y, 0.0f, 0.0f, 0u, 0u, 0u, 0u};
+        BloomInputEvent down = {0};
+        down.type = BLOOM_EVENT_POINTER_DOWN; down.x = e->anchor_x; down.y = e->anchor_y;
+        BloomInputEvent up = {0};
+        up.type = BLOOM_EVENT_POINTER_UP; up.x = e->anchor_x; up.y = e->anchor_y;
         bool hit = bloom_scene_handle_input(scene, &down);
         bloom_scene_handle_input(scene, &up);
         return hit;
@@ -391,9 +393,12 @@ bool bloom_sdk_dispatch_action(BloomScene *scene, const BloomSdkSnapshot *snap,
         float tx = e->layout_rect[0] + 12.0f;
         float tw = e->layout_rect[2] - 24.0f;
         float target_x = tw > 1.0f ? (tx + t * tw) : e->anchor_x;
-        BloomInputEvent down = {BLOOM_EVENT_POINTER_DOWN, e->anchor_x, e->anchor_y, 0.0f, 0.0f, 0u, 0u, 0u, 0u};
-        BloomInputEvent move = {BLOOM_EVENT_POINTER_MOVE, target_x, e->anchor_y, 0.0f, 0.0f, 0u, 0u, 0u, 0u};
-        BloomInputEvent up   = {BLOOM_EVENT_POINTER_UP,   target_x, e->anchor_y, 0.0f, 0.0f, 0u, 0u, 0u, 0u};
+        BloomInputEvent down = {0};
+        down.type = BLOOM_EVENT_POINTER_DOWN; down.x = e->anchor_x; down.y = e->anchor_y;
+        BloomInputEvent move = {0};
+        move.type = BLOOM_EVENT_POINTER_MOVE; move.x = target_x; move.y = e->anchor_y;
+        BloomInputEvent up = {0};
+        up.type = BLOOM_EVENT_POINTER_UP; up.x = target_x; up.y = e->anchor_y;
         if (!bloom_scene_handle_input(scene, &down)) return false;
         bloom_scene_handle_input(scene, &move);
         bloom_scene_handle_input(scene, &up);

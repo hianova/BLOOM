@@ -119,6 +119,53 @@ typedef struct {
 BLOOM_STATIC_ASSERT(sizeof(BloomGlyphInst) == 24, "BloomGlyphInst must be 24 bytes");
 
 typedef struct {
+    uint16_t dst_q14_2[4];   /*  8 B: x, y, w, h */
+    uint16_t uv_unorm16[4];  /*  8 B: u0, v0, uw, vh */
+    uint32_t tint_rgba8;     /*  4 B */
+    uint16_t tex_id;         /*  2 B: 0=sprite atlas, 1..N=tex array */
+    uint16_t clip_id;        /*  2 B */
+    uint32_t z_flags;        /*  4 B: z[15:0] | rad_q6_2[23:16] | flags[31:24] */
+    uint16_t ui_slot;        /*  2 B */
+    uint16_t pad0;           /*  2 B */
+} BloomSpriteInst;
+BLOOM_STATIC_ASSERT(sizeof(BloomSpriteInst) == 32, "BloomSpriteInst must be 32 bytes");
+
+enum {
+    BLOOM_MAT_FLAG_PBR          = 1u << 0,
+    BLOOM_MAT_FLAG_DOUBLE_SIDED = 1u << 1
+};
+
+typedef struct {
+    uint32_t base_rgba8;       /*  4 B */
+    uint32_t emissive_rgba8;   /*  4 B */
+    uint16_t metallic_f16;     /*  2 B */
+    uint16_t roughness_f16;    /*  2 B */
+    uint16_t ao_f16;           /*  2 B */
+    uint16_t normal_scale_f16; /*  2 B */
+    uint16_t albedo_tex;       /*  2 B: 0=none, 1..N=1-based tex array slice */
+    uint16_t mr_tex;           /*  2 B: G=roughness, B=metallic */
+    uint16_t normal_tex;       /*  2 B: tangent-space normal map */
+    uint16_t flags;            /*  2 B */
+    uint32_t pad0[2];          /*  8 B */
+} BloomMaterial32;
+BLOOM_STATIC_ASSERT(sizeof(BloomMaterial32) == 32, "BloomMaterial32 must be 32 bytes");
+
+enum {
+    BLOOM_LIGHT_DIR   = 0u,
+    BLOOM_LIGHT_POINT = 1u
+};
+
+typedef struct {
+    float    pos_or_dir[3];    /* 12 B */
+    float    range;            /*  4 B */
+    uint32_t rgba8_color;      /*  4 B */
+    float    intensity;        /*  4 B */
+    uint32_t kind;             /*  4 B */
+    uint32_t pad0;             /*  4 B */
+} BloomLight32;
+BLOOM_STATIC_ASSERT(sizeof(BloomLight32) == 32, "BloomLight32 must be 32 bytes");
+
+typedef struct {
     float x;
     float y;
     float w;
@@ -207,7 +254,8 @@ enum {
 
 enum {
     BLOOM_OBJ_FLAG_CUTAWAY = 1u << 0,
-    BLOOM_OBJ_FLAG_HIDDEN  = 1u << 1
+    BLOOM_OBJ_FLAG_HIDDEN  = 1u << 1,
+    BLOOM_OBJ_FLAG_PBR     = 1u << 2
 };
 
 typedef struct {
@@ -238,8 +286,19 @@ typedef enum {
     BLOOM_EVENT_POINTER_UP = 3,
     BLOOM_EVENT_SCROLL = 4,
     BLOOM_EVENT_KEY_DOWN = 5,
-    BLOOM_EVENT_RESIZE = 6
+    BLOOM_EVENT_RESIZE = 6,
+    BLOOM_EVENT_KEY_UP = 7,
+    BLOOM_EVENT_TEXT_INPUT = 8,
+    BLOOM_EVENT_IME_PREEDIT = 9,
+    BLOOM_EVENT_PINCH = 10
 } BloomInputEventType;
+
+enum {
+    BLOOM_MOD_SHIFT = 1u << 0,
+    BLOOM_MOD_CTRL  = 1u << 1,
+    BLOOM_MOD_ALT   = 1u << 2,
+    BLOOM_MOD_SUPER = 1u << 3
+};
 
 typedef struct {
     BloomInputEventType type;
@@ -251,6 +310,11 @@ typedef struct {
     uint32_t key_code;
     uint32_t width;
     uint32_t height;
+    uint32_t modifiers;
+    float    scale_delta;
+    char     text[64];
+    int32_t  preedit_cursor;
+    int32_t  preedit_len;
 } BloomInputEvent;
 
 /* ============================================================================

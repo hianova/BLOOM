@@ -46,6 +46,9 @@ typedef struct {
     float slider_t;
     bool toggle_on;
     float scroll_y;
+    char text_buf[128];
+    int32_t selected_idx;
+    float progress_t;
 } StateEntry;
 
 typedef struct {
@@ -56,6 +59,10 @@ typedef struct {
     BloomUiNodeDesc desc;
     char id_buf[64];
     char label_buf[128];
+    char placeholder_buf[64];
+    char options_buf[256];
+    char text_buf[128];
+    char preedit_buf[64];
     float x, y, w, h;
     float clip_x, clip_y, clip_w, clip_h;
     uint16_t clip_id;
@@ -63,6 +70,10 @@ typedef struct {
     float slider_t;
     bool toggle_on;
     float scroll_y;
+    float content_h;
+    int32_t selected_idx;
+    bool dropdown_open;
+    float progress_t;
 } UiSlot;
 
 struct BloomScene {
@@ -87,6 +98,12 @@ struct BloomScene {
     uint64_t *analytic_keys;
     uint32_t ana_cnt, ana_cap;
 
+    /* Milestone 2 Track 2B PBR Materials & Lights */
+    BloomMaterial32 *materials;
+    uint32_t mat_cnt, mat_cap;
+    BloomLight32 *lights;
+    uint32_t light_cnt, light_cap;
+
     /* GPU-ready flattened output arrays */
     BloomObjectState48 *gpu_states;
     uint32_t gpu_state_cnt, gpu_state_cap;
@@ -103,6 +120,8 @@ struct BloomScene {
     BloomHandle focused_ui;
     bool pointer_down;
     float last_ptr_x, last_ptr_y;
+    BloomTextMeasureFn text_measure_fn;
+    void *text_measure_ud;
 
     BloomQuadHot *opaque_quads;
     uint32_t opq_cnt, opq_cap;
@@ -114,6 +133,8 @@ struct BloomScene {
     uint32_t clip_cnt, clip_cap;
     BloomTextRun *text_runs;
     uint32_t text_cnt, text_cap;
+    BloomSpriteInst *sprites;
+    uint32_t sp_cnt, sp_cap;
 
     /* Visual timeline */
     BloomAnimTrack *tracks;
@@ -238,6 +259,16 @@ BloomScene *bloom_scene_create(void) {
     grow_array((void **)&s->uis, &s->ui_cap, 32u, sizeof(UiSlot));
     s->ui_cnt = 1u; /* Index 0 reserved for NULL */
 
+    /* Material 0 reserved as default legacy material */
+    grow_array((void **)&s->materials, &s->mat_cap, 8u, sizeof(BloomMaterial32));
+    if (s->materials) {
+        s->materials[0].base_rgba8 = 0xFFFFFFFFu;
+        s->materials[0].roughness_f16 = bloom_f32_to_f16(0.5f);
+        s->materials[0].ao_f16 = bloom_f32_to_f16(1.0f);
+        s->materials[0].normal_scale_f16 = bloom_f32_to_f16(1.0f);
+        s->mat_cnt = 1u;
+    }
+
     s->camera.pos[0] = 0.0f;
     s->camera.pos[1] = 0.0f;
     s->camera.pos[2] = -2.0f;
@@ -266,6 +297,8 @@ void bloom_scene_destroy(BloomScene *s) {
     free(s->states);
     free(s->analytics);
     free(s->analytic_keys);
+    free(s->materials);
+    free(s->lights);
     free(s->gpu_states);
     free(s->gpu_obj_slots);
     free(s->gpu_meshlets);
@@ -275,6 +308,7 @@ void bloom_scene_destroy(BloomScene *s) {
     free(s->shadows);
     free(s->clips);
     free(s->text_runs);
+    free(s->sprites);
     free(s->tracks);
     free(s);
 }
@@ -794,6 +828,13 @@ uint32_t bloom_scene_get_analytics(const BloomScene *s, const BloomAnalyticPrim3
  * Tri-Layer 2D UI, Flexbox Layout, VirtualList & Interactive Hit-Test
  * ============================================================================ */
 
+void bloom_scene_set_text_measurer(BloomScene *s, BloomTextMeasureFn fn, void *userdata) {
+    if (!s) return;
+    s->text_measure_fn = fn;
+    s->text_measure_ud = userdata;
+    s->ui_dirty = true;
+}
+
 BloomHandle bloom_scene_add_ui(BloomScene *s, const BloomUiNodeDesc *desc) {
     if (!s || !desc) return BLOOM_HANDLE_NULL;
     if (!grow_array((void **)&s->uis, &s->ui_cap, s->ui_cnt + 1u, sizeof(UiSlot))) return BLOOM_HANDLE_NULL;
@@ -807,23 +848,37 @@ BloomHandle bloom_scene_add_ui(BloomScene *s, const BloomUiNodeDesc *desc) {
     if (desc->id) snprintf(u->id_buf, sizeof(u->id_buf), "%s", desc->id);
     else snprintf(u->id_buf, sizeof(u->id_buf), "ui_%u", idx);
     if (desc->label) snprintf(u->label_buf, sizeof(u->label_buf), "%s", desc->label);
+    if (desc->placeholder) snprintf(u->placeholder_buf, sizeof(u->placeholder_buf), "%s", desc->placeholder);
+    if (desc->options_pipe) snprintf(u->options_buf, sizeof(u->options_buf), "%s", desc->options_pipe);
     u->desc.id = u->id_buf;
     u->desc.label = u->label_buf;
+    u->desc.placeholder = u->placeholder_buf;
+    u->desc.options_pipe = u->options_buf;
     if (u->desc.kind == BLOOM_UI_MODAL) u->desc.modal_trap = true;
     if (u->desc.action_mask == 0u && !u->desc.disabled) {
-        if (desc->kind == BLOOM_UI_BUTTON) u->desc.action_mask = BLOOM_ACT_CLICK | BLOOM_ACT_FOCUS;
-        else if (desc->kind == BLOOM_UI_SLIDER) u->desc.action_mask = BLOOM_ACT_CLICK | BLOOM_ACT_DRAG | BLOOM_ACT_FOCUS;
-        else if (desc->kind == BLOOM_UI_VLIST) u->desc.action_mask = BLOOM_ACT_SCROLL | BLOOM_ACT_FOCUS;
-        else if (desc->kind == BLOOM_UI_MODAL || desc->kind == BLOOM_UI_PANEL) u->desc.action_mask = BLOOM_ACT_FOCUS;
+        if (desc->kind == BLOOM_UI_BUTTON || desc->kind == BLOOM_UI_CHECKBOX ||
+            desc->kind == BLOOM_UI_SWITCH || desc->kind == BLOOM_UI_SELECT ||
+            desc->kind == BLOOM_UI_TABS || desc->kind == BLOOM_UI_TEXT_INPUT) {
+            u->desc.action_mask = BLOOM_ACT_CLICK | BLOOM_ACT_FOCUS;
+        } else if (desc->kind == BLOOM_UI_SLIDER) {
+            u->desc.action_mask = BLOOM_ACT_CLICK | BLOOM_ACT_DRAG | BLOOM_ACT_FOCUS;
+        } else if (desc->kind == BLOOM_UI_VLIST || desc->kind == BLOOM_UI_SCROLLVIEW) {
+            u->desc.action_mask = BLOOM_ACT_SCROLL | BLOOM_ACT_FOCUS;
+        } else if (desc->kind == BLOOM_UI_MODAL || desc->kind == BLOOM_UI_PANEL) {
+            u->desc.action_mask = BLOOM_ACT_FOCUS;
+        }
     }
     u->key = bloom_fnv1a64(u->id_buf);
     u->slider_t = 0.5f;
+    u->progress_t = clamp_f32(desc->progress_t, 0.0f, 1.0f);
 
     const StateEntry *se = state_store_find(s, u->key);
     if (se) {
         u->slider_t = se->slider_t;
         u->toggle_on = se->toggle_on;
         u->scroll_y = se->scroll_y;
+        u->selected_idx = se->selected_idx;
+        if (se->text_buf[0]) snprintf(u->text_buf, sizeof(u->text_buf), "%s", se->text_buf);
     } else if (desc->bind_obj_key != 0u && desc->kind == BLOOM_UI_SLIDER) {
         BloomHandle bh = bloom_scene_find_object_by_key(s, desc->bind_obj_key);
         const ObjectSlot *bo = get_obj_const(s, bh);
@@ -894,7 +949,10 @@ bool bloom_scene_set_ui_scroll(BloomScene *s, BloomHandle ui, float scroll_y) {
     UiSlot *u = get_ui_mut(s, ui);
     if (!u) return false;
     float max_sc = 0.0f;
-    if (u->desc.vlist_total_rows > 0u && u->desc.vlist_row_h > 0.0f) {
+    if (u->desc.kind == BLOOM_UI_SCROLLVIEW) {
+        max_sc = u->content_h - u->h;
+        if (max_sc < 0.0f) max_sc = 0.0f;
+    } else if (u->desc.vlist_total_rows > 0u && u->desc.vlist_row_h > 0.0f) {
         max_sc = (float)u->desc.vlist_total_rows * u->desc.vlist_row_h - u->h;
         if (max_sc < 0.0f) max_sc = 0.0f;
     }
@@ -917,6 +975,55 @@ bool bloom_scene_get_ui_toggle(const BloomScene *s, BloomHandle ui) {
     uint32_t idx = handle_index(ui);
     if (idx == 0u || idx >= s->ui_cnt) return false;
     return s->uis[idx].toggle_on;
+}
+
+const char *bloom_scene_get_ui_text(const BloomScene *s, BloomHandle ui) {
+    if (!s || ui == BLOOM_HANDLE_NULL) return "";
+    uint32_t idx = handle_index(ui);
+    if (idx == 0u || idx >= s->ui_cnt || !s->uis[idx].alive) return "";
+    return s->uis[idx].text_buf;
+}
+
+bool bloom_scene_set_ui_text(BloomScene *s, BloomHandle ui, const char *utf8) {
+    UiSlot *u = get_ui_mut(s, ui);
+    if (!u) return false;
+    snprintf(u->text_buf, sizeof(u->text_buf), "%s", utf8 ? utf8 : "");
+    StateEntry *se = state_store_get_or_create(s, u->key, NULL);
+    if (se) snprintf(se->text_buf, sizeof(se->text_buf), "%s", u->text_buf);
+    s->ui_dirty = true;
+    return true;
+}
+
+const char *bloom_scene_get_ui_preedit(const BloomScene *s, BloomHandle ui) {
+    if (!s || ui == BLOOM_HANDLE_NULL) return "";
+    uint32_t idx = handle_index(ui);
+    if (idx == 0u || idx >= s->ui_cnt || !s->uis[idx].alive) return "";
+    return s->uis[idx].preedit_buf;
+}
+
+int32_t bloom_scene_get_ui_selected(const BloomScene *s, BloomHandle ui) {
+    if (!s || ui == BLOOM_HANDLE_NULL) return -1;
+    uint32_t idx = handle_index(ui);
+    if (idx == 0u || idx >= s->ui_cnt || !s->uis[idx].alive) return -1;
+    return s->uis[idx].selected_idx;
+}
+
+bool bloom_scene_set_ui_selected(BloomScene *s, BloomHandle ui, int32_t sel) {
+    UiSlot *u = get_ui_mut(s, ui);
+    if (!u) return false;
+    u->selected_idx = sel;
+    StateEntry *se = state_store_get_or_create(s, u->key, NULL);
+    if (se) se->selected_idx = sel;
+    s->ui_dirty = true;
+    return true;
+}
+
+bool bloom_scene_set_ui_progress(BloomScene *s, BloomHandle ui, float t) {
+    UiSlot *u = get_ui_mut(s, ui);
+    if (!u) return false;
+    u->progress_t = clamp_f32(t, 0.0f, 1.0f);
+    s->ui_dirty = true;
+    return true;
 }
 
 static void emit_quad(BloomScene *s, float x, float y, float w, float h,
@@ -988,9 +1095,44 @@ static void emit_shadow(BloomScene *s, float x, float y, float w, float h,
     s->shadows[s->sh_cnt++] = sh;
 }
 
+static void emit_sprite(BloomScene *s, float x, float y, float w, float h,
+                        const uint16_t uv[4], uint32_t tint, float rad_px,
+                        uint16_t tex_id, uint16_t clip_id, uint16_t z_order, uint16_t ui_slot) {
+    if (w <= 0.5f || h <= 0.5f) return;
+    if (!grow_array((void **)&s->sprites, &s->sp_cap, s->sp_cnt + 1u, sizeof(BloomSpriteInst))) return;
+    BloomSpriteInst sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.dst_q14_2[0] = f32_to_q14_2(x);
+    sp.dst_q14_2[1] = f32_to_q14_2(y);
+    sp.dst_q14_2[2] = f32_to_q14_2(w);
+    sp.dst_q14_2[3] = f32_to_q14_2(h);
+    if (uv) memcpy(sp.uv_unorm16, uv, 8u);
+    sp.tint_rgba8 = tint ? tint : 0xFFFFFFFFu;
+    sp.tex_id = tex_id;
+    sp.clip_id = clip_id;
+    sp.z_flags = ((uint32_t)z_order & 0xFFFFu) | ((uint32_t)f32_to_q6_2(rad_px) << 16u);
+    sp.ui_slot = ui_slot;
+    s->sprites[s->sp_cnt++] = sp;
+}
+
+static uint32_t split_options(const char *pipe, const char **ptrs, uint32_t *lens, uint32_t max_n) {
+    if (!pipe || !pipe[0]) return 0u;
+    uint32_t n = 0u;
+    const char *p = pipe;
+    while (*p && n < max_n) {
+        const char *bar = p;
+        while (*bar && *bar != '|') ++bar;
+        ptrs[n] = p;
+        lens[n] = (uint32_t)(bar - p);
+        ++n;
+        p = (*bar == '|') ? (bar + 1) : bar;
+    }
+    return n;
+}
+
 static void emit_text(BloomScene *s, uint64_t key, float x, float y, float w, float h,
                       float font_px, uint32_t rgba8, uint16_t clip_id, uint16_t z_order,
-                      const char *txt) {
+                      bool wrap, const char *txt) {
     if (!txt || !txt[0] || font_px <= 1.0f || (rgba8 >> 24u) == 0u) return;
     if (!grow_array((void **)&s->text_runs, &s->text_cap, s->text_cnt + 1u, sizeof(BloomTextRun))) return;
     BloomTextRun *tr = &s->text_runs[s->text_cnt++];
@@ -1000,7 +1142,14 @@ static void emit_text(BloomScene *s, uint64_t key, float x, float y, float w, fl
     tr->rgba8 = rgba8;
     tr->clip_id = clip_id;
     tr->z_order = z_order;
+    tr->wrap = wrap;
     snprintf(tr->text, sizeof(tr->text), "%s", txt);
+}
+
+static float clamp_range_f32(float v, float mn, float mx) {
+    if (mn > 0.0f && v < mn) v = mn;
+    if (mx > 0.0f && v > mx) v = mx;
+    return v;
 }
 
 static void layout_ui_recursive(BloomScene *s, uint32_t ui_idx, uint16_t clip_id, uint16_t z_base) {
@@ -1019,18 +1168,27 @@ static void layout_ui_recursive(BloomScene *s, uint32_t ui_idx, uint16_t clip_id
                       ? BLOOM_QUAD_FLAG_GROUND_ONLY : 0u;
     uint32_t bdr = u->desc.border_rgba8;
     float bw = u->desc.border_px;
-    if (u->self == s->focused_ui && !u->desc.disabled && bw <= 0.1f) {
+    if (u->self == s->focused_ui && !u->desc.disabled && (bw <= 0.1f || u->desc.kind == BLOOM_UI_TEXT_INPUT)) {
         bdr = BLOOM_RGBA(0x50, 0xE0, 0xFF, 0xFF);
-        bw = 1.5f;
+        bw = bw > 1.5f ? bw : 1.5f;
     }
-    emit_quad(s, u->x, u->y, u->w, u->h, fill, bdr,
-              u->desc.radius_px, bw, clip_id, (uint16_t)(z_base + 1u), (uint16_t)ui_idx, 0u, qf);
+    if (u->desc.kind == BLOOM_UI_SPRITE) {
+        if ((fill >> 24u) > 0u || (bw > 0.1f && (bdr >> 24u) > 0u)) {
+            emit_quad(s, u->x, u->y, u->w, u->h, fill, bdr,
+                      u->desc.radius_px, bw, clip_id, (uint16_t)(z_base + 1u), (uint16_t)ui_idx, 0u, 0u);
+        }
+        emit_sprite(s, u->x, u->y, u->w, u->h, u->desc.sprite_uv_unorm16, u->desc.sprite_tint_rgba8,
+                    u->desc.radius_px, 0u, clip_id, (uint16_t)(z_base + 2u), (uint16_t)ui_idx);
+    } else {
+        emit_quad(s, u->x, u->y, u->w, u->h, fill, bdr,
+                  u->desc.radius_px, bw, clip_id, (uint16_t)(z_base + 1u), (uint16_t)ui_idx, 0u, qf);
+    }
+
+    float fpx = u->desc.font_px > 0.0f ? u->desc.font_px : 15.0f;
+    uint32_t tcol = u->desc.text_rgba8 ? u->desc.text_rgba8 : BLOOM_RGBA(0xEA, 0xF2, 0xFC, 0xFF);
 
     if (u->desc.kind == BLOOM_UI_SLIDER) {
-        float track_h = 8.0f;
-        float track_y = u->y + u->h * 0.55f;
-        float track_x = u->x + 12.0f;
-        float track_w = u->w - 24.0f;
+        float track_h = 8.0f, track_y = u->y + u->h * 0.55f, track_x = u->x + 12.0f, track_w = u->w - 24.0f;
         if (track_w > 4.0f) {
             emit_quad(s, track_x, track_y, track_w, track_h, BLOOM_RGBA(0x1A, 0x22, 0x30, 0xFF), 0u, 4.0f, 0.0f,
                       clip_id, (uint16_t)(z_base + 2u), (uint16_t)ui_idx, 1u, 0u);
@@ -1039,6 +1197,107 @@ static void layout_ui_recursive(BloomScene *s, uint32_t ui_idx, uint16_t clip_id
             float kx = track_x + track_w * u->slider_t - 7.0f;
             emit_quad(s, kx, track_y - 4.0f, 14.0f, 16.0f, BLOOM_RGBA(0xF4, 0xF8, 0xFF, 0xFF), BLOOM_RGBA(0x0A, 0x14, 0x20, 0xFF), 7.0f, 1.5f,
                       clip_id, (uint16_t)(z_base + 4u), (uint16_t)ui_idx, 3u, 0u);
+        }
+    } else if (u->desc.kind == BLOOM_UI_CHECKBOX) {
+        float bs = 20.0f, bx = u->x + 8.0f, by = u->y + (u->h - bs) * 0.5f;
+        uint32_t box_col = u->toggle_on ? BLOOM_RGBA(0x38, 0xB6, 0xFF, 0xFF) : BLOOM_RGBA(0x18, 0x21, 0x2F, 0xFF);
+        emit_quad(s, bx, by, bs, bs, box_col, BLOOM_RGBA(0x4E, 0x6A, 0x8A, 0xFF), 4.0f, 1.5f,
+                  clip_id, (uint16_t)(z_base + 2u), (uint16_t)ui_idx, 1u, 0u);
+        if (u->toggle_on) {
+            emit_quad(s, bx + 5.0f, by + 5.0f, bs - 10.0f, bs - 10.0f, BLOOM_RGBA(0xFA, 0xFC, 0xFF, 0xFF), 0u, 2.0f, 0.0f,
+                      clip_id, (uint16_t)(z_base + 3u), (uint16_t)ui_idx, 2u, 0u);
+        }
+        if (u->label_buf[0]) {
+            emit_text(s, u->key, bx + bs + 10.0f, u->y + (u->h - fpx * 1.2f) * 0.5f,
+                      u->w - (bs + 24.0f), u->h, fpx, tcol, clip_id, (uint16_t)(z_base + 5u), false, u->label_buf);
+        }
+    } else if (u->desc.kind == BLOOM_UI_SWITCH) {
+        float sw_w = 44.0f, sw_h = 24.0f, sx = u->x + 8.0f, sy = u->y + (u->h - sw_h) * 0.5f;
+        uint32_t trk = u->toggle_on ? BLOOM_RGBA(0x2E, 0xC8, 0x7A, 0xFF) : BLOOM_RGBA(0x2B, 0x35, 0x45, 0xFF);
+        emit_quad(s, sx, sy, sw_w, sw_h, trk, 0u, 12.0f, 0.0f,
+                  clip_id, (uint16_t)(z_base + 2u), (uint16_t)ui_idx, 1u, 0u);
+        float kx = u->toggle_on ? (sx + sw_w - 21.0f) : (sx + 3.0f);
+        emit_quad(s, kx, sy + 3.0f, 18.0f, 18.0f, BLOOM_RGBA(0xFF, 0xFF, 0xFF, 0xFF), 0u, 9.0f, 0.0f,
+                  clip_id, (uint16_t)(z_base + 3u), (uint16_t)ui_idx, 2u, 0u);
+        if (u->label_buf[0]) {
+            emit_text(s, u->key, sx + sw_w + 10.0f, u->y + (u->h - fpx * 1.2f) * 0.5f,
+                      u->w - (sw_w + 24.0f), u->h, fpx, tcol, clip_id, (uint16_t)(z_base + 5u), false, u->label_buf);
+        }
+    } else if (u->desc.kind == BLOOM_UI_PROGRESS) {
+        float pt = clamp_f32(u->progress_t, 0.0f, 1.0f);
+        emit_quad(s, u->x, u->y, u->w * pt, u->h, BLOOM_RGBA(0x38, 0xD0, 0xFF, 0xFF), 0u,
+                  u->desc.radius_px, 0.0f, clip_id, (uint16_t)(z_base + 2u), (uint16_t)ui_idx, 1u, 0u);
+    } else if (u->desc.kind == BLOOM_UI_TEXT_INPUT) {
+        float pad = u->desc.pad > 0.0f ? u->desc.pad : 10.0f;
+        char disp[196];
+        bool is_empty = (!u->text_buf[0] && !u->preedit_buf[0]);
+        if (u->preedit_buf[0]) {
+            snprintf(disp, sizeof(disp), "%s[%s]", u->text_buf, u->preedit_buf);
+        } else if (u->text_buf[0]) {
+            snprintf(disp, sizeof(disp), "%s%s", u->text_buf, (u->self == s->focused_ui) ? "|" : "");
+        } else {
+            snprintf(disp, sizeof(disp), "%s", u->placeholder_buf[0] ? u->placeholder_buf : "");
+        }
+        uint32_t col = is_empty ? BLOOM_RGBA(0x76, 0x86, 0x9C, 0xFF) : tcol;
+        if (disp[0]) {
+            emit_text(s, u->key, u->x + pad, u->y + (u->h - fpx * 1.2f) * 0.5f,
+                      u->w - 2.0f * pad, u->h, fpx, col, clip_id, (uint16_t)(z_base + 5u), false, disp);
+        }
+    } else if (u->desc.kind == BLOOM_UI_TABS) {
+        const char *ptrs[16]; uint32_t lens[16];
+        uint32_t n = split_options(u->options_buf, ptrs, lens, 16u);
+        if (n > 0u) {
+            float tw = u->w / (float)n;
+            for (uint32_t k = 0u; k < n; ++k) {
+                bool sel = ((int32_t)k == u->selected_idx);
+                uint32_t tc = sel ? BLOOM_RGBA(0x28, 0x4E, 0x7A, 0xFF) : 0u;
+                float tx = u->x + (float)k * tw;
+                if (sel) {
+                    emit_quad(s, tx + 2.0f, u->y + 2.0f, tw - 4.0f, u->h - 4.0f, tc, 0u, 6.0f, 0.0f,
+                              clip_id, (uint16_t)(z_base + 2u), (uint16_t)ui_idx, (uint8_t)(k + 1u), 0u);
+                    emit_quad(s, tx + 8.0f, u->y + u->h - 3.0f, tw - 16.0f, 3.0f, BLOOM_RGBA(0x38, 0xD0, 0xFF, 0xFF), 0u,
+                              1.5f, 0.0f, clip_id, (uint16_t)(z_base + 3u), (uint16_t)ui_idx, (uint8_t)(k + 1u), 0u);
+                }
+                char seg[64];
+                uint32_t clen = lens[k] < 63u ? lens[k] : 63u;
+                memcpy(seg, ptrs[k], clen);
+                seg[clen] = '\0';
+                emit_text(s, u->key ^ k, tx + 10.0f, u->y + (u->h - fpx * 1.2f) * 0.5f, tw - 20.0f, u->h,
+                          fpx, tcol, clip_id, (uint16_t)(z_base + 5u), false, seg);
+            }
+        }
+    } else if (u->desc.kind == BLOOM_UI_SELECT) {
+        const char *ptrs[16]; uint32_t lens[16];
+        uint32_t n = split_options(u->options_buf, ptrs, lens, 16u);
+        char cur_lbl[80];
+        if (n > 0u) {
+            uint32_t si = (u->selected_idx >= 0 && (uint32_t)u->selected_idx < n) ? (uint32_t)u->selected_idx : 0u;
+            uint32_t clen = lens[si] < 64u ? lens[si] : 64u;
+            memcpy(cur_lbl, ptrs[si], clen);
+            snprintf(cur_lbl + clen, sizeof(cur_lbl) - clen, "  v");
+        } else {
+            snprintf(cur_lbl, sizeof(cur_lbl), "%s v", u->label_buf);
+        }
+        emit_text(s, u->key, u->x + 12.0f, u->y + (u->h - fpx * 1.2f) * 0.5f, u->w - 24.0f, u->h,
+                  fpx, tcol, clip_id, (uint16_t)(z_base + 5u), false, cur_lbl);
+        if (u->dropdown_open && n > 0u) {
+            float opt_h = u->h > 20.0f ? u->h : 34.0f;
+            float base_y = u->y + u->h + 4.0f;
+            emit_quad(s, u->x, base_y, u->w, opt_h * (float)n, BLOOM_RGBA(0x1B, 0x26, 0x38, 0xFF),
+                      BLOOM_RGBA(0x40, 0x88, 0xC8, 0xFF), 6.0f, 1.0f, 0u, (uint16_t)(z_base + 200u), (uint16_t)ui_idx, 100u, 0u);
+            for (uint32_t k = 0u; k < n; ++k) {
+                float oy = base_y + (float)k * opt_h;
+                if ((int32_t)k == u->selected_idx) {
+                    emit_quad(s, u->x + 2.0f, oy + 2.0f, u->w - 4.0f, opt_h - 4.0f, BLOOM_RGBA(0x2A, 0x56, 0x86, 0xFF),
+                              0u, 4.0f, 0.0f, 0u, (uint16_t)(z_base + 201u), (uint16_t)ui_idx, (uint8_t)(101u + k), 0u);
+                }
+                char seg[64];
+                uint32_t clen = lens[k] < 63u ? lens[k] : 63u;
+                memcpy(seg, ptrs[k], clen);
+                seg[clen] = '\0';
+                emit_text(s, u->key ^ (k + 0x100u), u->x + 12.0f, oy + (opt_h - fpx * 1.2f) * 0.5f,
+                          u->w - 24.0f, opt_h, fpx, tcol, 0u, (uint16_t)(z_base + 205u), false, seg);
+            }
         }
     }
 
@@ -1061,25 +1320,31 @@ static void layout_ui_recursive(BloomScene *s, uint32_t ui_idx, uint16_t clip_id
                 emit_text(s, u->key ^ row_id, u->x + 14.0f, ry + 5.0f, u->w - 28.0f, rh,
                           u->desc.font_px > 0.0f ? u->desc.font_px : 14.0f,
                           u->desc.text_rgba8 ? u->desc.text_rgba8 : BLOOM_RGBA(0xD0, 0xDC, 0xEC, 0xFF),
-                          vclip, (uint16_t)(z_base + 3u), row_lbl);
+                          vclip, (uint16_t)(z_base + 3u), false, row_lbl);
             }
         }
-    } else if (u->label_buf[0]) {
+    } else if (u->label_buf[0] &&
+               u->desc.kind != BLOOM_UI_CHECKBOX && u->desc.kind != BLOOM_UI_SWITCH &&
+               u->desc.kind != BLOOM_UI_TEXT_INPUT && u->desc.kind != BLOOM_UI_TABS &&
+               u->desc.kind != BLOOM_UI_SELECT && u->desc.kind != BLOOM_UI_SPRITE) {
         float pad = u->desc.pad > 0.0f ? u->desc.pad : 10.0f;
         float ly = (u->desc.kind == BLOOM_UI_SLIDER) ? (u->y + 6.0f) : (u->y + pad * 0.6f);
         emit_text(s, u->key, u->x + pad, ly, u->w - 2.0f * pad, u->h,
-                  u->desc.font_px > 0.0f ? u->desc.font_px : 15.0f,
-                  u->desc.text_rgba8 ? u->desc.text_rgba8 : BLOOM_RGBA(0xEA, 0xF2, 0xFC, 0xFF),
-                  clip_id, (uint16_t)(z_base + 5u), u->label_buf);
+                  fpx, tcol, clip_id, (uint16_t)(z_base + 5u), u->desc.text_wrap, u->label_buf);
     }
 
-    /* Count direct children and lay out flex flow */
-    uint32_t child_idxs[128];
-    uint32_t child_cnt = 0u;
-    for (uint32_t i = 1u; i < s->ui_cnt && child_cnt < 128u; ++i) {
-        if (s->uis[i].alive && s->uis[i].desc.parent == u->self) child_idxs[child_cnt++] = i;
+    uint32_t flow_idxs[128], abs_idxs[64];
+    uint32_t flow_cnt = 0u, abs_cnt = 0u;
+    for (uint32_t i = 1u; i < s->ui_cnt; ++i) {
+        if (s->uis[i].alive && s->uis[i].desc.parent == u->self) {
+            if (s->uis[i].desc.pos_absolute) {
+                if (abs_cnt < 64u) abs_idxs[abs_cnt++] = i;
+            } else if (flow_cnt < 128u) {
+                flow_idxs[flow_cnt++] = i;
+            }
+        }
     }
-    if (child_cnt == 0u) return;
+    if (flow_cnt == 0u && abs_cnt == 0u) return;
 
     uint16_t child_clip = clip_id;
     if (grow_array((void **)&s->clips, &s->clip_cap, s->clip_cnt + 1u, sizeof(BloomClipRect))) {
@@ -1094,42 +1359,126 @@ static void layout_ui_recursive(BloomScene *s, uint32_t ui_idx, uint16_t clip_id
 
     float pad = u->desc.pad;
     float hdr_h = ((u->desc.kind == BLOOM_UI_PANEL || u->desc.kind == BLOOM_UI_MODAL) && u->label_buf[0])
-                      ? ((u->desc.font_px > 0.0f ? u->desc.font_px : 15.0f) + 12.0f)
-                      : 0.0f;
+                      ? (fpx + 12.0f) : 0.0f;
     float gap = u->desc.gap;
-    float inner_w = u->w - 2.0f * pad;
-    float inner_h = u->h - 2.0f * pad - hdr_h;
-    if (inner_h < 0.0f) inner_h = 0.0f;
+    float inner_w = u->w - 2.0f * pad; if (inner_w < 0.0f) inner_w = 0.0f;
+    float inner_h = u->h - 2.0f * pad - hdr_h; if (inner_h < 0.0f) inner_h = 0.0f;
     bool row = (u->desc.flex_dir == BLOOM_FLEX_ROW);
 
-    float fixed_sum = gap * (float)(child_cnt > 1u ? child_cnt - 1u : 0u);
-    uint32_t flex_cnt = 0u;
-    for (uint32_t c = 0u; c < child_cnt; ++c) {
-        const UiSlot *cu = &s->uis[child_idxs[c]];
-        float primary = row ? cu->desc.w : cu->desc.h;
-        if (primary > 0.0f) fixed_sum += primary;
-        else ++flex_cnt;
+    for (uint32_t a = 0u; a < abs_cnt; ++a) {
+        UiSlot *cu = &s->uis[abs_idxs[a]];
+        cu->x = u->x + cu->desc.x;
+        cu->y = u->y + cu->desc.y;
+        float aw = cu->desc.pct_w > 0.0f ? (cu->desc.pct_w * inner_w) : (cu->desc.w > 0.0f ? cu->desc.w : inner_w);
+        float ah = cu->desc.pct_h > 0.0f ? (cu->desc.pct_h * inner_h) : (cu->desc.h > 0.0f ? cu->desc.h : inner_h);
+        cu->w = clamp_range_f32(aw, cu->desc.min_w, cu->desc.max_w);
+        cu->h = clamp_range_f32(ah, cu->desc.min_h, cu->desc.max_h);
+        layout_ui_recursive(s, abs_idxs[a], child_clip, (uint16_t)(z_base + 50u + a * 10u));
     }
-    float rem = (row ? inner_w : inner_h) - fixed_sum;
-    float flex_sz = (flex_cnt > 0u && rem > 0.0f) ? (rem / (float)flex_cnt) : 0.0f;
-    float cursor = row ? (u->x + pad) : (u->y + pad + hdr_h);
+    if (flow_cnt == 0u) return;
 
-    for (uint32_t c = 0u; c < child_cnt; ++c) {
-        UiSlot *cu = &s->uis[child_idxs[c]];
-        if (row) {
-            cu->x = cursor;
-            cu->y = u->y + pad + hdr_h;
-            cu->w = cu->desc.w > 0.0f ? cu->desc.w : flex_sz;
-            cu->h = cu->desc.h > 0.0f ? cu->desc.h : inner_h;
-            cursor += cu->w + gap;
-        } else {
-            cu->x = u->x + pad;
-            cu->y = cursor;
-            cu->w = cu->desc.w > 0.0f ? cu->desc.w : inner_w;
-            cu->h = cu->desc.h > 0.0f ? cu->desc.h : flex_sz;
-            cursor += cu->h + gap;
+    float base_w[128], base_h[128], weights[128];
+    for (uint32_t c = 0u; c < flow_cnt; ++c) {
+        const UiSlot *cu = &s->uis[flow_idxs[c]];
+        float cw = cu->desc.pct_w > 0.0f ? (cu->desc.pct_w * inner_w) : cu->desc.w;
+        float ch = cu->desc.pct_h > 0.0f ? (cu->desc.pct_h * inner_h) : cu->desc.h;
+        if ((cw <= 0.0f || ch <= 0.0f) && s->text_measure_fn && cu->label_buf[0] &&
+            (cu->desc.kind == BLOOM_UI_TEXT || (cu->desc.kind == BLOOM_UI_BUTTON && cw <= 0.0f && ch <= 0.0f))) {
+            float mw = 0.0f, mh = 0.0f;
+            float cfpx = cu->desc.font_px > 0.0f ? cu->desc.font_px : 15.0f;
+            s->text_measure_fn(s->text_measure_ud, cu->label_buf, cfpx, cw > 0.0f ? cw : inner_w, &mw, &mh);
+            if (cw <= 0.0f) cw = mw + 20.0f;
+            if (ch <= 0.0f) ch = mh + 12.0f;
         }
-        layout_ui_recursive(s, child_idxs[c], child_clip, (uint16_t)(z_base + 10u + c * 10u));
+        base_w[c] = cw > 0.0f ? clamp_range_f32(cw, cu->desc.min_w, cu->desc.max_w) : 0.0f;
+        base_h[c] = ch > 0.0f ? clamp_range_f32(ch, cu->desc.min_h, cu->desc.max_h) : 0.0f;
+        weights[c] = (cu->desc.flex_grow > 0.0f) ? cu->desc.flex_grow : ((row ? base_w[c] : base_h[c]) <= 0.0f ? 1.0f : 0.0f);
+    }
+
+    float max_cap = row ? inner_w : inner_h;
+    float cross_cursor = row ? (u->y + pad + hdr_h) : (u->x + pad);
+    if (u->desc.kind == BLOOM_UI_SCROLLVIEW && !row) cross_cursor = u->x + pad;
+    float scroll_off = (u->desc.kind == BLOOM_UI_SCROLLVIEW) ? u->scroll_y : 0.0f;
+    float content_end = u->y + pad + hdr_h;
+
+    uint32_t ls = 0u;
+    while (ls < flow_cnt) {
+        uint32_t le = ls + 1u;
+        float line_fixed = row ? base_w[ls] : base_h[ls];
+        while (u->desc.flex_wrap && le < flow_cnt) {
+            float next_p = row ? base_w[le] : base_h[le];
+            if (line_fixed + gap + next_p > max_cap + 0.5f) break;
+            line_fixed += gap + next_p;
+            ++le;
+        }
+        if (!u->desc.flex_wrap) le = flow_cnt;
+
+        float fixed_sum = gap * (float)(le - ls > 1u ? le - ls - 1u : 0u);
+        float w_sum = 0.0f, cross_max = 0.0f;
+        for (uint32_t c = ls; c < le; ++c) {
+            float pr = row ? base_w[c] : base_h[c];
+            float cr = row ? base_h[c] : base_w[c];
+            if (weights[c] > 0.0f && pr <= 0.0f) w_sum += weights[c];
+            else if (weights[c] > 0.0f) { fixed_sum += pr; w_sum += weights[c]; }
+            else fixed_sum += pr;
+            if (cr > cross_max) cross_max = cr;
+        }
+        float line_cross = (!u->desc.flex_wrap || cross_max <= 0.0f) ? (row ? inner_h : inner_w) : cross_max;
+        float rem = max_cap - fixed_sum;
+        float free_rem = (w_sum > 0.0f) ? 0.0f : (rem > 0.0f ? rem : 0.0f);
+
+        float cur = row ? (u->x + pad) : (u->y + pad + hdr_h);
+        float eff_gap = gap;
+        uint32_t lcnt = le - ls;
+        if (free_rem > 0.0f) {
+            if (u->desc.justify == BLOOM_JUSTIFY_CENTER) cur += free_rem * 0.5f;
+            else if (u->desc.justify == BLOOM_JUSTIFY_END) cur += free_rem;
+            else if (u->desc.justify == BLOOM_JUSTIFY_SPACE_BETWEEN && lcnt > 1u) eff_gap += free_rem / (float)(lcnt - 1u);
+            else if (u->desc.justify == BLOOM_JUSTIFY_SPACE_AROUND && lcnt > 0u) {
+                float sp = free_rem / (float)lcnt;
+                cur += sp * 0.5f;
+                eff_gap += sp;
+            }
+        }
+
+        for (uint32_t c = ls; c < le; ++c) {
+            UiSlot *cu = &s->uis[flow_idxs[c]];
+            float add = (w_sum > 0.0f && rem > 0.0f && weights[c] > 0.0f) ? (rem * (weights[c] / w_sum)) : 0.0f;
+            float cw = row ? clamp_range_f32(base_w[c] + add, cu->desc.min_w, cu->desc.max_w)
+                           : (base_w[c] > 0.0f ? base_w[c] : (u->desc.align == BLOOM_ALIGN_STRETCH ? line_cross : line_cross));
+            float ch = row ? (base_h[c] > 0.0f ? base_h[c] : (u->desc.align == BLOOM_ALIGN_STRETCH ? line_cross : line_cross))
+                           : clamp_range_f32(base_h[c] + add, cu->desc.min_h, cu->desc.max_h);
+            float cx_off = 0.0f;
+            if (u->desc.align == BLOOM_ALIGN_CENTER) cx_off = (line_cross - (row ? ch : cw)) * 0.5f;
+            else if (u->desc.align == BLOOM_ALIGN_END) cx_off = line_cross - (row ? ch : cw);
+
+            cu->w = cw > 0.0f ? cw : 0.0f;
+            cu->h = ch > 0.0f ? ch : 0.0f;
+            if (row) {
+                cu->x = cur;
+                cu->y = cross_cursor + cx_off - scroll_off;
+                cur += cu->w + eff_gap;
+            } else {
+                cu->x = cross_cursor + cx_off;
+                cu->y = cur - scroll_off;
+                cur += cu->h + eff_gap;
+            }
+            float unshifted_b = (row ? cross_cursor + cx_off : (cur - eff_gap)) + cu->h;
+            if (unshifted_b > content_end) content_end = unshifted_b;
+            layout_ui_recursive(s, flow_idxs[c], child_clip, (uint16_t)(z_base + 10u + c * 10u));
+        }
+        cross_cursor += line_cross + gap;
+        ls = le;
+    }
+
+    u->content_h = content_end - (u->y + pad + hdr_h) + 2.0f * pad + hdr_h;
+    if (u->desc.kind == BLOOM_UI_SCROLLVIEW && u->content_h > u->h + 2.0f) {
+        float ratio = u->h / u->content_h;
+        float th = clamp_f32(u->h * ratio, 24.0f, u->h - 8.0f);
+        float max_sc = u->content_h - u->h;
+        float ty = u->y + 4.0f + (max_sc > 1.0f ? (u->scroll_y / max_sc) * (u->h - 8.0f - th) : 0.0f);
+        emit_quad(s, u->x + u->w - 8.0f, ty, 5.0f, th, BLOOM_RGBA(0x5A, 0x80, 0xA8, 0xCC), 0u,
+                  2.5f, 0.0f, child_clip, (uint16_t)(z_base + 40u), (uint16_t)ui_idx, 99u, 0u);
     }
 }
 
@@ -1140,6 +1489,7 @@ void bloom_scene_layout_ui(BloomScene *s, float vp_w, float vp_h) {
     s->sh_cnt = 0u;
     s->clip_cnt = 0u;
     s->text_cnt = 0u;
+    s->sp_cnt = 0u;
 
     if (!grow_array((void **)&s->clips, &s->clip_cap, 16u, sizeof(BloomClipRect))) return;
     s->clips[0] = (BloomClipRect){0.0f, 0.0f, vp_w, vp_h};
@@ -1171,6 +1521,7 @@ static void apply_ui_binding(BloomScene *s, UiSlot *u) {
     if (se) {
         se->slider_t = u->slider_t;
         se->toggle_on = u->toggle_on;
+        se->selected_idx = u->selected_idx;
     }
     if (u->desc.bind_obj_key == 0u) return;
     BloomHandle oh = bloom_scene_find_object_by_key(s, u->desc.bind_obj_key);
@@ -1188,7 +1539,7 @@ static void apply_ui_binding(BloomScene *s, UiSlot *u) {
             p[3] = -1.0f + u->slider_t * 2.0f;
             bloom_scene_set_object_cutaway(s, oh, (bo->flags & BLOOM_OBJ_FLAG_CUTAWAY) != 0u, p);
         }
-    } else if (u->desc.kind == BLOOM_UI_BUTTON) {
+    } else if (u->desc.kind == BLOOM_UI_BUTTON || u->desc.kind == BLOOM_UI_CHECKBOX || u->desc.kind == BLOOM_UI_SWITCH) {
         bloom_scene_set_object_cutaway(s, oh, u->toggle_on, bo->local_clip);
     }
 }
@@ -1227,21 +1578,50 @@ bool bloom_scene_handle_input(BloomScene *s, const BloomInputEvent *ev) {
         s->pointer_down = true;
         s->last_ptr_x = ev->x;
         s->last_ptr_y = ev->y;
+
+        /* Check open Select dropdown overlay first */
+        for (uint32_t i = 1u; i < s->ui_cnt; ++i) {
+            UiSlot *u = &s->uis[i];
+            if (!u->alive || u->desc.disabled || u->z_order < modal_z ||
+                u->desc.kind != BLOOM_UI_SELECT || !u->dropdown_open) continue;
+            const char *ptrs[16]; uint32_t lens[16];
+            uint32_t n = split_options(u->options_buf, ptrs, lens, 16u);
+            float opt_h = u->h > 20.0f ? u->h : 34.0f;
+            float base_y = u->y + u->h + 4.0f;
+            if (n > 0u && ev->x >= u->x && ev->x <= u->x + u->w &&
+                ev->y >= base_y && ev->y < base_y + opt_h * (float)n) {
+                int32_t k = (int32_t)((ev->y - base_y) / opt_h);
+                if (k >= 0 && (uint32_t)k < n) u->selected_idx = k;
+                u->dropdown_open = false;
+                apply_ui_binding(s, u);
+                s->ui_dirty = true;
+                return true;
+            }
+        }
+
         uint32_t best_i = 0u;
         uint16_t best_z = 0u;
         for (uint32_t i = 1u; i < s->ui_cnt; ++i) {
             const UiSlot *u = &s->uis[i];
             if (!u->alive || u->desc.disabled || u->z_order < modal_z) continue;
-            if ((u->desc.kind == BLOOM_UI_BUTTON || u->desc.kind == BLOOM_UI_SLIDER || u->desc.kind == BLOOM_UI_MODAL) &&
-                point_in_ui(u, ev->x, ev->y) && u->z_order >= best_z) {
+            BloomUiKind k = u->desc.kind;
+            bool clickable = (k == BLOOM_UI_BUTTON || k == BLOOM_UI_SLIDER || k == BLOOM_UI_MODAL ||
+                              k == BLOOM_UI_CHECKBOX || k == BLOOM_UI_SWITCH || k == BLOOM_UI_SELECT ||
+                              k == BLOOM_UI_TABS || k == BLOOM_UI_TEXT_INPUT);
+            if (clickable && point_in_ui(u, ev->x, ev->y) && u->z_order >= best_z) {
                 best_z = u->z_order;
                 best_i = i;
+            }
+        }
+        for (uint32_t i = 1u; i < s->ui_cnt; ++i) {
+            if (s->uis[i].alive && s->uis[i].desc.kind == BLOOM_UI_SELECT && i != best_i) {
+                if (s->uis[i].dropdown_open) { s->uis[i].dropdown_open = false; s->ui_dirty = true; }
             }
         }
         if (best_i > 0u) {
             UiSlot *u = &s->uis[best_i];
             s->focused_ui = u->self;
-            if (u->desc.kind == BLOOM_UI_BUTTON) {
+            if (u->desc.kind == BLOOM_UI_BUTTON || u->desc.kind == BLOOM_UI_CHECKBOX || u->desc.kind == BLOOM_UI_SWITCH) {
                 s->captured_ui = u->self;
                 u->toggle_on = !u->toggle_on;
                 apply_ui_binding(s, u);
@@ -1250,6 +1630,18 @@ bool bloom_scene_handle_input(BloomScene *s, const BloomInputEvent *ev) {
                 float tx = u->x + 12.0f, tw = u->w - 24.0f;
                 u->slider_t = tw > 1.0f ? clamp_f32((ev->x - tx) / tw, 0.0f, 1.0f) : 0.5f;
                 apply_ui_binding(s, u);
+            } else if (u->desc.kind == BLOOM_UI_SELECT) {
+                u->dropdown_open = !u->dropdown_open;
+            } else if (u->desc.kind == BLOOM_UI_TABS) {
+                const char *ptrs[16]; uint32_t lens[16];
+                uint32_t n = split_options(u->options_buf, ptrs, lens, 16u);
+                if (n > 0u && u->w > 1.0f) {
+                    int32_t k = (int32_t)(((ev->x - u->x) / u->w) * (float)n);
+                    if (k < 0) k = 0;
+                    if ((uint32_t)k >= n) k = (int32_t)(n - 1u);
+                    u->selected_idx = k;
+                    apply_ui_binding(s, u);
+                }
             }
             s->ui_dirty = true;
             consumed = true;
@@ -1265,7 +1657,6 @@ bool bloom_scene_handle_input(BloomScene *s, const BloomInputEvent *ev) {
                 consumed = true;
             }
         } else if (s->pointer_down && s->captured_ui == BLOOM_HANDLE_NULL && modal_z == 0u) {
-            /* Drag empty viewport -> orbit camera */
             s->camera.yaw += (ev->x - s->last_ptr_x) * 0.005f;
             s->camera.pitch = clamp_f32(s->camera.pitch + (ev->y - s->last_ptr_y) * 0.004f, -1.2f, 1.2f);
             s->camera_dirty = true;
@@ -1284,33 +1675,70 @@ bool bloom_scene_handle_input(BloomScene *s, const BloomInputEvent *ev) {
         s->pointer_down = false;
         s->captured_ui = BLOOM_HANDLE_NULL;
     } else if (ev->type == BLOOM_EVENT_SCROLL) {
-        bool hit_vlist = false;
+        bool hit_scroll = false;
         for (uint32_t i = s->ui_cnt; i > 1u; --i) {
             UiSlot *u = &s->uis[i - 1u];
             if (u->alive && !u->desc.disabled && u->z_order >= modal_z &&
-                u->desc.kind == BLOOM_UI_VLIST && point_in_ui(u, ev->x, ev->y)) {
+                (u->desc.kind == BLOOM_UI_VLIST || u->desc.kind == BLOOM_UI_SCROLLVIEW) &&
+                point_in_ui(u, ev->x, ev->y)) {
                 bloom_scene_set_ui_scroll(s, u->self, u->scroll_y - ev->dy * 16.0f);
-                hit_vlist = true;
+                hit_scroll = true;
                 consumed = true;
                 break;
             }
         }
-        if (!hit_vlist && modal_z == 0u) {
+        if (!hit_scroll && modal_z == 0u) {
             s->camera.pos[2] += ev->dy * 0.25f;
             s->camera_dirty = true;
         }
-    } else if (ev->type == BLOOM_EVENT_KEY_DOWN && (ev->key_code == 48u || ev->key_code == 9u) && s->ui_cnt > 1u) {
-        /* Roving TabIndex with Modal Focus Trap */
-        uint32_t cur = (s->focused_ui != BLOOM_HANDLE_NULL) ? handle_index(s->focused_ui) : 0u;
-        for (uint32_t step = 1u; step < s->ui_cnt; ++step) {
-            uint32_t idx = ((cur + step - 1u) % (s->ui_cnt - 1u)) + 1u;
-            const UiSlot *u = &s->uis[idx];
-            if (!u->alive || u->desc.disabled || u->z_order < modal_z) continue;
-            if ((u->desc.action_mask & (BLOOM_ACT_CLICK | BLOOM_ACT_DRAG | BLOOM_ACT_SCROLL)) != 0u) {
-                s->focused_ui = u->self;
-                s->ui_dirty = true;
-                consumed = true;
-                break;
+    } else if (ev->type == BLOOM_EVENT_IME_PREEDIT) {
+        UiSlot *u = get_ui_mut(s, s->focused_ui);
+        if (u && !u->desc.disabled && u->desc.kind == BLOOM_UI_TEXT_INPUT && u->z_order >= modal_z) {
+            snprintf(u->preedit_buf, sizeof(u->preedit_buf), "%s", ev->text);
+            s->ui_dirty = true;
+            consumed = true;
+        }
+    } else if (ev->type == BLOOM_EVENT_TEXT_INPUT) {
+        UiSlot *u = get_ui_mut(s, s->focused_ui);
+        if (u && !u->desc.disabled && u->desc.kind == BLOOM_UI_TEXT_INPUT && u->z_order >= modal_z) {
+            u->preedit_buf[0] = '\0';
+            size_t cur_len = strlen(u->text_buf);
+            if (cur_len + 1u < sizeof(u->text_buf)) {
+                snprintf(u->text_buf + cur_len, sizeof(u->text_buf) - cur_len, "%s", ev->text);
+            }
+            StateEntry *se = state_store_get_or_create(s, u->key, NULL);
+            if (se) snprintf(se->text_buf, sizeof(se->text_buf), "%s", u->text_buf);
+            s->ui_dirty = true;
+            consumed = true;
+        }
+    } else if (ev->type == BLOOM_EVENT_KEY_DOWN) {
+        UiSlot *fu = get_ui_mut(s, s->focused_ui);
+        if (fu && !fu->desc.disabled && fu->desc.kind == BLOOM_UI_TEXT_INPUT && fu->z_order >= modal_z &&
+            (ev->key_code == 51u || ev->key_code == 8u)) {
+            if (fu->preedit_buf[0]) {
+                fu->preedit_buf[0] = '\0';
+            } else {
+                size_t len = strlen(fu->text_buf);
+                while (len > 0u && (((uint8_t)fu->text_buf[len - 1u] & 0xC0u) == 0x80u)) --len;
+                if (len > 0u) --len;
+                fu->text_buf[len] = '\0';
+                StateEntry *se = state_store_get_or_create(s, fu->key, NULL);
+                if (se) snprintf(se->text_buf, sizeof(se->text_buf), "%s", fu->text_buf);
+            }
+            s->ui_dirty = true;
+            consumed = true;
+        } else if ((ev->key_code == 48u || ev->key_code == 9u) && s->ui_cnt > 1u) {
+            uint32_t cur = (s->focused_ui != BLOOM_HANDLE_NULL) ? handle_index(s->focused_ui) : 0u;
+            for (uint32_t step = 1u; step < s->ui_cnt; ++step) {
+                uint32_t idx = ((cur + step - 1u) % (s->ui_cnt - 1u)) + 1u;
+                const UiSlot *u = &s->uis[idx];
+                if (!u->alive || u->desc.disabled || u->z_order < modal_z) continue;
+                if ((u->desc.action_mask & (BLOOM_ACT_CLICK | BLOOM_ACT_DRAG | BLOOM_ACT_SCROLL)) != 0u) {
+                    s->focused_ui = u->self;
+                    s->ui_dirty = true;
+                    consumed = true;
+                    break;
+                }
             }
         }
     } else if (ev->type == BLOOM_EVENT_RESIZE) {
@@ -1348,6 +1776,73 @@ uint32_t bloom_scene_get_text_runs(const BloomScene *s, const BloomTextRun **out
     if (!s) return 0u;
     if (out_ptr) *out_ptr = s->text_runs;
     return s->text_cnt;
+}
+
+uint32_t bloom_scene_get_sprites(const BloomScene *s, const BloomSpriteInst **out_ptr) {
+    if (!s) return 0u;
+    if (out_ptr) *out_ptr = s->sprites;
+    return s->sp_cnt;
+}
+
+uint16_t bloom_scene_add_material(BloomScene *s, const BloomMaterial32 *mat) {
+    if (!s || !mat) return 0u;
+    if (!grow_array((void **)&s->materials, &s->mat_cap, s->mat_cnt + 1u, sizeof(BloomMaterial32))) {
+        return 0u;
+    }
+    uint16_t id = (uint16_t)s->mat_cnt++;
+    s->materials[id] = *mat;
+    s->state_dirty = true;
+    return id;
+}
+
+bool bloom_scene_set_object_material(BloomScene *s, BloomHandle obj, uint16_t mat_id) {
+    ObjectSlot *o = get_obj_mut(s, obj);
+    if (!o || mat_id >= s->mat_cnt) return false;
+    o->flags = (o->flags & 0xFFFFu) | ((uint32_t)mat_id << 16u);
+    if (s->materials[mat_id].flags & BLOOM_MAT_FLAG_PBR) o->flags |= BLOOM_OBJ_FLAG_PBR;
+    else o->flags &= ~BLOOM_OBJ_FLAG_PBR;
+    s->state_dirty = true;
+    return true;
+}
+
+uint32_t bloom_scene_add_light(BloomScene *s, const BloomLight32 *light) {
+    if (!s || !light) return UINT32_MAX;
+    if (!grow_array((void **)&s->lights, &s->light_cap, s->light_cnt + 1u, sizeof(BloomLight32))) {
+        return UINT32_MAX;
+    }
+    uint32_t idx = s->light_cnt++;
+    s->lights[idx] = *light;
+    s->state_dirty = true;
+    return idx;
+}
+
+void bloom_scene_clear_lights(BloomScene *s) {
+    if (!s) return;
+    s->light_cnt = 0u;
+    s->state_dirty = true;
+}
+
+uint32_t bloom_scene_get_materials(const BloomScene *s, const BloomMaterial32 **out_ptr) {
+    if (!s) return 0u;
+    if (out_ptr) *out_ptr = s->materials;
+    return s->mat_cnt;
+}
+
+uint32_t bloom_scene_get_lights(const BloomScene *s, const BloomLight32 **out_ptr) {
+    if (!s) return 0u;
+    if (out_ptr) *out_ptr = s->lights;
+    return s->light_cnt;
+}
+
+bool bloom_scene_has_pbr_objects(const BloomScene *s) {
+    if (!s) return false;
+    for (uint32_t i = 0u; i < s->gpu_state_cnt; ++i) {
+        if ((s->gpu_states[i].flags & BLOOM_OBJ_FLAG_PBR) != 0u) return true;
+    }
+    for (uint32_t i = 1u; i < s->obj_cap; ++i) {
+        if (s->objs[i].alive && ((s->objs[i].flags & BLOOM_OBJ_FLAG_PBR) != 0u)) return true;
+    }
+    return false;
 }
 
 /* ============================================================================
@@ -1518,6 +2013,9 @@ bool bloom_scene_get_ui_meta(const BloomScene *s, uint32_t slot, BloomUiMeta *ou
     out->action_mask = u->desc.action_mask;
     out->bind_obj_key = u->desc.bind_obj_key;
     out->bind_dof_slot = u->desc.bind_dof_slot;
+    out->selected_idx = u->selected_idx;
+    out->text_value = u->text_buf;
+    out->preedit_text = u->preedit_buf;
     return true;
 }
 
