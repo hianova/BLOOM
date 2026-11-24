@@ -6,13 +6,15 @@
 
 ## 1. 全代架構與實測總對照表
 
-| 引擎 / 原型 | 4K 純 UI (2k Quads / 16 視窗+字型) | 4K 20k Quads | 4K 3D / 合成 | 核心架構決定性差異 |
-| :--- | :---: | :---: | :---: | :--- |
-| **BLOOM `v1.0.0`** (Metal 舊基線) | `~6.19 ms` (full+SVG) / `0.72–0.80 ms` (empty) | — | `6.9–11.5 ms` (125k tris) | 864-line MSL 硬體光柵化 |
-| **BLOOM `v2.0.0`** (`bento_glass`) | `10.45 ms` (`95.7 fps`, 16 full win) | — | — | 603-line MSL, `maxTG=1024` |
-| **Archived `v9`** (`5,123` 行 megashader) | **`14.08 ms`** (empty) → **`26.41–35.12 ms`** (16 full+text) | N/A (`16-node` 天花板) | **`257.10 ms`** (`3.9 fps`) | 11,711 行 MSL、`448–640` Occupancy 崩盤、全螢幕 HDR Compute UI + CPU UTF-8 迴圈 + 額外 Blit |
-| **`zed-main` GPUI 實測** (`160 B` Quad + fragment re-fetch) | `0.87 ms` (`2k` solid) / `0.93 ms` (`16q`)<br>探針 `176B` 圓角邊框：**`1.087 ms`** | 探針 `176B`：**`10.424 ms`** | 無原生 3D | TBDR `RenderCommandEncoder` + `Memoryless Depth` + `Shared\|WC` Ring，但 `160 B` Monolithic `Quad` |
-| **BLOOM vNext 探針 (`Refetch20B + 32 B Hot`)** | **`0.581 ms` (`1,721 fps`, 2k 圓角帶框)** / `0.612 ms` (`256 widgets`) | **`4.806 ms` (`208 fps`)** | 降尺度 3D 預期 `~1–3 ms` + 4K UI `~0.6 ms` | **`32 B` `BloomQuadHot` + `20 B` `[[stage_in]]` + GPU L1 `32 B` 重讀 + `half` SDF + 零 `FLOW` + `Private+Opt` Atlas** |
+| 引擎 / 原型 | 4K 純 UI (2k Quads / 16 視窗+字型) | 4K 20k Quads | 4K 綜合 IDE+HUD (`15k` 字+UI+陰影) | 4K 3D / 合成 | 核心架構決定性差異 |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **BLOOM `v1.0.0`** (Metal 舊基線) | `~6.19 ms` (full+SVG) / `0.72–0.80 ms` (empty) | — | — | `6.9–11.5 ms` (125k tris) | 864-line MSL 硬體光柵化 |
+| **BLOOM `v2.0.0`** (`bento_glass`) | `10.45 ms` (`95.7 fps`, 16 full win) | — | — | — | 603-line MSL, `maxTG=1024` |
+| **Archived `v9`** (`5,123` 行 megashader) | **`14.08 ms`** (empty) → **`26.41–35.12 ms`** (16 full+text) | N/A (`16-node` 天花板) | N/A (`16-node` 天花板) | **`257.10 ms`** (`3.9 fps`) | 11,711 行 MSL、`448–640` Occupancy 崩盤、全螢幕 HDR Compute UI + CPU UTF-8 迴圈 + 額外 Blit |
+| **`zed-main` GPUI 實測** (`160 B` Quad + `112 B` Sprite/Shadow) | `0.87 ms` (`2k` solid) / `0.93 ms` (`16q`)<br>探針 `176B` 圓角邊框：**`1.087 ms`** | 探針 `176B`：**`10.424 ms`**<br>混合 Dual-Pass：**`5.928 ms`** | **`1.274 ms`** (`1,677 KB` buf, `785 fps`) | 無原生 3D | TBDR `RenderCommandEncoder` + `Memoryless Depth` + `Shared\|WC` Ring，但 `112–160 B` Monolithic + `56–100 B` StageIn + `Shared` Atlas |
+| **BLOOM vNext 探針 (`Refetch20B + 24/32 B Hot`)** | **`0.581 ms` (`1,721 fps`, 2k 圓角帶框)** / `0.557–0.612 ms` (`256 widgets`) | **`4.802 ms` (`208 fps`)**<br>混合 Pre-Part：**`4.186 ms`** | **`0.671 ms`** (`359.5 KB` buf, **`1,491 fps`**) | 降尺度 3D 預期 `~1–3 ms` + 4K UI `~0.6 ms` | **`32 B` Quad/Shadow + `24 B` Glyph + `20 B StageIn` (`Refetch20B`) + GPU L1 重讀 + Pre-Partitioned Opaque + `Private+Opt` Atlas (`1.90×` 快於 GPUI)** |
+
+*(完整 `zed-main` GPUI 全元件拆解與 Adopt/Beat/Skip 矩陣見 [`06_gpui_component_benchmark.md`](./06_gpui_component_benchmark.md#L105-L120))*
 
 ---
 
@@ -49,8 +51,8 @@ flowchart TB
 研究探針已經把所有矽片邊界摸透，現在剩這 **5 個產品與工程方向** 需要我們拍板，拍板後就可以在明確的邊界內重寫乾淨的 BLOOM vNext：
 
 1. **後端優先順序：Metal-First 原生管線 vs WebGPU (wgpu / Dawn) 同源跨平台？**
-   - **選項 A（建議優先驗證）**：核心 ABI 與 Shader 資料結構設計先 **對齊 Apple M1 原生 Metal 最佳佈局**（`32 B` `Refetch20B`、`Memoryless`、`Shared|WC`、`MTLHeap`），同時將結構保持 WGSL 32-bit 相容，讓 WebGPU 成為第二個等價後端（但絕不為了 WebGPU 妥協掉 `Private` / `Refetch20B` / `Memoryless`）。
-   - **選項 B**：全程先綁 `wgpu-native` / `SDL3-GPU` 單一抽象層（工程上較單純，但容易重新踩回 `maxTG=64` 轉譯開銷與無法控管 `WriteCombined`/`Memoryless` 的老路）。
+   - **選項 A（建議優先驗證，並參考 `gpui_apple` + `gpui_wgpu` 雙後端切線）**：核心 ABI 與 Shader 資料結構設計先 **對齊 Apple M1 原生 Metal 最佳佈局**（`32 B` `Refetch20B`、`Memoryless`、`Shared|WC`、`Private+Opt` Atlas、`MTLHeap`），同時只用 32-bit 原生型別讓 WebGPU `gpui_wgpu`-style storage buffer 後端能等價實作（絕不為了抽象層妥協 `Private` / `Refetch20B` / `Memoryless` 或讓 WebGL 退路拖累主線）。
+   - **選項 B**：全程先綁 `wgpu-native` / `SDL3-GPU` 單一抽象層（工程上較單純，但無法精細控制 `WriteCombined` / `Private+Opt` / `Memoryless` / 同 CB `Blit→Render`，且容易重蹈舊版轉譯降 Occupancy 的風險）。
 
 2. **CPU UI 前端定位：保留精簡 C17 Flexbox Core (`bloom_ui.c`, `2.18 µs`) vs 只做極低階 Immediate-Mode Painter？**
    - `2.18 µs` 的無分配 C17 Flexbox/Pointer/Constraint 引擎已經極快、且完全獨立於舊 shader。

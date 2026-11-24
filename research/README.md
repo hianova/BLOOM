@@ -9,7 +9,7 @@
 所有數據皆實測於本機 **`Apple M1` (`7-core GPU`, `4P+4E`, `8 GB UMA`, `128 B cache line`, `16 KB page`, `Metal 4`)**，零 `FLOW` / `SDL3` / 外部資產依賴。
 
 ```bash
-make -C /Users/kuangtalin/Documents/BLOOM/research/probes clean && make -C /Users/kuangtalin/Documents/BLOOM/research/probes run
+make -C /Users/kuangtalin/Documents/BLOOM/research/probes clean && make -C /Users/kuangtalin/Documents/BLOOM/research/probes run-all
 ```
 
 | 文件 / 檔案 | 主題與核心實測結論 |
@@ -19,7 +19,9 @@ make -C /Users/kuangtalin/Documents/BLOOM/research/probes clean && make -C /User
 | **[`03_gpu_data_structures.md`](./03_gpu_data_structures.md)** | **純 GPU 原生資料結構**：發現 **TBDR Parameter Buffer 定律 (`Refetch20B`)**——`32 B` `BloomQuadHot` 僅傳 `20 B StageIn` (`pos + quad_id`) 再由 L1 重讀，`4K 2k Quads = 0.581 ms` (`1,721 fps`) / `20k Quads = 4.806 ms`，擊敗 GPUI-like `176 B` (`1.087 / 10.424 ms`) 與肥大 StageIn (`1.440–1.541 ms`) |
 | **[`04_transfer_and_pipeline_order.md`](./04_transfer_and_pipeline_order.md)** | **傳輸與管線排序**：Triple-Buffer (`154.7 µs/f`, CPU `21.5 µs`)、Apple TBDR HSR 與 **`discard_fragment()` 摧毀 HSR 實測 (`4.36 ms → 68.13 ms`, 暴慢 `15.8×`)**、同 CB 2 MB SLC 接力 vs 24 MB 溢位 DRAM (`1.018 → 2.156 ms`, `SplitCB` 再多損失 `+0.28–0.44 ms`) |
 | **[`05_architecture_synthesis.md`](./05_architecture_synthesis.md)** | **BLOOM vNext 藍圖與討論題**：7 條硬體鐵律 (CI Gates)、4 層零耦合結構、**5 項開放架構決策**準備討論 |
-| **[`probes/m1_silicon_probe.mm`](./probes/m1_silicon_probe.mm)** | 可重複編譯執行的單檔原生 Metal/ObjC++ 微基準探針原始碼（輸出 `build/m1_probe_results.json`） |
+| **[`06_gpui_component_benchmark.md`](./06_gpui_component_benchmark.md)** | **`zed-main` GPUI 全元件實證對標**：6 大元件實測對決——**4K IDE+HUD 綜合幀 BLOOM `0.671 ms` (`1,491 fps`, `360 KB`) vs GPUI `1.274 ms` (`785 fps`, `1,677 KB`) 快 `1.90×`**；陰影快 `2.13×`；Atlas 圖示快 `5.0×` vs Slug；揭露 `BoundsTree overlap-4096` `21.19 ms` 病理與 Adopt/Beat/Skip 矩陣 |
+| **[`probes/m1_silicon_probe.mm`](./probes/m1_silicon_probe.mm)** | 原生 Metal 矽片物理探針（輸出 `build/m1_probe_results.json`） |
+| **[`probes/gpui_component_bench.mm`](./probes/gpui_component_bench.mm)** | `zed-main` GPUI vs BLOOM 元件對標探針（輸出 `build/gpui_bench_results.json`） |
 
 ---
 

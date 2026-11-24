@@ -48,9 +48,12 @@
 | **`BloomClipRect`** | **`16 B`** | `float x0, y0, x1, y1` (16B) | UI 滾動視口遮罩通常整個頁面共用不到 16–64 個；存在獨立索引表，`BloomQuadHot` 只帶 `uint16_t clip_id`（省下每個 Quad `16 B`） |
 | **`BloomStyleCold`** | **`64 B`** | `uint32_t tag` (Gradient / Pattern / Shadow / Transform ID), `float4 stops[2]`, `float angle_params[4]`, `float2x2 mat` | **冷路徑（僅漸層、旋轉矩陣、9-slice 材質才索引讀取）**；不污染 95% 普通矩形的熱頻寬 |
 | **`BloomGlyphInst`** | **`24 B`** (pad `32 B` 若與 Quad 共用池) | `int16_t dst_x, dst_y, dst_w, dst_h` (`8 B`)<br>`uint16_t uv_x, uv_y, uv_w, uv_h` (`unorm16`, `8 B`)<br>`uint32_t rgba8_color` (`4 B`)<br>`uint16_t clip_id` (`2 B`) + `uint16_t atlas_flags` (`2 B`: page/MSDF/color-emoji) | 專供字體/單色圖標渲染；實例體積小至 `24 B`，4K 繪製 `100,000` 字元僅需 **`2.4 MB`**（全進 SLC） |
-| **`BloomShadowInst`** | **`32 B`** | `int16_t box_xywh[4]` (`8 B`) + `int16_t clip_xywh_or_id` + `uint32_t rgba8` + `uint16_t blur_q8` + `uint16_t radius_q8` + `uint32_t flags` | 解析積分高斯圓角盒陰影 (Analytic Erf Box Shadow)，單實例 1 Pass 直接於片上混合 |
+| **`BloomShadowHot`** | **`32 B`** | `uint16_t bounds_q14_2[4]` (`8 B`), `half4 shape_params` (`half_w, half_h, s_inv, min_edge`, `8 B`), `half4 blur_r1_exp_sc` (`r1, exp, scale, corner_r`, `8 B`), `uint32_t rgba8` (`4 B`), `clip_id, z_flags` (`4 B`) | 解析積分高斯圓角盒陰影 (Analytic `erf7`)；CPU 一次算好形狀常數取代 GPUI 每頂點 4× 重算 + 100B StageIn（見 [`06_gpui_component_benchmark.md`](./06_gpui_component_benchmark.md#L48-L62)：**`64–2000` 陰影快 `1.53–2.13×`**） |
 
-> **註**：所有 `x, y, w, h` 若需支援超大縮放畫布，改採 `float x, y` + `half w, h` 也能用 **`32 B`**（只要把 `cold_style_id` / `clip_id` 合併壓成 `uint32_t meta`），確保 **4K/8K subpixel 精確無階梯** 與 **嚴格 32 B 熱快取行** 兼得。
+> **實證修正補充（見 [`06_gpui_component_benchmark.md`](./06_gpui_component_benchmark.md)）**：
+> * 改用 `uint16_t Q14.2`（`0.25 px` 到 `16,383.75 px`）取代軟體 `f32_to_f16()` 移位後，CPU 打包全數反超 GPUI：20k 字元 `97.1 µs` vs `121.5 µs`、20k 混合矩形分桶 `57.2 µs` vs `83.8 µs`、4K 綜合 15k 字+UI `25.0 µs` vs `28.0 µs`。
+> * **`BloomGlyphInst (24 B)` + `Private R8Unorm`** 在 4K `50,000` 字元壓到 **`1.316 ms` (`1.45×` 快於 GPUI `112 B + Shared A8Unorm` 的 `1.909 ms`)**，緩衝區小 `4.67×`。
+> * 重複 SVG 圖示應快取進 `Private R8Unorm` Atlas（2,048 icons 僅 **`0.488 ms`**，比動態 Slug `PathTile` `2.446 ms` 快 **`5.01×`**）；動態無段縮放路徑才進 Slug。
 
 ### 3.2 字體與圖標 Atlas 架構（徹底根除 `v9` 每像素解析字型）
 1. **紋理分池 (`MTLStorageModePrivate`, `allowGPUOptimizedContents = YES`)**：
@@ -64,7 +67,7 @@
 
 | 領域 | 圖元數量邊界 | 最佳空間資料結構 | 硬體原因 |
 | :--- | :---: | :--- | :--- |
-| **2D / UI** | `< 50,000` quads / 幀 | **無需 CPU/Compute Binning，直接交給 TBDR 硬體 Tiler** | `20,000` quads @ 4K 只要 `4.8 ms`（常見 UI `2,000` quads 僅 `0.58 ms`）；Compute 自建 Tile Bin 在中等量級只會增加同步與緩衝開銷 |
+| **2D / UI** | `< 50,000` quads / 幀 | **Explicit Layer Key + 小範圍容器合批，其餘交給 TBDR 硬體 Tiler** | 對標實測 GPUI `BoundsTree`：隨機 UI `N=1,024` 可砍 Draw Call `3.5×` (`504 µs`)，但 **`overlap-4096` 病理會飆出 `21.19 ms` CPU 尖峰**；且預分 Opaque/Alpha 桶在 20k 混合矩形直接快 `1.42×`（見 [`06`](./06_gpui_component_benchmark.md)） |
 | **2D / UI 極端** | `> 50,000–100,000` 重疊實例 | **GPU Coarse Tile Prefix-Sum Binning (64×64 tile)** + Indirect Draw | 避免 Tiler Parameter Buffer 溢出、減少超密畫布逐元掃描 |
 | **3D 幾何** | 任意網格（取代高耗能全螢幕 SDF） | **SoA Vertex Streams + Meshlet (`≤64v / ≤126t`)** | Position Stream (`float3` / `snorm16x4`) 獨立一條緩衝，讓 Shadow / Depth Prepass 零浪費讀取 Normal/UV |
 | **3D 屬性壓縮** | 每頂點從 `48–64 B` 壓到 **`16–20 B`** | `Position` (`float3` 12B 或 `snorm16x4` 8B) + `OctNormal` (`snorm16x2` 4B) + `UV` (`half2` 4B) | 頂點提取頻寬砍半以上，完美契合 M1 68 GB/s DRAM 頻寬牆 |
