@@ -1,5 +1,6 @@
 CXX ?= clang++
 CXXFLAGS = -std=c++17 -ObjC++ -O3 -Wall -Wextra -fobjc-arc
+CXXFLAGS_CPP = -std=c++17 -O3 -Wall -Wextra
 FRAMEWORKS = -framework Metal -framework Foundation -framework QuartzCore
 
 BUILD_DIR = ../build
@@ -15,9 +16,12 @@ JSON_SVG = $(BUILD_DIR)/svg_ssot_results.json
 BIN_OBJ = $(BUILD_DIR)/object_ssot_bench
 JSON_OBJ = $(BUILD_DIR)/object_ssot_results.json
 
-.PHONY: all run run-gpui run-svg run-obj run-all clean
+BIN_FMT = $(BUILD_DIR)/format_ssot_bench
+JSON_FMT = $(BUILD_DIR)/format_info_results.json
 
-all: $(BIN_SILICON) $(BIN_GPUI) $(BIN_SVG) $(BIN_OBJ)
+.PHONY: all run run-gpui run-svg run-obj run-fmt run-all clean
+
+all: $(BIN_SILICON) $(BIN_GPUI) $(BIN_SVG) $(BIN_OBJ) $(BIN_FMT)
 
 $(BIN_SILICON): m1_silicon_probe.mm Makefile
 	@mkdir -p $(BUILD_DIR)
@@ -35,6 +39,10 @@ $(BIN_OBJ): object_ssot_bench.mm Makefile
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(FRAMEWORKS)
 
+$(BIN_FMT): format_ssot_bench.cpp Makefile
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS_CPP) $< -o $@
+
 run: $(BIN_SILICON)
 	$(BIN_SILICON) --json $(JSON_SILICON)
 
@@ -47,7 +55,10 @@ run-svg: $(BIN_SVG)
 run-obj: $(BIN_OBJ)
 	$(BIN_OBJ) --json $(JSON_OBJ)
 
-run-all: run run-gpui run-svg run-obj
+run-fmt: $(BIN_FMT) run_format_info_eval.py
+	python3 run_format_info_eval.py --bench-bin $(BIN_FMT) --out-json $(JSON_FMT)
+
+run-all: run run-gpui run-svg run-obj run-fmt
 
 clean:
 	rm -rf $(BUILD_DIR)

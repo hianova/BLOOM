@@ -36,8 +36,8 @@
 
 ```mermaid
 flowchart TB
-    L0["Layer 0: Renderer-Agnostic Host Adapter (可選對接 Games ge_host_if.h, 0-dep C17 / W3C SVG SSOT)"]
-    L1["Layer 1: Tri-Layer SVG-SSOT & Thin CPU Frontend (26–62 us)\nBlueprint[2] (<defs>/<use>/<style>/Flex) | NodeKey StateStore (零遺失熱重載) | O(dirty) Bind | VirtualList | WC Ring Pack"]
+    L0["Layer 0: Renderer-Agnostic Host Adapter (可選對接 Games ge_host_if.h; SVG/GLB 僅作 Build-Time 選配匯入器)"]
+    L1["Layer 1: Constraint-Native Binary SSOT Core (BOBC/BOBR, 6–15 us Init | Zero-Heap StateStore)\nImmutable Asset[2] (BOBC->BOBR/Private) | fnv1a64(id) Hot-Delta (126 B NCD) | VirtualList | WC Ring Pack"]
     L2["Layer 2: Metal / WebGPU Render Graph & Memory Core\nTriple-Buf WC Ring | Private MTLHeap + Fence | Memoryless Depth | Late nextDrawable"]
     L3["Layer 3: Short Specialized fp16 Shaders (Occupancy=1024)\nQuadHot_32B (Refetch20B) | R8Unorm Glyph_24B | Shadow_32B | Constraint 3D SSOT (Vtx12+State48 + Tight-Proxy)"]
 
@@ -53,12 +53,13 @@ flowchart TB
 1. **後端優先順序：Metal-First 原生管線 + WebGPU 同源佈局 — ✅ 已定案（選項 A）**
    - 核心 ABI 與 Shader 資料結構對齊 Apple M1 原生 Metal 最佳佈局（`32 B` `Refetch20B`、`Memoryless`、`Shared|WC`、`Private+Opt` Atlas、`MTLHeap`），同時全數使用 32-bit 原生友善型別（搭配 C++/MSL 雙側 `static_assert` 與純量欄位守則），讓 `gpui_wgpu`-style WebGPU storage buffer 後端可等價實作而不向最低公分母妥協。
 
-2. **CPU UI 前端定位：Tri-Layer W3C SVG-SSOT 融合架構 — ✅ 已定案（ok，內建 SVG-SSOT + 純原語 Painter C API）**
-   - [`07_svg_ssot_fusion.md`](./07_svg_ssot_fusion.md) 已完成實證：`Blueprint[2]`（含 `<defs>/<symbol>/<use>`、`<style>` 偽類、巢狀 Flex）+ `fnv1a64(id)` `StateStore`（`reconcile+relayout = 62.29 µs`）+ `WC Ring → Refetch20B TBDR`，兼保留極低階純原語 Painter C API，全面取代舊版 `16-node` 受限編譯器。
+2. **CPU UI / Asset 前端規格：Tri-Layer 架構保留，上層格式改採「3C 雙形態 Binary SSOT (`BOBC`+`BOBR`)，SVG 退位為選配匯入器」 — 💡 [`09_format_information_density.md`](./09_format_information_density.md) 實證更新**
+   - 雖然 [`07_svg_ssot_fusion.md`](./07_svg_ssot_fusion.md) 驗證了三層分離可讓 `.svg` 熱更新不遺失狀態（`62.29 µs`），但 [`09_format_information_density.md`](./09_format_information_density.md) 經 `../INFO` 實證後顯示：**獨立 2D SVG HUD 的真實資訊密度僅 `6.2%` (`0.500 bpb`, `25,286 B -> 1,591 B INF1`)，比二進位欄位 `BUIC` (`4,967 B -> 556 B INF1`) 多出 `2.86×` 真實 MDL 冗餘且慢 `17×–38×` 解碼**。
+   - **最新實證定案方向**：核心 Engine **Tri-Layer（不可變模板 + `fnv1a64(id)` `StateStore` + `WC Ring`）與純原語 Painter C API 不變**，但 SSOT 核心表現改為 **3C Binary (`BOBC`+`BOBR`)**，`.svg`/`.glb` 降至工具鏈選配匯入器（而非執行核心相容負擔）。
 
-3. **3D 主場景與物件本體：Constraint-Native Dual-Track 3D Object SSOT — 🔶 硬體層已實證，待定案語法層**
-   - [`08_object_ssot_3d.md`](./08_object_ssot_3d.md) 實證了比業界 `.glb` (`64B + 512B`) 更低維的新規格：**準確幾何只於 `init` 定格，Runtime 只傳 `48 B` 約束狀態變換**（M1 上比蒙皮管線 **快 `3.65×` GPU / 少 `10.7×` WC 頻寬**）；`ComputeCull+Indirect` (`0.419 ms`) 勝過 Metal 3 Object+Mesh (`0.812 ms`)；Track B `Tight-Proxy O(1)` (`0.376 ms`) 與硬體 `[[clip_distance]]` (`0.687 ms` vs `discard` `1.172 ms`) 合計在單一 CB 完成 **4K 3D+HUD 複合幀僅 `0.959 ms` (`1,042.5 fps`)**，對照舊版 v9 `257.10 ms` 提升 **`268×`**。
-   - **待與使用者繼續討論定案**：3D Object SSOT 規格文件要採 **方案 3A（`<bloom-obj>` 宣告式 XML，與 SVG 共用 `fnv1a64(id)` 熱更新管線）**、**方案 3B（SVG 內嵌 `<bloom-scene>`）**，還是 **方案 3C（`.bobj` 二進位 Header + Manifest）**？
+3. **3D 主場景與物件本體：Constraint-Native Dual-Track 3D Object SSOT (`3C` 推薦待最終確認) — ✅ 硬體與格式雙實證完成**
+   - [`08_object_ssot_3d.md`](./08_object_ssot_3d.md) 實證了比業界 `.glb` (`64B + 512B`) 更低維的新規格：**準確幾何只於 `init` 定格，Runtime 只傳 `48 B` 約束狀態變換**（M1 上比蒙皮管線 **快 `3.65×` GPU / 少 `10.7×` WC 頻寬**）；`ComputeCull+Indirect` (`0.419 ms`) 勝過 Metal 3 Object+Mesh (`0.812 ms`)；Track B `Tight-Proxy O(1)` (`0.376 ms`) 與硬體 `[[clip_distance]]` (`0.687 ms` vs `discard` `1.172 ms`) 合計在單一 CB 完成 **4K 3D+HUD 複合幀僅 `0.959 ms` (`1,042.5 fps`)**。
+   - [`09_format_information_density.md`](./09_format_information_density.md) 以 `../INFO` 完成 **3A vs 3B vs 3C vs GLB64** 真實資訊密度實測：`s3_stage [scene]` 上 **`3c_bobj_col` (`BOBC`) 僅 `23,100 B` / `INF1 8,292 B`**（比 `baseline_glb64` 小 `10.55×`/`2.96×`，比 `3A`/`3B` 小 `4.5×`/`2.00×`），搭配 **`3c_bobj_row` (`BOBR`) `6.2 us` 零解析映射 + `126.1 B` 最小熱編輯增量** 勝出。**待與使用者最終拍板：是否將 3C (`BOBC` Wire + `BOBR` Runtime) 鎖定為 BLOOM 2D+3D 統一 SSOT 唯一原生格式？**
 
 4. **文字渲染管線：CoreText / FreeType 點陣 Alpha Atlas (`R8Unorm`) — ✅ 已定案（Alpha）**
    - 主線採用 `R8Unorm` `Private+Opt` 點陣 Alpha Atlas，確保 Retina/4K 小字體銳利度與蘋果原生渲染一致性，字號縮放動畫則依需求快取適量級距；24 B `BloomGlyphInst` 在 4K `12k–15k` 字元下僅約 `0.21–0.67 ms` 整體幀預算。

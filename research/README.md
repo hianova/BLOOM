@@ -22,10 +22,12 @@ make -C /Users/kuangtalin/Documents/BLOOM/research/probes clean && make -C /User
 | **[`06_gpui_component_benchmark.md`](./06_gpui_component_benchmark.md)** | **`zed-main` GPUI 全元件實證對標**：6 大元件實測對決——**4K IDE+HUD 綜合幀 BLOOM `0.671 ms` (`1,491 fps`, `360 KB`) vs GPUI `1.274 ms` (`785 fps`, `1,677 KB`) 快 `1.90×`**；陰影快 `2.13×`；Atlas 圖示快 `5.0×` vs Slug；揭露 `BoundsTree overlap-4096` `21.19 ms` 病理與 Adopt/Beat/Skip 矩陣 |
 | **[`07_svg_ssot_fusion.md`](./07_svg_ssot_fusion.md)** | **SVG-SSOT 融合架構與 Git 法醫審計**：拆解 `v1→v2→v9` 成敗、實證 Tri-Layer (`Blueprint[2]` + `NodeKey` `StateStore` + `WC Ring` `TBDR`)——**`497` 節點 `.svg` 編譯 `778 µs`、熱重載完整保狀態 (`62.29 µs`)、1 萬列虛擬清單僅 `45 KB`、4K UI `1.087 ms` (`920 fps`) 比 `v9_compute_256` (`47.11 ms`) 快 `43.3×`** |
 | **[`08_object_ssot_3d.md`](./08_object_ssot_3d.md)** | **3D Constraint-Native Object SSOT 實測**：準確幾何只於 `init` 烘焙（`12 B/vtx`, `6.42×` 壓縮），Runtime 只傳 `48 B/obj` 約束狀態（**`3.65×` GPU / `10.7×` WC 勝過業界 `64B+512B` 蒙皮**）；**`ComputeCull+Indirect` (`0.419 ms`) 勝過 Metal 3 Object+Mesh (`0.812 ms`)**；Track B `Tight-Proxy O(1)` (`0.376 ms`) 與 `[[clip_distance]]` 單 CB 完成 **4K 3D+HUD 僅 `0.959 ms` (`1,042.5 fps`)** |
+| **[`09_format_information_density.md`](./09_format_information_density.md)** | **`../INFO` 格式資訊密度實測（3A vs 3B vs 3C vs SVG vs GLB64）**：以 `INFO eval-bpb` + `info_decomp` SHA-256 + `eval-mdl-group` + `ncd` 證實 **W3C SVG HUD 資訊密度僅 `6.2%` (`25,286 B -> 1,591 B INF1`)**；**`3c_bobj_col` (`BOBC`) 勝出（`s3 [scene] 23,100 B / INF1 8,292 B`；`hud 4,967 B / INF1 556 B`，比 XML/SVG 少 `2.0×–2.86×` MDL）**，搭配 `3c_bobj_row` (`BOBR`) 零解析 `6.2 us` 與 `126.1 B` 熱增量 |
 | **[`probes/m1_silicon_probe.mm`](./probes/m1_silicon_probe.mm)** | 原生 Metal 矽片物理探針（輸出 `build/m1_probe_results.json`） |
 | **[`probes/gpui_component_bench.mm`](./probes/gpui_component_bench.mm)** | `zed-main` GPUI vs BLOOM 元件對標探針（輸出 `build/gpui_bench_results.json`） |
 | **[`probes/svg_ssot_bench.mm`](./probes/svg_ssot_bench.mm)** | Tri-Layer SVG-SSOT 編譯、熱重載保狀態與 4K TBDR 對標探針（輸出 `build/svg_ssot_results.json`） |
 | **[`probes/object_ssot_bench.mm`](./probes/object_ssot_bench.mm)** | 3D Constraint-Native Object SSOT 壓縮、Cluster Cull (Compute vs Mesh Shader)、Tight-Proxy、剖切與 4K 合成探針（輸出 `build/object_ssot_results.json`） |
+| **[`probes/format_ssot_bench.cpp`](./probes/format_ssot_bench.cpp)** + **[`probes/run_format_info_eval.py`](./probes/run_format_info_eval.py)** | `3A / 3B / 3C (BOBR+BOBC) / GLB64 / 2D HUD` 128-bit bit-exact 編解碼與 `../INFO` MDL/NCD 資訊密度評測驅動（輸出 `build/format_info_results.json`） |
 
 ---
 
