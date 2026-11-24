@@ -9,9 +9,12 @@ JSON_SILICON = $(BUILD_DIR)/m1_probe_results.json
 BIN_GPUI = $(BUILD_DIR)/gpui_component_bench
 JSON_GPUI = $(BUILD_DIR)/gpui_bench_results.json
 
-.PHONY: all run run-gpui run-all clean
+BIN_SVG = $(BUILD_DIR)/svg_ssot_bench
+JSON_SVG = $(BUILD_DIR)/svg_ssot_results.json
 
-all: $(BIN_SILICON) $(BIN_GPUI)
+.PHONY: all run run-gpui run-svg run-all clean
+
+all: $(BIN_SILICON) $(BIN_GPUI) $(BIN_SVG)
 
 $(BIN_SILICON): m1_silicon_probe.mm Makefile
 	@mkdir -p $(BUILD_DIR)
@@ -21,13 +24,20 @@ $(BIN_GPUI): gpui_component_bench.mm Makefile
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(FRAMEWORKS)
 
+$(BIN_SVG): svg_ssot_bench.mm Makefile
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< -o $@ $(FRAMEWORKS)
+
 run: $(BIN_SILICON)
 	$(BIN_SILICON) --json $(JSON_SILICON)
 
 run-gpui: $(BIN_GPUI)
 	$(BIN_GPUI) --json $(JSON_GPUI)
 
-run-all: run run-gpui
+run-svg: $(BIN_SVG)
+	$(BIN_SVG) --json $(JSON_SVG)
+
+run-all: run run-gpui run-svg
 
 clean:
 	rm -rf $(BUILD_DIR)

@@ -36,8 +36,8 @@
 
 ```mermaid
 flowchart TB
-    L0["Layer 0: Renderer-Agnostic Host Adapter (可選對接 Games ge_host_if.h, 0-dep C17)"]
-    L1["Layer 1: Thin CPU Frontend (1–20 us/frame)\nLayout / Dirty-Diff / Font Atlas Shelf Alloc / State Sort / WC Ring Pack"]
+    L0["Layer 0: Renderer-Agnostic Host Adapter (可選對接 Games ge_host_if.h, 0-dep C17 / W3C SVG SSOT)"]
+    L1["Layer 1: Tri-Layer SVG-SSOT & Thin CPU Frontend (26–62 us)\nBlueprint[2] (<defs>/<use>/<style>/Flex) | NodeKey StateStore (零遺失熱重載) | O(dirty) Bind | VirtualList | WC Ring Pack"]
     L2["Layer 2: Metal / WebGPU Render Graph & Memory Core\nTriple-Buf WC Ring | Private MTLHeap + Fence | Memoryless Depth | Late nextDrawable"]
     L3["Layer 3: Short Specialized fp16 Shaders (Occupancy=1024)\nQuadHot_32B (Refetch20B) | Glyph_24B | Shadow_32B | Meshlet 3D | Half-Res FX"]
 
@@ -54,9 +54,9 @@ flowchart TB
    - **選項 A（建議優先驗證，並參考 `gpui_apple` + `gpui_wgpu` 雙後端切線）**：核心 ABI 與 Shader 資料結構設計先 **對齊 Apple M1 原生 Metal 最佳佈局**（`32 B` `Refetch20B`、`Memoryless`、`Shared|WC`、`Private+Opt` Atlas、`MTLHeap`），同時只用 32-bit 原生型別讓 WebGPU `gpui_wgpu`-style storage buffer 後端能等價實作（絕不為了抽象層妥協 `Private` / `Refetch20B` / `Memoryless` 或讓 WebGL 退路拖累主線）。
    - **選項 B**：全程先綁 `wgpu-native` / `SDL3-GPU` 單一抽象層（工程上較單純，但無法精細控制 `WriteCombined` / `Private+Opt` / `Memoryless` / 同 CB `Blit→Render`，且容易重蹈舊版轉譯降 Occupancy 的風險）。
 
-2. **CPU UI 前端定位：保留精簡 C17 Flexbox Core (`bloom_ui.c`, `2.18 µs`) vs 只做極低階 Immediate-Mode Painter？**
-   - `2.18 µs` 的無分配 C17 Flexbox/Pointer/Constraint 引擎已經極快、且完全獨立於舊 shader。
-   - **待決**：是否將乾淨版 C17 UI Layout 核心保留為 BLOOM Optional Layer 1，還是讓 BLOOM 只當純「GPUI-like 原語畫家（Scene Painter）」由上層自己算矩形座標？
+2. **CPU UI 前端定位：Tri-Layer W3C SVG-SSOT 融合架構 vs 只做極低階 Immediate-Mode Painter？**
+   - [`07_svg_ssot_fusion.md`](./07_svg_ssot_fusion.md) 已完成實證：透過把「不可變 `Blueprint[2]`（含 `<defs>/<symbol>/<use>`、`<style>` 偽類、巢狀 Flex）」與「依 `fnv1a64(id)` 對齊的 `StateStore`」及「`WC Ring → Refetch20B TBDR`」拆離，可保留瀏覽器可視化預覽與無狀態流失熱重載（`reconcile+relayout = 62.29 µs`），同時讓 4K `500`-節點介面鎖在 **`1.087 ms` (`920 fps`)**。
+   - **待決**：BLOOM Layer 1 是否直接內建此零堆積 Tri-Layer W3C SVG-SSOT 前端（兼保留純原語 Painter C API），取代舊版 `16-node` 受限編譯器與無 XML Auto-Bento？
 
 3. **3D 主場景管線：純硬體 Triangle/Meshlet 光柵化 vs「硬體光柵主 pass + 選擇性半解析度 SDF/GI 特效」？**
    - M1 上硬體光柵輕鬆穩住 4K/1080p 120 FPS；全螢幕 4K SDF raymarch 要 `257 ms`。

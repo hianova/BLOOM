@@ -20,8 +20,10 @@ make -C /Users/kuangtalin/Documents/BLOOM/research/probes clean && make -C /User
 | **[`04_transfer_and_pipeline_order.md`](./04_transfer_and_pipeline_order.md)** | **傳輸與管線排序**：Triple-Buffer (`154.7 µs/f`, CPU `21.5 µs`)、Apple TBDR HSR 與 **`discard_fragment()` 摧毀 HSR 實測 (`4.36 ms → 68.13 ms`, 暴慢 `15.8×`)**、同 CB 2 MB SLC 接力 vs 24 MB 溢位 DRAM (`1.018 → 2.156 ms`, `SplitCB` 再多損失 `+0.28–0.44 ms`) |
 | **[`05_architecture_synthesis.md`](./05_architecture_synthesis.md)** | **BLOOM vNext 藍圖與討論題**：7 條硬體鐵律 (CI Gates)、4 層零耦合結構、**5 項開放架構決策**準備討論 |
 | **[`06_gpui_component_benchmark.md`](./06_gpui_component_benchmark.md)** | **`zed-main` GPUI 全元件實證對標**：6 大元件實測對決——**4K IDE+HUD 綜合幀 BLOOM `0.671 ms` (`1,491 fps`, `360 KB`) vs GPUI `1.274 ms` (`785 fps`, `1,677 KB`) 快 `1.90×`**；陰影快 `2.13×`；Atlas 圖示快 `5.0×` vs Slug；揭露 `BoundsTree overlap-4096` `21.19 ms` 病理與 Adopt/Beat/Skip 矩陣 |
+| **[`07_svg_ssot_fusion.md`](./07_svg_ssot_fusion.md)** | **SVG-SSOT 融合架構與 Git 法醫審計**：拆解 `v1→v2→v9` 成敗、實證 Tri-Layer (`Blueprint[2]` + `NodeKey` `StateStore` + `WC Ring` `TBDR`)——**`497` 節點 `.svg` 編譯 `778 µs`、熱重載完整保狀態 (`62.29 µs`)、1 萬列虛擬清單僅 `45 KB`、4K UI `1.087 ms` (`920 fps`) 比 `v9_compute_256` (`47.11 ms`) 快 `43.3×`** |
 | **[`probes/m1_silicon_probe.mm`](./probes/m1_silicon_probe.mm)** | 原生 Metal 矽片物理探針（輸出 `build/m1_probe_results.json`） |
 | **[`probes/gpui_component_bench.mm`](./probes/gpui_component_bench.mm)** | `zed-main` GPUI vs BLOOM 元件對標探針（輸出 `build/gpui_bench_results.json`） |
+| **[`probes/svg_ssot_bench.mm`](./probes/svg_ssot_bench.mm)** | Tri-Layer SVG-SSOT 編譯、熱重載保狀態與 4K TBDR 對標探針（輸出 `build/svg_ssot_results.json`） |
 
 ---
 
