@@ -237,6 +237,9 @@ bool bloom_gpu_node_dst(BloomGpuCtx *ctx,
 /* Dispatches GPU compute if !BLOOM_FLAG_IDLE_SLEEP or force_render == true */
 bool bloom_gpu_render(BloomGpuCtx *ctx, bool force_render);
 
+/* Waits for all in-flight asynchronous render frames to finish */
+bool bloom_gpu_flush(BloomGpuCtx *ctx);
+
 /* Downloads the latest RGBA8 GPU texture, computes FNV-1a hash + non-black pixel count,
  * and optionally writes binary P6 PPM when ppm_path is non-NULL and non-empty */
 bool bloom_gpu_write_ppm(const BloomGpuCtx *ctx,

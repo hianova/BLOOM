@@ -320,6 +320,58 @@ static int run_probe(uint64_t *out_digest) {
               unsat >= 1U);
         mix_bytes(gnodes, sizeof(gnodes));
         mix_u64((uint64_t)(uint32_t)bloom_ui_eval_glass_transmittance_q16(0x20D8FFU, 16384));
+
+        /* 2b. Generic Agent-Native UI SDK (Snapshot, Query, Guarded Act, Modal Trap, Roving Focus, JSON) */
+        static BloomEngineArena ui_arena;
+        bloom_arena_init_default(&ui_arena, 640U, 360U);
+        BloomUiNode64 *unds = ui_arena.map.ui_nodes;
+        memset(unds, 0, sizeof(ui_arena.map.ui_nodes));
+        for (uint32_t i = 0U; i < 4U; ++i) {
+            unds[i].node_id = i + 1U;
+            unds[i].prim_type = BLOOM_UI_PRIM_RECT_GLASS;
+            unds[i].bind_channel = i;
+            unds[i].half_w_q16 = 8000;
+            unds[i].half_h_q16 = 3000;
+            unds[i].scale_jet_v_q16 = BLOOM_Q16_ONE;
+            unds[i].style_and_state = BLOOM_UI_STATE_GLASS_BIT | (0x20D8FFU << 8U);
+            unds[i].action_opcode = (BLOOM_ACTION_CUSTOM_BASE + i) | BLOOM_UI_CAP_FOCUSABLE;
+            ui_arena.map.dom.dom_mask_lo32 |= 1U;
+        }
+        unds[0].action_opcode |= BLOOM_UI_CAP_TOGGLE;
+        unds[1].action_opcode |= BLOOM_UI_CAP_DISABLED;
+        unds[2].action_opcode |= BLOOM_UI_CAP_AGENT_GUARD;
+        ui_arena.map.frame_hdr.ui_count = 4U;
+        bloom_ui_set_node_label(&ui_arena, 0U, "ACT0");
+        bloom_ui_set_node_label(&ui_arena, 2U, "GRD2");
+
+        BloomUiActRequest ureq;
+        BloomUiActResult ures;
+        memset(&ureq, 0, sizeof(ureq));
+        ureq.source = BLOOM_UI_SRC_AGENT;
+        ureq.act_kind = BLOOM_UI_ACT_ROVE_NEXT;
+        CHECK(bloom_ui_agent_act(&ui_arena, &ureq, &ures) == BLOOM_UI_STATUS_OK && ures.focused_node_id == 1U);
+        CHECK(bloom_ui_agent_act(&ui_arena, &ureq, &ures) == BLOOM_UI_STATUS_OK && ures.focused_node_id == 3U);
+
+        ureq.node_id = 2U;
+        ureq.act_kind = BLOOM_UI_ACT_CLICK;
+        CHECK(bloom_ui_agent_act(&ui_arena, &ureq, &ures) == BLOOM_UI_STATUS_DISABLED);
+        ureq.node_id = 3U;
+        CHECK(bloom_ui_agent_act(&ui_arena, &ureq, &ures) == BLOOM_UI_STATUS_VETOED_GUARD);
+        ureq.allow_guarded = true;
+        CHECK(bloom_ui_agent_act(&ui_arena, &ureq, &ures) == BLOOM_UI_STATUS_OK);
+
+        bloom_ui_set_node_caps(&unds[3], BLOOM_UI_CAP_MODAL, 0U);
+        ureq.node_id = 1U;
+        ureq.act_kind = BLOOM_UI_ACT_CLICK;
+        CHECK(bloom_ui_agent_act(&ui_arena, &ureq, &ures) == BLOOM_UI_STATUS_MODAL_TRAP);
+        bloom_ui_set_node_caps(&unds[3], 0U, BLOOM_UI_CAP_MODAL);
+
+        BloomUiSnapshot usnap;
+        static char ujson[2048];
+        CHECK(bloom_ui_snapshot_arena(&ui_arena, &usnap));
+        size_t ujn = bloom_ui_snapshot_to_json(&usnap, ujson, sizeof(ujson));
+        CHECK(ujn > 20U && ujson[0] == '{');
+        mix_bytes(ujson, ujn);
     }
 
     /* 3. Arena Init, Prefabs, Swept-CCD, Modal DSP, Gameplay Shells, Rewind & FLOW v9.0.0 Gates */
@@ -544,6 +596,7 @@ def check_static_purity(obj_path: Path) -> bool:
 
 def compile_clean_objects(cc: str, tmp_dir: Path) -> Dict[str, Path]:
     srcs = {
+        "wire": ROOT / "src" / "bloom_wire.c",
         "scene": ROOT / "src" / "bloom_scene.c",
         "ui": ROOT / "src" / "bloom_ui.c",
         "prefab": ROOT / "src" / "bloom_prefab.c",
@@ -761,6 +814,34 @@ def build_ui_mutants() -> List[FlowMutant]:
             "    ime->ime_active = 1U;\n"
             "    ime->committed_count++;",
         ),
+        FlowMutant(
+            "U13_agent_guard_bypass",
+            "ui_agent_sdk",
+            "        } else if ((nd->action_opcode & BLOOM_UI_CAP_AGENT_GUARD) != 0U &&\n"
+            "                   !req->allow_guarded &&\n"
+            "                   req->guard_verdict != BLOOM_UI_GUARD_ALLOW) {\n"
+            "            allowed = false;",
+            "        } else if ((nd->action_opcode & BLOOM_UI_CAP_AGENT_GUARD) != 0U &&\n"
+            "                   false &&\n"
+            "                   req->guard_verdict != BLOOM_UI_GUARD_ALLOW) {\n"
+            "            allowed = false;",
+        ),
+        FlowMutant(
+            "U14_modal_trap_bypass",
+            "ui_agent_sdk",
+            "    if (modal_active && (nd->action_opcode & BLOOM_UI_CAP_MODAL) == 0U) {\n"
+            "        return ui_finish_act_status(arena, dom, out_res, BLOOM_UI_STATUS_MODAL_TRAP, target_nid,",
+            "    if (false && modal_active && (nd->action_opcode & BLOOM_UI_CAP_MODAL) == 0U) {\n"
+            "        return ui_finish_act_status(arena, dom, out_res, BLOOM_UI_STATUS_MODAL_TRAP, target_nid,",
+        ),
+        FlowMutant(
+            "U15_disabled_act_bypass",
+            "ui_agent_sdk",
+            "    if ((nd->action_opcode & BLOOM_UI_CAP_DISABLED) != 0U) {\n"
+            "        return ui_finish_act_status(arena, dom, out_res, BLOOM_UI_STATUS_DISABLED, target_nid,",
+            "    if (false && (nd->action_opcode & BLOOM_UI_CAP_DISABLED) != 0U) {\n"
+            "        return ui_finish_act_status(arena, dom, out_res, BLOOM_UI_STATUS_DISABLED, target_nid,",
+        ),
     ]
 
 
@@ -889,6 +970,7 @@ def main() -> int:
                 "-isystem",
                 str(FLOW_DIR / "sdk"),
                 str(probe_c),
+                str(clean_objs["wire"]),
                 str(clean_objs["scene"]),
                 str(clean_objs["ui"]),
                 str(clean_objs["prefab"]),
@@ -907,9 +989,9 @@ def main() -> int:
         print(f"  golden_baseline_digest : 0x{golden_digest}")
 
         suites = [
-            ("bloom_scene.c", ROOT / "src" / "bloom_scene.c", [str(clean_objs["ui"]), str(clean_objs["prefab"])], build_scene_mutants()),
-            ("bloom_ui.c", ROOT / "src" / "bloom_ui.c", [str(clean_objs["scene"]), str(clean_objs["prefab"])], build_ui_mutants()),
-            ("bloom_prefab.c", ROOT / "src" / "bloom_prefab.c", [str(clean_objs["scene"]), str(clean_objs["ui"])], build_prefab_mutants()),
+            ("bloom_scene.c", ROOT / "src" / "bloom_scene.c", [str(clean_objs["wire"]), str(clean_objs["ui"]), str(clean_objs["prefab"])], build_scene_mutants()),
+            ("bloom_ui.c", ROOT / "src" / "bloom_ui.c", [str(clean_objs["wire"]), str(clean_objs["scene"]), str(clean_objs["prefab"])], build_ui_mutants()),
+            ("bloom_prefab.c", ROOT / "src" / "bloom_prefab.c", [str(clean_objs["wire"]), str(clean_objs["scene"]), str(clean_objs["ui"])], build_prefab_mutants()),
         ]
 
         overall_rc = 0

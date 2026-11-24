@@ -21,6 +21,8 @@ struct Cell64 {
 @group(0) @binding(1) var<storage, read> mesh_buf : array<Cell64, 512>;
 @group(1) @binding(0) var out_tex : texture_storage_2d<rgba8unorm, write>;
 @group(1) @binding(1) var<storage, read_write> rc_buf : array<vec4<f32>, 32768>;
+@group(1) @binding(2) var<storage, read_write> slice_buf : array<vec4<f32>, 524288>;
+@group(1) @binding(3) var<storage, read_write> scene_hdr : array<u32, 8388608>;
 
 // ----------------------------------------------------------------------------
 // 0. Fixed-Point, Bitfield & Vector Algebra Helpers
@@ -127,6 +129,75 @@ fn aces_tonemap(x : vec3<f32>) -> vec3<f32> {
 // 1. 3D CSG, BVH, DQ-Skeleton, 4-Bit SDF Bricks & Triangle Mesh Kernel
 // ----------------------------------------------------------------------------
 
+struct RayCull {
+    t_enter   : f32,
+    t_exit    : f32,
+    inst_mask : u32,
+    feat_mask : u32,
+};
+
+fn intersect_aabb(ro : vec3<f32>, rd : vec3<f32>, bmin : vec3<f32>, bmax : vec3<f32>) -> vec2<f32> {
+    let safe_rd = vec3<f32>(
+        select(rd.x, select(-1e-6, 1e-6, rd.x >= 0.0), abs(rd.x) < 1e-6),
+        select(rd.y, select(-1e-6, 1e-6, rd.y >= 0.0), abs(rd.y) < 1e-6),
+        select(rd.z, select(-1e-6, 1e-6, rd.z >= 0.0), abs(rd.z) < 1e-6)
+    );
+    let inv_d = 1.0 / safe_rd;
+    let t0 = (bmin - ro) * inv_d;
+    let t1 = (bmax - ro) * inv_d;
+    let tmin = min(t0, t1);
+    let tmax = max(t0, t1);
+    let t_enter = max(tmin.x, max(tmin.y, tmin.z));
+    let t_exit  = min(tmax.x, min(tmax.y, tmax.z));
+    return vec2<f32>(t_enter, t_exit);
+}
+
+fn prim_aabb_half(prim_type : u32, e : vec3<f32>, bevel : f32) -> vec3<f32> {
+    if (prim_type == 1u) { return vec3<f32>(e.x); }
+    if (prim_type == 2u) { return vec3<f32>(e.x + e.y, e.y, e.x + e.y); }
+    if (prim_type == 3u) { return e; }
+    if (prim_type == 4u) { return vec3<f32>(e.x); }
+    if (prim_type == 5u) { return vec3<f32>(e.x + bevel, e.y + bevel, e.x + bevel); }
+    if (prim_type == 6u) { return vec3<f32>(e.x, e.y + e.x, e.x); }
+    return vec3<f32>(0.0);
+}
+
+fn dq_joint_endpoints(j : Cell64) -> mat2x3<f32> {
+    let blen = clamp(q16_to_f32(j.q2.z), -1024.0, 1024.0);
+    let u  = vec3<f32>(q16_to_f32(j.q0.w), q16_to_f32(j.q1.x), q16_to_f32(j.q1.y));
+    let qw = q16_to_f32(j.q0.z);
+    let dw = q16_to_f32(j.q1.z);
+    let dv = vec3<f32>(q16_to_f32(j.q1.w), q16_to_f32(j.q2.x), q16_to_f32(j.q2.y));
+    let a = 2.0 * (-dw * u + qw * dv - cross(dv, u));
+    let ba = vec3<f32>(
+        2.0 * blen * (u.x * u.y - qw * u.z),
+        blen * (1.0 - 2.0 * (u.x * u.x + u.z * u.z)),
+        2.0 * blen * (u.y * u.z + qw * u.x)
+    );
+    return mat2x3<f32>(a, ba);
+}
+
+fn ray_sphere_interval(ro : vec3<f32>, rd : vec3<f32>, center : vec3<f32>, r : f32) -> vec2<f32> {
+    let oc = center - ro;
+    let proj = dot(oc, rd);
+    let d2 = dot(oc, oc) - proj * proj;
+    let r2 = r * r;
+    if (d2 > r2) {
+        return vec2<f32>(1e9, -1e9);
+    }
+    let hc = sqrt(max(r2 - d2, 0.0));
+    return vec2<f32>(proj - hc, proj + hc);
+}
+
+fn prim_bound_r(prim_type : u32, e : vec3<f32>, bev : f32) -> f32 {
+    if (prim_type == 1u || prim_type == 4u) { return e.x + 0.02; }
+    if (prim_type == 2u) { return e.x + e.y + 0.02; }
+    if (prim_type == 3u) { return length(e) + 0.02; }
+    if (prim_type == 5u) { return length(vec2<f32>(e.x, e.y)) + bev + 0.02; }
+    if (prim_type == 6u) { return e.x + e.y + 0.02; }
+    return 0.0;
+}
+
 fn smin_poly(a : f32, b : f32, k : f32) -> f32 {
     if (k <= 1e-4) { return min(a, b); }
     let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
@@ -134,6 +205,7 @@ fn smin_poly(a : f32, b : f32, k : f32) -> f32 {
 }
 
 fn rot_inv_euler(v : vec3<f32>, rot : vec3<f32>) -> vec3<f32> {
+    if (rot.x == 0.0 && rot.y == 0.0 && rot.z == 0.0) { return v; }
     if (abs(rot.x) + abs(rot.y) + abs(rot.z) < 1e-5) {
         return v;
     }
@@ -183,6 +255,41 @@ fn eval_csg_single(op : Cell64, p : vec3<f32>) -> f32 {
     return sd_prim(prim_t, p - pos, ext, bev);
 }
 
+fn eval_csg_program_masked(start_idx : u32, cnt : u32, p : vec3<f32>, csg_mask : u32) -> vec2<f32> {
+    let lim = min(cnt, 32u - min(start_idx, 32u));
+    if (csg_mask == 0xFFFFFFFFu || lim > 16u) {
+        return eval_csg_program(start_idx, cnt, p);
+    }
+    var m = csg_mask & ((1u << lim) - 1u);
+    var d_acc : f32 = 1e5;
+    var mat : u32 = 0u;
+    var first = true;
+    while (m != 0u) {
+        let i = countTrailingZeros(m);
+        m = m & (m - 1u);
+        let op = arena[72u + start_idx + i];
+        let d = eval_csg_single(op, p);
+        if (first) {
+            d_acc = d;
+            mat = op.q0.w;
+            first = false;
+            continue;
+        }
+        let bop = op.q0.z;
+        if (bop == 3u) {
+            let sm = smin_poly(d_acc, d, max(q16_to_f32(op.q2.z), 0.0));
+            if (d < d_acc) { mat = op.q0.w; }
+            d_acc = sm;
+        } else {
+            if (d < d_acc) {
+                d_acc = d;
+                mat = op.q0.w;
+            }
+        }
+    }
+    return vec2<f32>(d_acc, f32(mat));
+}
+
 fn eval_csg_program(start_idx : u32, cnt : u32, p : vec3<f32>) -> vec2<f32> {
     var d_acc : f32 = 1e5;
     var mat : u32 = 0u;
@@ -217,6 +324,14 @@ fn eval_csg_program(start_idx : u32, cnt : u32, p : vec3<f32>) -> vec2<f32> {
     return vec2<f32>(d_acc, f32(mat));
 }
 
+fn dq_trans_only(j : Cell64) -> vec3<f32> {
+    let u  = vec3<f32>(q16_to_f32(j.q0.w), q16_to_f32(j.q1.x), q16_to_f32(j.q1.y));
+    let qw = q16_to_f32(j.q0.z);
+    let dw = q16_to_f32(j.q1.z);
+    let dv = vec3<f32>(q16_to_f32(j.q1.w), q16_to_f32(j.q2.x), q16_to_f32(j.q2.y));
+    return 2.0 * (-dw * u + qw * dv - cross(dv, u));
+}
+
 fn dq_transform(j : Cell64, pt : vec3<f32>) -> vec3<f32> {
     let u  = vec3<f32>(q16_to_f32(j.q0.w), q16_to_f32(j.q1.x), q16_to_f32(j.q1.y));
     let qw = q16_to_f32(j.q0.z);
@@ -227,23 +342,26 @@ fn dq_transform(j : Cell64, pt : vec3<f32>) -> vec3<f32> {
     return p_rot + trans;
 }
 
-fn eval_skeleton_sdf(p : vec3<f32>, joint_cnt : u32) -> vec2<f32> {
+fn eval_skeleton_sdf_masked(p : vec3<f32>, joint_cnt : u32, joint_mask : u32) -> vec2<f32> {
     let n = min(joint_cnt, 8u);
+    var jm = joint_mask & ((1u << n) - 1u);
     var d_acc : f32 = 1e5;
     var best_mat : u32 = 0u;
-    for (var i : u32 = 0u; i < n; i = i + 1u) {
+    var first = true;
+    while (jm != 0u) {
+        let i = countTrailingZeros(jm);
+        jm = jm & (jm - 1u);
         let j = arena[136u + i];
-        let blen = clamp(q16_to_f32(j.q2.z), -1024.0, 1024.0);
-        let a = dq_transform(j, vec3<f32>(0.0));
-        let b = dq_transform(j, vec3<f32>(0.0, blen, 0.0));
-        let pa = p - a;
-        let ba = b - a;
+        let ep = dq_joint_endpoints(j);
+        let pa = p - ep[0];
+        let ba = ep[1];
         let baba = dot(ba, ba);
         let h = select(0.0, clamp(dot(pa, ba) / max(baba, 1e-8), 0.0, 1.0), baba > 1e-8);
         let d_cap = length(pa - ba * h) - q16_to_f32(j.q2.w);
-        if (i == 0u) {
+        if (first) {
             d_acc = d_cap;
             best_mat = j.q3.y;
+            first = false;
         } else {
             let sm = smin_poly(d_acc, d_cap, max(q16_to_f32(j.q3.x), 0.0));
             if (d_cap < d_acc) { best_mat = j.q3.y; }
@@ -251,6 +369,10 @@ fn eval_skeleton_sdf(p : vec3<f32>, joint_cnt : u32) -> vec2<f32> {
         }
     }
     return vec2<f32>(d_acc, f32(best_mat));
+}
+
+fn eval_skeleton_sdf(p : vec3<f32>, joint_cnt : u32) -> vec2<f32> {
+    return eval_skeleton_sdf_masked(p, joint_cnt, 0xFFu);
 }
 
 fn brick_voxel(b : Cell64, x : u32, y : u32, z : u32, step_f : f32) -> f32 {
@@ -366,7 +488,7 @@ fn eval_mesh_bvh_sdf(p : vec3<f32>, tri_cnt : u32, bvh_cnt : u32, solid_mode : b
     let tcnt = min(tri_cnt, 256u);
     let ncnt = min(bvh_cnt, 256u);
 
-    var stack : array<u32, 48>;
+    var stack : array<u32, 24>;
     var sp : u32 = 0u;
     stack[0] = 0u;
     sp = 1u;
@@ -404,11 +526,11 @@ fn eval_mesh_bvh_sdf(p : vec3<f32>, tri_cnt : u32, bvh_cnt : u32, solid_mode : b
             let dl = select(best_ud, aabb_lb(mesh_buf[256u + l], p), l > nid && l < ncnt);
             let dr = select(best_ud, aabb_lb(mesh_buf[256u + r], p), r > nid && r < ncnt);
             if (dl < dr) {
-                if (dr < best_ud && sp < 48u) { stack[sp] = r; sp = sp + 1u; }
-                if (dl < best_ud && sp < 48u) { stack[sp] = l; sp = sp + 1u; }
+                if (dr < best_ud && sp < 24u) { stack[sp] = r; sp = sp + 1u; }
+                if (dl < best_ud && sp < 24u) { stack[sp] = l; sp = sp + 1u; }
             } else {
-                if (dl < best_ud && sp < 48u) { stack[sp] = l; sp = sp + 1u; }
-                if (dr < best_ud && sp < 48u) { stack[sp] = r; sp = sp + 1u; }
+                if (dl < best_ud && sp < 24u) { stack[sp] = l; sp = sp + 1u; }
+                if (dr < best_ud && sp < 24u) { stack[sp] = r; sp = sp + 1u; }
             }
         }
     }
@@ -421,14 +543,13 @@ fn eval_mesh_bvh_sdf(p : vec3<f32>, tri_cnt : u32, bvh_cnt : u32, solid_mode : b
         let ry = p.y + (3.0 / 65536.0);
         let rz = p.z + (5.0 / 65536.0);
         var parity : u32 = 0u;
-        var rstack : array<u32, 48>;
         var rsp : u32 = 1u;
-        rstack[0] = 0u;
+        stack[0] = 0u;
         var rvis : u32 = 0u;
         for (var it : u32 = 0u; it < 280u; it = it + 1u) {
             if (rsp == 0u || rvis >= (ncnt * 2u)) { break; }
             rsp = rsp - 1u;
-            let nid = rstack[rsp];
+            let nid = stack[rsp];
             if (nid >= ncnt) { continue; }
             rvis = rvis + 1u;
             let nd = mesh_buf[256u + nid];
@@ -448,8 +569,8 @@ fn eval_mesh_bvh_sdf(p : vec3<f32>, tri_cnt : u32, bvh_cnt : u32, solid_mode : b
             } else {
                 let l = nd.q0.y;
                 let r = nd.q0.z;
-                if (r > nid && r < ncnt && rsp < 48u) { rstack[rsp] = r; rsp = rsp + 1u; }
-                if (l > nid && l < ncnt && rsp < 48u) { rstack[rsp] = l; rsp = rsp + 1u; }
+                if (r > nid && r < ncnt && rsp < 24u) { stack[rsp] = r; rsp = rsp + 1u; }
+                if (l > nid && l < ncnt && rsp < 24u) { stack[rsp] = l; rsp = rsp + 1u; }
             }
         }
         if (parity != 0u) {
@@ -534,12 +655,408 @@ struct SceneHit {
     local_p      : vec3<f32>,
 };
 
-fn map_scene_raw_best(p : vec3<f32>) -> f32 {
+fn all_inst_mask() -> u32 {
+    let cnt = min(arena[0].q1.z, 32u);
+    if (cnt == 0u) { return 0u; }
+    if (cnt >= 32u) { return 0xFFFFFFFFu; }
+    return (1u << cnt) - 1u;
+}
+
+fn inst_world_bound_r(pf : Cell64, sc : f32, p_ovr : f32) -> f32 {
+    var local_r = max(q16_to_f32(pf.q1.x), 0.0);
+    let csg_cnt = pf.q3.x;
+    if (csg_cnt > 0u) {
+        let csg_start = pf.q2.w;
+        if (csg_start + csg_cnt <= 32u) {
+            let clim = min(csg_cnt, 32u - csg_start);
+            for (var k : u32 = 0u; k < clim; k = k + 1u) {
+                let c = arena[72u + csg_start + k];
+                if (c.q0.y != 0u) {
+                    let pos_c = vec3<f32>(q16_to_f32(c.q1.x), q16_to_f32(c.q1.y), q16_to_f32(c.q1.z));
+                    let ext_c = vec3<f32>(q16_to_f32(c.q1.w), q16_to_f32(c.q2.x), q16_to_f32(c.q2.y));
+                    let bev_c = max(q16_to_f32(c.q2.w), 0.0);
+                    let smk_c = max(q16_to_f32(c.q2.z), 0.0);
+                    local_r = max(local_r, length(pos_c) + prim_bound_r(c.q0.y, ext_c, bev_c) + smk_c * 0.25);
+                }
+            }
+            return local_r * sc;
+        }
+    }
+    let mask = pf.q0.w;
+    let prim1 = mask & 0xFu;
+    let prim2 = (mask >> 4u) & 0xFu;
+    let bop   = (mask >> 8u) & 0xFu;
+    let p0 = clamp(q16_to_f32(pf.q1.y) + p_ovr, 0.0625, 8.0);
+    let p1 = q16_to_f32(pf.q1.z);
+    let p2 = q16_to_f32(pf.q1.w);
+    let e1 = vec3<f32>(p0, clamp(select(p0, p1, p1 > 0.0), 0.0625, 8.0), clamp(select(p0, p2, p2 > 0.0), 0.0625, 8.0));
+    local_r = max(local_r, prim_bound_r(prim1, e1, 0.03125));
+    if (prim2 != 0u && bop != 1u && bop != 2u) {
+        let p3 = clamp(q16_to_f32(pf.q2.x), 0.0625, 8.0);
+        let p4 = q16_to_f32(pf.q2.y);
+        let e2 = vec3<f32>(p3, clamp(select(p3, p4, p4 > 0.0), 0.0625, 8.0), p3);
+        local_r = max(local_r, prim_bound_r(prim2, e2, 0.015625));
+    }
+    return local_r * sc;
+}
+
+fn compute_ray_cull(ro : vec3<f32>, rd : vec3<f32>, t_min : f32, t_max : f32, pad : f32) -> RayCull {
+    var res : RayCull;
+    res.t_enter   = t_max;
+    res.t_exit    = t_min;
+    res.inst_mask = 0u;
+    res.feat_mask = 0u;
+
     let inst_cnt = min(arena[0].q1.z, 32u);
+    for (var i : u32 = 0u; i < inst_cnt; i = i + 1u) {
+        let inst = arena[40u + i];
+        let flags = (inst.q3.x >> 16u) & 0xFFFFu;
+        if ((flags & 1u) == 0u) { continue; }
+        let pid = inst.q0.y;
+        if (pid == 0u || pid > 16u) { continue; }
+        let pf = arena[24u + (pid - 1u)];
+        let pos = vec3<f32>(q16_to_f32(inst.q1.x), q16_to_f32(inst.q1.y), q16_to_f32(inst.q1.z));
+        let raw_sc = q16_to_f32(inst.q2.z);
+        let sc = select(1.0, clamp(raw_sc, 0.0625, 256.0), raw_sc > 0.0625);
+        let p_ovr = q16_to_f32(inst.q3.z);
+        let r = inst_world_bound_r(pf, sc, p_ovr) + pad;
+        let iv = ray_sphere_interval(ro, rd, pos, r);
+        if (iv.y >= t_min && iv.x <= t_max) {
+            res.inst_mask = res.inst_mask | (1u << i);
+            res.t_enter = min(res.t_enter, max(t_min, iv.x));
+            res.t_exit  = max(res.t_exit,  min(t_max, iv.y));
+        }
+    }
+
+    let sec = arena[254];
+    let gcsg_cnt = (sec.q3.x >> 16u) & 0xFFFFu;
+    if (gcsg_cnt > 0u) {
+        let gcsg_start = sec.q3.x & 0xFFFFu;
+        if (gcsg_start + gcsg_cnt <= 32u) {
+            let lim = min(gcsg_cnt, 32u - gcsg_start);
+            var has_non_union = (lim > 16u);
+            var cmask : u32 = 0u;
+            for (var k : u32 = 0u; k < lim; k = k + 1u) {
+                let op = arena[72u + gcsg_start + k];
+                if (k > 0u && (op.q0.z == 1u || op.q0.z == 2u)) {
+                    has_non_union = true;
+                }
+                if (op.q0.y != 0u && (k == 0u || op.q0.z != 1u)) {
+                    let op_pos = vec3<f32>(q16_to_f32(op.q1.x), q16_to_f32(op.q1.y), q16_to_f32(op.q1.z));
+                    let op_ext = vec3<f32>(q16_to_f32(op.q1.w), q16_to_f32(op.q2.x), q16_to_f32(op.q2.y));
+                    let bev = max(q16_to_f32(op.q2.w), 0.0);
+                    let smk = max(q16_to_f32(op.q2.z), 0.0);
+                    let half_b = prim_aabb_half(op.q0.y, op_ext, bev) + vec3<f32>(smk + pad);
+                    let iv = intersect_aabb(ro, rd, op_pos - half_b, op_pos + half_b);
+                    if (iv.y >= max(t_min, iv.x) && iv.x <= t_max) {
+                        res.feat_mask = res.feat_mask | 1u;
+                        if (k < 16u) { cmask = cmask | (1u << k); }
+                        res.t_enter = min(res.t_enter, max(t_min, iv.x));
+                        res.t_exit  = max(res.t_exit,  min(t_max, iv.y));
+                    }
+                }
+            }
+            if ((res.feat_mask & 1u) != 0u) {
+                if (has_non_union) {
+                    res.feat_mask = res.feat_mask | 0xFFFF0080u;
+                } else {
+                    res.feat_mask = res.feat_mask | (cmask << 16u);
+                }
+            }
+        }
+    }
+
+    let jcnt = min(sec.q0.z & 0xFFFFu, 8u);
+    for (var j_i : u32 = 0u; j_i < jcnt; j_i = j_i + 1u) {
+        let j = arena[136u + j_i];
+        let ep = dq_joint_endpoints(j);
+        let a = ep[0];
+        let b = a + ep[1];
+        let rad = q16_to_f32(j.q2.w);
+        let smk = max(q16_to_f32(j.q3.x), 0.0);
+        let r_pad = vec3<f32>(rad + smk + pad);
+        let iv = intersect_aabb(ro, rd, min(a, b) - r_pad, max(a, b) + r_pad);
+        if (iv.y >= max(t_min, iv.x) && iv.x <= t_max) {
+            res.feat_mask = res.feat_mask | 2u | (1u << (8u + j_i));
+            res.t_enter = min(res.t_enter, max(t_min, iv.x));
+            res.t_exit  = max(res.t_exit,  min(t_max, iv.y));
+        }
+    }
+
+    let bcnt = min((sec.q0.z >> 16u) & 0xFFFFu, 8u);
+    for (var bi : u32 = 0u; bi < bcnt; bi = bi + 1u) {
+        let b = arena[144u + bi];
+        let step_f = q16_to_f32(b.q1.y);
+        if (step_f > 0.00390625) {
+            let orig = vec3<f32>(q16_to_f32(b.q0.z), q16_to_f32(b.q0.w), q16_to_f32(b.q1.x));
+            let iv = intersect_aabb(ro, rd, orig - vec3<f32>(2.0 * step_f + pad), orig + vec3<f32>(5.0 * step_f + pad));
+            if (iv.y >= max(t_min, iv.x) && iv.x <= t_max) {
+                res.feat_mask = res.feat_mask | 4u;
+                res.t_enter = min(res.t_enter, max(t_min, iv.x));
+                res.t_exit  = max(res.t_exit,  min(t_max, iv.y));
+            }
+        }
+    }
+
+    let tri_cnt  = sec.q0.w & 0xFFFFu;
+    let mbvh_cnt = (sec.q0.w >> 16u) & 0xFFFFu;
+    if (tri_cnt > 0u && mbvh_cnt > 0u) {
+        let root = mesh_buf[256u];
+        let rmn = vec3<f32>(q16_to_f32(root.q1.x), q16_to_f32(root.q1.y), q16_to_f32(root.q1.z));
+        let rmx = vec3<f32>(q16_to_f32(root.q1.w), q16_to_f32(root.q2.x), q16_to_f32(root.q2.y));
+        let iv = intersect_aabb(ro, rd, rmn - vec3<f32>(0.25 + pad), rmx + vec3<f32>(0.25 + pad));
+        if (iv.y >= max(t_min, iv.x) && iv.x <= t_max) {
+            res.feat_mask = res.feat_mask | 8u;
+            res.t_enter = min(res.t_enter, max(t_min, iv.x));
+            res.t_exit  = max(res.t_exit,  min(t_max, iv.y));
+        }
+    }
+
+    return res;
+}
+
+fn compute_ray_cull_cone(
+    ro : vec3<f32>, rd : vec3<f32>, t_min : f32, t_max : f32,
+    pad : f32, ang_pad : f32, bend_t0 : f32, bend_ang : f32
+) -> RayCull {
+    var res : RayCull;
+    res.t_enter   = t_max;
+    res.t_exit    = t_min;
+    res.inst_mask = 0u;
+    res.feat_mask = 0u;
+
+    let inst_cnt = min(arena[0].q1.z, 32u);
+    for (var i : u32 = 0u; i < inst_cnt; i = i + 1u) {
+        let inst = arena[40u + i];
+        let flags = (inst.q3.x >> 16u) & 0xFFFFu;
+        if ((flags & 1u) == 0u) { continue; }
+        let pid = inst.q0.y;
+        if (pid == 0u || pid > 16u) { continue; }
+        let pf = arena[24u + (pid - 1u)];
+        let pos = vec3<f32>(q16_to_f32(inst.q1.x), q16_to_f32(inst.q1.y), q16_to_f32(inst.q1.z));
+        let raw_sc = q16_to_f32(inst.q2.z);
+        let sc = select(1.0, clamp(raw_sc, 0.0625, 256.0), raw_sc > 0.0625);
+        let p_ovr = q16_to_f32(inst.q3.z);
+        let r0 = inst_world_bound_r(pf, sc, p_ovr);
+        let dist_c = clamp(dot(pos - ro, rd) + r0, 0.25, t_max);
+        let r = r0 + pad + dist_c * ang_pad + max(dist_c - bend_t0, 0.0) * bend_ang;
+        let iv = ray_sphere_interval(ro, rd, pos, r);
+        if (iv.y >= t_min && iv.x <= t_max) {
+            res.inst_mask = res.inst_mask | (1u << i);
+            res.t_enter = min(res.t_enter, max(t_min, iv.x));
+            res.t_exit  = max(res.t_exit,  min(t_max, iv.y));
+        }
+    }
+
+    let sec = arena[254];
+    let gcsg_cnt = (sec.q3.x >> 16u) & 0xFFFFu;
+    if (gcsg_cnt > 0u) {
+        let gcsg_start = sec.q3.x & 0xFFFFu;
+        if (gcsg_start + gcsg_cnt <= 32u) {
+            let lim = min(gcsg_cnt, 32u - gcsg_start);
+            var has_non_union = (lim > 16u);
+            var cmask : u32 = 0u;
+            for (var k : u32 = 0u; k < lim; k = k + 1u) {
+                let op = arena[72u + gcsg_start + k];
+                if (k > 0u && (op.q0.z == 1u || op.q0.z == 2u)) {
+                    has_non_union = true;
+                }
+                if (op.q0.y != 0u && (k == 0u || op.q0.z != 1u)) {
+                    let op_pos = vec3<f32>(q16_to_f32(op.q1.x), q16_to_f32(op.q1.y), q16_to_f32(op.q1.z));
+                    let op_ext = vec3<f32>(q16_to_f32(op.q1.w), q16_to_f32(op.q2.x), q16_to_f32(op.q2.y));
+                    let bev = max(q16_to_f32(op.q2.w), 0.0);
+                    let smk = max(q16_to_f32(op.q2.z), 0.0);
+                    let base_hb = prim_aabb_half(op.q0.y, op_ext, bev);
+                    let dist_c = clamp(dot(op_pos - ro, rd) + length(base_hb), 0.25, t_max);
+                    let half_b = base_hb + vec3<f32>(smk + pad + dist_c * ang_pad + max(dist_c - bend_t0, 0.0) * bend_ang);
+                    let iv = intersect_aabb(ro, rd, op_pos - half_b, op_pos + half_b);
+                    if (iv.y >= max(t_min, iv.x) && iv.x <= t_max) {
+                        res.feat_mask = res.feat_mask | 1u;
+                        if (k < 16u) { cmask = cmask | (1u << k); }
+                        res.t_enter = min(res.t_enter, max(t_min, iv.x));
+                        res.t_exit  = max(res.t_exit,  min(t_max, iv.y));
+                    }
+                }
+            }
+            if ((res.feat_mask & 1u) != 0u) {
+                if (has_non_union) {
+                    res.feat_mask = res.feat_mask | 0xFFFF0080u;
+                } else {
+                    res.feat_mask = res.feat_mask | (cmask << 16u);
+                }
+            }
+        }
+    }
+
+    let jcnt = min(sec.q0.z & 0xFFFFu, 8u);
+    for (var j_i : u32 = 0u; j_i < jcnt; j_i = j_i + 1u) {
+        let j = arena[136u + j_i];
+        let ep = dq_joint_endpoints(j);
+        let a = ep[0];
+        let b = a + ep[1];
+        let rad = q16_to_f32(j.q2.w);
+        let smk = max(q16_to_f32(j.q3.x), 0.0);
+        let mid_j = a + ep[1] * 0.5;
+        let dist_c = clamp(dot(mid_j - ro, rd) + length(ep[1]) * 0.5 + rad, 0.25, t_max);
+        let r_pad = vec3<f32>(rad + smk + pad + dist_c * ang_pad + max(dist_c - bend_t0, 0.0) * bend_ang);
+        let iv = intersect_aabb(ro, rd, min(a, b) - r_pad, max(a, b) + r_pad);
+        if (iv.y >= max(t_min, iv.x) && iv.x <= t_max) {
+            res.feat_mask = res.feat_mask | 2u | (1u << (8u + j_i));
+            res.t_enter = min(res.t_enter, max(t_min, iv.x));
+            res.t_exit  = max(res.t_exit,  min(t_max, iv.y));
+        }
+    }
+
+    let bcnt = min((sec.q0.z >> 16u) & 0xFFFFu, 8u);
+    for (var bi : u32 = 0u; bi < bcnt; bi = bi + 1u) {
+        let b = arena[144u + bi];
+        let step_f = q16_to_f32(b.q1.y);
+        if (step_f > 0.00390625) {
+            let orig = vec3<f32>(q16_to_f32(b.q0.z), q16_to_f32(b.q0.w), q16_to_f32(b.q1.x));
+            let mid_b = orig + vec3<f32>(1.5 * step_f);
+            let dist_c = clamp(dot(mid_b - ro, rd) + 3.5 * step_f, 0.25, t_max);
+            let b_pad = pad + dist_c * ang_pad + max(dist_c - bend_t0, 0.0) * bend_ang;
+            let iv = intersect_aabb(ro, rd, orig - vec3<f32>(2.0 * step_f + b_pad), orig + vec3<f32>(5.0 * step_f + b_pad));
+            if (iv.y >= max(t_min, iv.x) && iv.x <= t_max) {
+                res.feat_mask = res.feat_mask | 4u;
+                res.t_enter = min(res.t_enter, max(t_min, iv.x));
+                res.t_exit  = max(res.t_exit,  min(t_max, iv.y));
+            }
+        }
+    }
+
+    let tri_cnt  = sec.q0.w & 0xFFFFu;
+    let mbvh_cnt = (sec.q0.w >> 16u) & 0xFFFFu;
+    if (tri_cnt > 0u && mbvh_cnt > 0u) {
+        let root = mesh_buf[256u];
+        let rmn = vec3<f32>(q16_to_f32(root.q1.x), q16_to_f32(root.q1.y), q16_to_f32(root.q1.z));
+        let rmx = vec3<f32>(q16_to_f32(root.q1.w), q16_to_f32(root.q2.x), q16_to_f32(root.q2.y));
+        let mid_m = (rmn + rmx) * 0.5;
+        let dist_c = clamp(dot(mid_m - ro, rd) + length(rmx - rmn) * 0.5, 0.25, t_max);
+        let m_pad = 0.25 + pad + dist_c * ang_pad + max(dist_c - bend_t0, 0.0) * bend_ang;
+        let iv = intersect_aabb(ro, rd, rmn - vec3<f32>(m_pad), rmx + vec3<f32>(m_pad));
+        if (iv.y >= max(t_min, iv.x) && iv.x <= t_max) {
+            res.feat_mask = res.feat_mask | 8u;
+            res.t_enter = min(res.t_enter, max(t_min, iv.x));
+            res.t_exit  = max(res.t_exit,  min(t_max, iv.y));
+        }
+    }
+
+    return res;
+}
+
+fn point_near_scene_mask(p : vec3<f32>, margin : f32) -> vec2<u32> {
+    var inst_mask : u32 = 0u;
+    var feat_mask : u32 = 0u;
+
+    let inst_cnt = min(arena[0].q1.z, 32u);
+    for (var i : u32 = 0u; i < inst_cnt; i = i + 1u) {
+        let inst = arena[40u + i];
+        let flags = (inst.q3.x >> 16u) & 0xFFFFu;
+        if ((flags & 1u) == 0u) { continue; }
+        let pid = inst.q0.y;
+        if (pid == 0u || pid > 16u) { continue; }
+        let pf = arena[24u + (pid - 1u)];
+        let pos = vec3<f32>(q16_to_f32(inst.q1.x), q16_to_f32(inst.q1.y), q16_to_f32(inst.q1.z));
+        let raw_sc = q16_to_f32(inst.q2.z);
+        let sc = select(1.0, clamp(raw_sc, 0.0625, 256.0), raw_sc > 0.0625);
+        let p_ovr = q16_to_f32(inst.q3.z);
+        let r = inst_world_bound_r(pf, sc, p_ovr) + margin;
+        let d_vec = p - pos;
+        if (dot(d_vec, d_vec) <= r * r) {
+            inst_mask = inst_mask | (1u << i);
+        }
+    }
+
+    let sec = arena[254];
+    let gcsg_cnt = (sec.q3.x >> 16u) & 0xFFFFu;
+    if (gcsg_cnt > 0u) {
+        let gcsg_start = sec.q3.x & 0xFFFFu;
+        if (gcsg_start + gcsg_cnt <= 32u) {
+            let lim = min(gcsg_cnt, 32u - gcsg_start);
+            var has_non_union = (lim > 16u);
+            var cmask : u32 = 0u;
+            for (var k : u32 = 0u; k < lim; k = k + 1u) {
+                let op = arena[72u + gcsg_start + k];
+                if (k > 0u && (op.q0.z == 1u || op.q0.z == 2u)) {
+                    has_non_union = true;
+                }
+                if (op.q0.y != 0u && (k == 0u || op.q0.z != 1u)) {
+                    let op_pos = vec3<f32>(q16_to_f32(op.q1.x), q16_to_f32(op.q1.y), q16_to_f32(op.q1.z));
+                    let op_ext = vec3<f32>(q16_to_f32(op.q1.w), q16_to_f32(op.q2.x), q16_to_f32(op.q2.y));
+                    let bev = max(q16_to_f32(op.q2.w), 0.0);
+                    let smk = max(q16_to_f32(op.q2.z), 0.0);
+                    let half_b = prim_aabb_half(op.q0.y, op_ext, bev) + vec3<f32>(smk + margin);
+                    let dp = abs(p - op_pos);
+                    if (dp.x <= half_b.x && dp.y <= half_b.y && dp.z <= half_b.z) {
+                        feat_mask = feat_mask | 1u;
+                        if (k < 16u) { cmask = cmask | (1u << k); }
+                    }
+                }
+            }
+            if ((feat_mask & 1u) != 0u) {
+                if (has_non_union) {
+                    feat_mask = feat_mask | 0xFFFF0080u;
+                } else {
+                    feat_mask = feat_mask | (cmask << 16u);
+                }
+            }
+        }
+    }
+
+    let jcnt = min(sec.q0.z & 0xFFFFu, 8u);
+    for (var j_i : u32 = 0u; j_i < jcnt; j_i = j_i + 1u) {
+        let j = arena[136u + j_i];
+        let ep = dq_joint_endpoints(j);
+        let a = ep[0];
+        let b = a + ep[1];
+        let rad = q16_to_f32(j.q2.w);
+        let smk = max(q16_to_f32(j.q3.x), 0.0);
+        let r_pad = vec3<f32>(rad + smk + margin);
+        let mn = min(a, b) - r_pad;
+        let mx = max(a, b) + r_pad;
+        if (p.x >= mn.x && p.x <= mx.x && p.y >= mn.y && p.y <= mx.y && p.z >= mn.z && p.z <= mx.z) {
+            feat_mask = feat_mask | 2u | (1u << (8u + j_i));
+        }
+    }
+
+    let bcnt = min((sec.q0.z >> 16u) & 0xFFFFu, 8u);
+    for (var bi : u32 = 0u; bi < bcnt; bi = bi + 1u) {
+        let b = arena[144u + bi];
+        let step_f = q16_to_f32(b.q1.y);
+        if (step_f > 0.00390625) {
+            let orig = vec3<f32>(q16_to_f32(b.q0.z), q16_to_f32(b.q0.w), q16_to_f32(b.q1.x));
+            let bmin_b = orig - vec3<f32>(2.0 * step_f + margin);
+            let bmax_b = orig + vec3<f32>(5.0 * step_f + margin);
+            if (p.x >= bmin_b.x && p.x <= bmax_b.x && p.y >= bmin_b.y && p.y <= bmax_b.y && p.z >= bmin_b.z && p.z <= bmax_b.z) {
+                feat_mask = feat_mask | 4u;
+                break;
+            }
+        }
+    }
+
+    let tri_cnt  = sec.q0.w & 0xFFFFu;
+    let mbvh_cnt = (sec.q0.w >> 16u) & 0xFFFFu;
+    if (tri_cnt > 0u && mbvh_cnt > 0u) {
+        let root = mesh_buf[256u];
+        let rmn = vec3<f32>(q16_to_f32(root.q1.x), q16_to_f32(root.q1.y), q16_to_f32(root.q1.z)) - vec3<f32>(0.25 + margin);
+        let rmx = vec3<f32>(q16_to_f32(root.q1.w), q16_to_f32(root.q2.x), q16_to_f32(root.q2.y)) + vec3<f32>(0.25 + margin);
+        if (p.x >= rmn.x && p.x <= rmx.x && p.y >= rmn.y && p.y <= rmx.y && p.z >= rmn.z && p.z <= rmx.z) {
+            feat_mask = feat_mask | 8u;
+        }
+    }
+
+    return vec2<u32>(inst_mask, feat_mask);
+}
+
+fn map_scene_raw_masked(p : vec3<f32>, inst_mask : u32, feat_mask : u32) -> f32 {
     let sec = arena[254];
     var best_d : f32 = 1e5;
 
-    for (var i : u32 = 0u; i < inst_cnt; i = i + 1u) {
+    var m = inst_mask;
+    while (m != 0u) {
+        let i = countTrailingZeros(m);
+        m = m & (m - 1u);
         let inst = arena[40u + i];
         let flags = (inst.q3.x >> 16u) & 0xFFFFu;
         if ((flags & 1u) == 0u) { continue; }
@@ -559,34 +1076,53 @@ fn map_scene_raw_best(p : vec3<f32>) -> f32 {
         if (d < best_d) { best_d = d; }
     }
 
-    let gcsg_cnt = (sec.q3.x >> 16u) & 0xFFFFu;
-    if (gcsg_cnt > 0u) {
-        let gcsg_start = sec.q3.x & 0xFFFFu;
-        if (gcsg_start + gcsg_cnt <= 32u) {
-            best_d = min(best_d, eval_csg_program(gcsg_start, gcsg_cnt, p).x);
+    if ((feat_mask & 1u) != 0u) {
+        let gcsg_cnt = (sec.q3.x >> 16u) & 0xFFFFu;
+        if (gcsg_cnt > 0u) {
+            let gcsg_start = sec.q3.x & 0xFFFFu;
+            if (gcsg_start + gcsg_cnt <= 32u) {
+                let cm = select(feat_mask >> 16u, 0xFFFFFFFFu, (feat_mask & 0x80u) != 0u);
+                best_d = min(best_d, eval_csg_program_masked(gcsg_start, gcsg_cnt, p, cm).x);
+            }
         }
     }
-    let jcnt = sec.q0.z & 0xFFFFu;
-    if (jcnt > 0u) { best_d = min(best_d, eval_skeleton_sdf(p, jcnt).x); }
-    let bcnt = (sec.q0.z >> 16u) & 0xFFFFu;
-    if (bcnt > 0u) { best_d = min(best_d, eval_bricks_sdf(p, bcnt).x); }
-    let tri_cnt = sec.q0.w & 0xFFFFu;
-    let mbvh_cnt = (sec.q0.w >> 16u) & 0xFFFFu;
-    if (tri_cnt > 0u && mbvh_cnt > 0u) {
-        let solid_m = (sec.q0.y & 16u) != 0u;
-        best_d = min(best_d, eval_mesh_bvh_sdf(p, tri_cnt, mbvh_cnt, solid_m));
+    if ((feat_mask & 2u) != 0u) {
+        let jcnt = sec.q0.z & 0xFFFFu;
+        if (jcnt > 0u) {
+            let jm = (feat_mask >> 8u) & 0xFFu;
+            best_d = min(best_d, eval_skeleton_sdf_masked(p, jcnt, select(0xFFu, jm, jm != 0u)).x);
+        }
+    }
+    if ((feat_mask & 4u) != 0u) {
+        let bcnt = (sec.q0.z >> 16u) & 0xFFFFu;
+        if (bcnt > 0u) { best_d = min(best_d, eval_bricks_sdf(p, bcnt).x); }
+    }
+    if ((feat_mask & 8u) != 0u) {
+        let tri_cnt = sec.q0.w & 0xFFFFu;
+        let mbvh_cnt = (sec.q0.w >> 16u) & 0xFFFFu;
+        if (tri_cnt > 0u && mbvh_cnt > 0u) {
+            let solid_m = (sec.q0.y & 16u) != 0u;
+            best_d = min(best_d, eval_mesh_bvh_sdf(p, tri_cnt, mbvh_cnt, solid_m));
+        }
     }
     return best_d;
 }
 
-fn map_scene_dist(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> f32 {
-    let raw_d = map_scene_raw_best(p);
+fn map_scene_raw_best(p : vec3<f32>) -> f32 {
+    return map_scene_raw_masked(p, all_inst_mask(), 0xFFFFFFFFu);
+}
+
+fn map_scene_dist_masked(p : vec3<f32>, xray_on : bool, xray_plane : f32, inst_mask : u32, feat_mask : u32) -> f32 {
+    let raw_d = map_scene_raw_masked(p, inst_mask, feat_mask);
     let clip_v = eval_section_clip_val(p, xray_on, xray_plane);
     return max(raw_d, clip_v);
 }
 
-fn map_scene_full(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> SceneHit {
-    let inst_cnt = min(arena[0].q1.z, 32u);
+fn map_scene_dist(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> f32 {
+    return map_scene_dist_masked(p, xray_on, xray_plane, all_inst_mask(), 0xFFFFFFFFu);
+}
+
+fn map_scene_full_masked(p : vec3<f32>, xray_on : bool, xray_plane : f32, inst_mask : u32, feat_mask : u32) -> SceneHit {
     let sec = arena[254];
     let clip_v = eval_section_clip_val(p, xray_on, xray_plane);
 
@@ -604,7 +1140,10 @@ fn map_scene_full(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> SceneHit {
     var best_raw : f32 = 1e5;
     var sec_raw  : f32 = 1e5;
 
-    for (var i : u32 = 0u; i < inst_cnt; i = i + 1u) {
+    var m = inst_mask;
+    while (m != 0u) {
+        let i = countTrailingZeros(m);
+        m = m & (m - 1u);
         let inst = arena[40u + i];
         let flags = (inst.q3.x >> 16u) & 0xFFFFu;
         if ((flags & 1u) == 0u) { continue; }
@@ -649,18 +1188,42 @@ fn map_scene_full(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> SceneHit {
         }
     }
 
-    let gcsg_cnt = (sec.q3.x >> 16u) & 0xFFFFu;
-    if (gcsg_cnt > 0u) {
-        let gcsg_start = sec.q3.x & 0xFFFFu;
-        if (gcsg_start + gcsg_cnt <= 32u) {
-            let res = eval_csg_program(gcsg_start, gcsg_cnt, p);
+    if ((feat_mask & 1u) != 0u) {
+        let gcsg_cnt = (sec.q3.x >> 16u) & 0xFFFFu;
+        if (gcsg_cnt > 0u) {
+            let gcsg_start = sec.q3.x & 0xFFFFu;
+            if (gcsg_start + gcsg_cnt <= 32u) {
+                let cm_f = select(feat_mask >> 16u, 0xFFFFFFFFu, (feat_mask & 0x80u) != 0u);
+                let res = eval_csg_program_masked(gcsg_start, gcsg_cnt, p, cm_f);
+                let raw_d = res.x;
+                if (raw_d < best_raw) { sec_raw = best_raw; best_raw = raw_d; }
+                else if (raw_d < sec_raw) { sec_raw = raw_d; }
+                let d = max(raw_d, clip_v);
+                if (d < out.dist) {
+                    out.dist = d;
+                    out.inst_id = 99u;
+                    out.mat_id = u32(res.y) & 7u;
+                    out.style_id = clamp(out.mat_id + 1u, 1u, 8u);
+                    out.is_cut = clip_v > raw_d;
+                    out.raw_d = raw_d;
+                    out.local_p = p;
+                }
+            }
+        }
+    }
+
+    if ((feat_mask & 2u) != 0u) {
+        let jcnt = sec.q0.z & 0xFFFFu;
+        if (jcnt > 0u) {
+            let jm_f = (feat_mask >> 8u) & 0xFFu;
+            let res = eval_skeleton_sdf_masked(p, jcnt, select(0xFFu, jm_f, jm_f != 0u));
             let raw_d = res.x;
             if (raw_d < best_raw) { sec_raw = best_raw; best_raw = raw_d; }
             else if (raw_d < sec_raw) { sec_raw = raw_d; }
             let d = max(raw_d, clip_v);
             if (d < out.dist) {
                 out.dist = d;
-                out.inst_id = 99u;
+                out.inst_id = 100u;
                 out.mat_id = u32(res.y) & 7u;
                 out.style_id = clamp(out.mat_id + 1u, 1u, 8u);
                 out.is_cut = clip_v > raw_d;
@@ -670,60 +1233,46 @@ fn map_scene_full(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> SceneHit {
         }
     }
 
-    let jcnt = sec.q0.z & 0xFFFFu;
-    if (jcnt > 0u) {
-        let res = eval_skeleton_sdf(p, jcnt);
-        let raw_d = res.x;
-        if (raw_d < best_raw) { sec_raw = best_raw; best_raw = raw_d; }
-        else if (raw_d < sec_raw) { sec_raw = raw_d; }
-        let d = max(raw_d, clip_v);
-        if (d < out.dist) {
-            out.dist = d;
-            out.inst_id = 100u;
-            out.mat_id = u32(res.y) & 7u;
-            out.style_id = clamp(out.mat_id + 1u, 1u, 8u);
-            out.is_cut = clip_v > raw_d;
-            out.raw_d = raw_d;
-            out.local_p = p;
+    if ((feat_mask & 4u) != 0u) {
+        let bcnt = (sec.q0.z >> 16u) & 0xFFFFu;
+        if (bcnt > 0u) {
+            let res = eval_bricks_sdf(p, bcnt);
+            let raw_d = res.x;
+            if (raw_d < best_raw) { sec_raw = best_raw; best_raw = raw_d; }
+            else if (raw_d < sec_raw) { sec_raw = raw_d; }
+            let d = max(raw_d, clip_v);
+            if (d < out.dist) {
+                out.dist = d;
+                out.inst_id = 101u;
+                out.mat_id = u32(res.y) & 7u;
+                out.style_id = clamp(out.mat_id + 1u, 1u, 8u);
+                out.is_cut = clip_v > raw_d;
+                out.raw_d = raw_d;
+                out.local_p = p;
+            }
         }
     }
 
-    let bcnt = (sec.q0.z >> 16u) & 0xFFFFu;
-    if (bcnt > 0u) {
-        let res = eval_bricks_sdf(p, bcnt);
-        let raw_d = res.x;
-        if (raw_d < best_raw) { sec_raw = best_raw; best_raw = raw_d; }
-        else if (raw_d < sec_raw) { sec_raw = raw_d; }
-        let d = max(raw_d, clip_v);
-        if (d < out.dist) {
-            out.dist = d;
-            out.inst_id = 101u;
-            out.mat_id = u32(res.y) & 7u;
-            out.style_id = clamp(out.mat_id + 1u, 1u, 8u);
-            out.is_cut = clip_v > raw_d;
-            out.raw_d = raw_d;
-            out.local_p = p;
-        }
-    }
-
-    let tri_cnt = sec.q0.w & 0xFFFFu;
-    let mbvh_cnt = (sec.q0.w >> 16u) & 0xFFFFu;
-    if (tri_cnt > 0u && mbvh_cnt > 0u) {
-        let solid_m = (sec.q0.y & 16u) != 0u;
-        let raw_d = eval_mesh_bvh_sdf(p, tri_cnt, mbvh_cnt, solid_m);
-        if (raw_d < best_raw) { sec_raw = best_raw; best_raw = raw_d; }
-        else if (raw_d < sec_raw) { sec_raw = raw_d; }
-        let d = max(raw_d, clip_v);
-        if (d < out.dist) {
-            out.dist = d;
-            out.inst_id = 102u;
-            let mms = sec.q3.y;
-            out.mat_id = mms & 7u;
-            let st_m = (mms >> 16u) & 0xFFu;
-            out.style_id = select(clamp(out.mat_id + 1u, 1u, 8u), clamp(st_m, 1u, 8u), st_m >= 1u && st_m <= 8u);
-            out.is_cut = clip_v > raw_d;
-            out.raw_d = raw_d;
-            out.local_p = p;
+    if ((feat_mask & 8u) != 0u) {
+        let tri_cnt = sec.q0.w & 0xFFFFu;
+        let mbvh_cnt = (sec.q0.w >> 16u) & 0xFFFFu;
+        if (tri_cnt > 0u && mbvh_cnt > 0u) {
+            let solid_m = (sec.q0.y & 16u) != 0u;
+            let raw_d = eval_mesh_bvh_sdf(p, tri_cnt, mbvh_cnt, solid_m);
+            if (raw_d < best_raw) { sec_raw = best_raw; best_raw = raw_d; }
+            else if (raw_d < sec_raw) { sec_raw = raw_d; }
+            let d = max(raw_d, clip_v);
+            if (d < out.dist) {
+                out.dist = d;
+                out.inst_id = 102u;
+                let mms = sec.q3.y;
+                out.mat_id = mms & 7u;
+                let st_m = (mms >> 16u) & 0xFFu;
+                out.style_id = select(clamp(out.mat_id + 1u, 1u, 8u), clamp(st_m, 1u, 8u), st_m >= 1u && st_m <= 8u);
+                out.is_cut = clip_v > raw_d;
+                out.raw_d = raw_d;
+                out.local_p = p;
+            }
         }
     }
 
@@ -731,23 +1280,33 @@ fn map_scene_full(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> SceneHit {
     return out;
 }
 
-fn calc_normal(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> vec3<f32> {
-    let e = 0.0022;
-    let gx = map_scene_dist(p + vec3<f32>(e, 0.0, 0.0), xray_on, xray_plane) -
-             map_scene_dist(p - vec3<f32>(e, 0.0, 0.0), xray_on, xray_plane);
-    let gy = map_scene_dist(p + vec3<f32>(0.0, e, 0.0), xray_on, xray_plane) -
-             map_scene_dist(p - vec3<f32>(0.0, e, 0.0), xray_on, xray_plane);
-    let gz = map_scene_dist(p + vec3<f32>(0.0, 0.0, e), xray_on, xray_plane) -
-             map_scene_dist(p - vec3<f32>(0.0, 0.0, e), xray_on, xray_plane);
-    return safe_norm3(vec3<f32>(gx, gy, gz), vec3<f32>(0.0, 1.0, 0.0));
+fn map_scene_full(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> SceneHit {
+    return map_scene_full_masked(p, xray_on, xray_plane, all_inst_mask(), 0xFFFFFFFFu);
 }
 
-fn calc_ao(p : vec3<f32>, n : vec3<f32>, xray_on : bool, xray_plane : f32) -> f32 {
+fn calc_normal_masked(p : vec3<f32>, xray_on : bool, xray_plane : f32, inst_mask : u32, feat_mask : u32) -> vec3<f32> {
+    let e = 0.0022;
+    let k0 = vec3<f32>( 1.0, -1.0, -1.0);
+    let k1 = vec3<f32>(-1.0, -1.0,  1.0);
+    let k2 = vec3<f32>(-1.0,  1.0, -1.0);
+    let k3 = vec3<f32>( 1.0,  1.0,  1.0);
+    let g = k0 * map_scene_dist_masked(p + k0 * e, xray_on, xray_plane, inst_mask, feat_mask)
+          + k1 * map_scene_dist_masked(p + k1 * e, xray_on, xray_plane, inst_mask, feat_mask)
+          + k2 * map_scene_dist_masked(p + k2 * e, xray_on, xray_plane, inst_mask, feat_mask)
+          + k3 * map_scene_dist_masked(p + k3 * e, xray_on, xray_plane, inst_mask, feat_mask);
+    return safe_norm3(g, vec3<f32>(0.0, 1.0, 0.0));
+}
+
+fn calc_normal(p : vec3<f32>, xray_on : bool, xray_plane : f32) -> vec3<f32> {
+    return calc_normal_masked(p, xray_on, xray_plane, all_inst_mask(), 0xFFFFFFFFu);
+}
+
+fn calc_ao_masked(p : vec3<f32>, n : vec3<f32>, xray_on : bool, xray_plane : f32, inst_mask : u32, feat_mask : u32) -> f32 {
     var occ : f32 = 0.0;
     var w : f32 = 1.0;
-    for (var i : u32 = 0u; i < 5u; i = i + 1u) {
-        let h = 0.025 + 0.055 * f32(i);
-        let d = map_scene_dist(p + n * h, xray_on, xray_plane);
+    for (var i : u32 = 0u; i < 3u; i = i + 1u) {
+        let h = 0.04 + 0.11 * f32(i);
+        let d = map_scene_dist_masked(p + n * h, xray_on, xray_plane, inst_mask, feat_mask);
         occ = occ + max(h - d, 0.0) * w;
         w = w * 0.68;
     }
@@ -755,16 +1314,20 @@ fn calc_ao(p : vec3<f32>, n : vec3<f32>, xray_on : bool, xray_plane : f32) -> f3
 }
 
 fn calc_soft_shadow(ro : vec3<f32>, rd : vec3<f32>, k_pen : f32, xray_on : bool, xray_plane : f32) -> f32 {
+    let sc = compute_ray_cull(ro, rd, 0.03, 6.5, 0.06);
+    if ((sc.inst_mask | sc.feat_mask) == 0u || sc.t_enter >= sc.t_exit) {
+        return 1.0;
+    }
+    var t = sc.t_enter;
     var res : f32 = 1.0;
-    var t : f32 = 0.03;
-    for (var i : u32 = 0u; i < 14u; i = i + 1u) {
-        if (t > 6.5) { break; }
-        let h = map_scene_dist(ro + rd * t, xray_on, xray_plane);
+    for (var i : u32 = 0u; i < 8u; i = i + 1u) {
+        if (t > sc.t_exit) { break; }
+        let h = map_scene_dist_masked(ro + rd * t, xray_on, xray_plane, sc.inst_mask, sc.feat_mask);
         if (h < 0.0015) {
             return 0.04;
         }
         res = min(res, k_pen * h / t);
-        t = t + clamp(h, 0.025, 0.45);
+        t = t + clamp(h, 0.035, 0.62);
     }
     return clamp(res, 0.04, 1.0);
 }
@@ -924,54 +1487,26 @@ struct DiffJet2 {
     e1    : vec3<f32>,
 };
 
-fn eval_diff_jet2(p : vec3<f32>, n : vec3<f32>) -> DiffJet2 {
+fn eval_diff_jet2_masked(p : vec3<f32>, n : vec3<f32>, f0 : f32, inst_mask : u32, feat_mask : u32) -> DiffJet2 {
     let e = 0.04;
     let inv_e2 = 625.0;
-    let inv_4e2 = 156.25;
-
-    let f0   = map_scene_raw_best(p);
-    let f_px = map_scene_raw_best(p + vec3<f32>( e, 0.0, 0.0));
-    let f_mx = map_scene_raw_best(p + vec3<f32>(-e, 0.0, 0.0));
-    let f_py = map_scene_raw_best(p + vec3<f32>(0.0,  e, 0.0));
-    let f_my = map_scene_raw_best(p + vec3<f32>(0.0, -e, 0.0));
-    let f_pz = map_scene_raw_best(p + vec3<f32>(0.0, 0.0,  e));
-    let f_mz = map_scene_raw_best(p + vec3<f32>(0.0, 0.0, -e));
-
-    let f_pp0 = map_scene_raw_best(p + vec3<f32>( e,  e, 0.0));
-    let f_pm0 = map_scene_raw_best(p + vec3<f32>( e, -e, 0.0));
-    let f_mp0 = map_scene_raw_best(p + vec3<f32>(-e,  e, 0.0));
-    let f_mm0 = map_scene_raw_best(p + vec3<f32>(-e, -e, 0.0));
-
-    let f_0pp = map_scene_raw_best(p + vec3<f32>(0.0,  e,  e));
-    let f_0pm = map_scene_raw_best(p + vec3<f32>(0.0,  e, -e));
-    let f_0mp = map_scene_raw_best(p + vec3<f32>(0.0, -e,  e));
-    let f_0mm = map_scene_raw_best(p + vec3<f32>(0.0, -e, -e));
-
-    let f_p0p = map_scene_raw_best(p + vec3<f32>( e, 0.0,  e));
-    let f_p0m = map_scene_raw_best(p + vec3<f32>( e, 0.0, -e));
-    let f_m0p = map_scene_raw_best(p + vec3<f32>(-e, 0.0,  e));
-    let f_m0m = map_scene_raw_best(p + vec3<f32>(-e, 0.0, -e));
-
-    let hxx = clamp((f_px - 2.0 * f0 + f_mx) * inv_e2, -64.0, 64.0);
-    let hyy = clamp((f_py - 2.0 * f0 + f_my) * inv_e2, -64.0, 64.0);
-    let hzz = clamp((f_pz - 2.0 * f0 + f_mz) * inv_e2, -64.0, 64.0);
-    let hxy = clamp(((f_pp0 - f_pm0) - (f_mp0 - f_mm0)) * inv_4e2, -64.0, 64.0);
-    let hyz = clamp(((f_0pp - f_0pm) - (f_0mp - f_0mm)) * inv_4e2, -64.0, 64.0);
-    let hxz = clamp(((f_p0p - f_p0m) - (f_m0p - f_m0m)) * inv_4e2, -64.0, 64.0);
-
-    let r0 = vec3<f32>(hxx, hxy, hxz);
-    let r1 = vec3<f32>(hxy, hyy, hyz);
-    let r2 = vec3<f32>(hxz, hyz, hzz);
 
     let up_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.80);
     let t1 = safe_norm3(cross(up_ref, n), vec3<f32>(1.0, 0.0, 0.0));
     let t2 = safe_norm3(cross(n, t1), vec3<f32>(0.0, 0.0, 1.0));
 
-    let ht1 = vec3<f32>(dot(r0, t1), dot(r1, t1), dot(r2, t1));
-    let ht2 = vec3<f32>(dot(r0, t2), dot(r1, t2), dot(r2, t2));
-    let s11 = dot(t1, ht1);
-    let s22 = dot(t2, ht2);
-    let s12 = dot(t1, ht2);
+    let f_p1 = map_scene_raw_masked(p + t1 * e, inst_mask, feat_mask);
+    let f_m1 = map_scene_raw_masked(p - t1 * e, inst_mask, feat_mask);
+    let f_p2 = map_scene_raw_masked(p + t2 * e, inst_mask, feat_mask);
+    let f_m2 = map_scene_raw_masked(p - t2 * e, inst_mask, feat_mask);
+    let d12  = (t1 + t2) * e;
+    let f_pd = map_scene_raw_masked(p + d12, inst_mask, feat_mask);
+    let f_md = map_scene_raw_masked(p - d12, inst_mask, feat_mask);
+
+    let s11 = clamp((f_p1 - 2.0 * f0 + f_m1) * inv_e2, -64.0, 64.0);
+    let s22 = clamp((f_p2 - 2.0 * f0 + f_m2) * inv_e2, -64.0, 64.0);
+    let sdd = clamp((f_pd - 2.0 * f0 + f_md) * inv_e2, -256.0, 256.0);
+    let s12 = clamp(0.5 * (sdd - s11 - s22), -64.0, 64.0);
 
     let diff_s = s11 - s22;
     let aniso = length(vec2<f32>(diff_s, 2.0 * s12));
@@ -1030,14 +1565,16 @@ fn rc_probe_pos(px : u32, py : u32, pz : u32, dims : vec3<f32>) -> vec3<f32> {
     return rc_cage_center() + uvw * rc_half_ext();
 }
 
-fn eval_rc_hit_radiance(
+fn eval_rc_hit_radiance_masked(
     p : vec3<f32>,
     xray_on : bool,
     xray_plane : f32,
-    time_s : f32
+    time_s : f32,
+    inst_mask : u32,
+    feat_mask : u32
 ) -> vec4<f32> {
-    let hit = map_scene_full(p, xray_on, xray_plane);
-    let n = calc_normal(p, xray_on, xray_plane);
+    let hit = map_scene_full_masked(p, xray_on, xray_plane, inst_mask, feat_mask);
+    let n = calc_normal_masked(p, xray_on, xray_plane, inst_mask, feat_mask);
     let m_cell = arena[8u + (hit.mat_id & 7u)];
     let s_cell = arena[16u + (clamp(hit.style_id, 1u, 8u) - 1u)];
     let inst_k = arena[40u + (hit.inst_slot & 31u)].q2.w;
@@ -1073,17 +1610,25 @@ fn trace_rc_interval(
     xray_plane : f32,
     time_s : f32
 ) -> vec4<f32> {
-    if (map_scene_dist(ro, xray_on, xray_plane) < -0.02) {
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let near_ro = point_near_scene_mask(ro, 0.04);
+    if ((near_ro.x | near_ro.y) != 0u) {
+        if (map_scene_dist_masked(ro, xray_on, xray_plane, near_ro.x, near_ro.y) < -0.02) {
+            return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        }
     }
+    let rc_cull = compute_ray_cull(ro, rd, t0, t1, 0.06);
+    if ((rc_cull.inst_mask | rc_cull.feat_mask) == 0u || rc_cull.t_enter > rc_cull.t_exit) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    var t = rc_cull.t_enter;
+    let t_end = rc_cull.t_exit;
     let min_step = max((t1 - t0) / f32(steps), 0.02);
-    var t = t0;
     for (var i : u32 = 0u; i < steps; i = i + 1u) {
-        if (t > t1) { break; }
+        if (t > t_end) { break; }
         let p = ro + rd * t;
-        let d = map_scene_dist(p, xray_on, xray_plane);
+        let d = map_scene_dist_masked(p, xray_on, xray_plane, rc_cull.inst_mask, rc_cull.feat_mask);
         if (d < 0.02) {
-            return eval_rc_hit_radiance(p, xray_on, xray_plane, time_s);
+            return eval_rc_hit_radiance_masked(p, xray_on, xray_plane, time_s, rc_cull.inst_mask, rc_cull.feat_mask);
         }
         t = t + max(d, min_step);
     }
@@ -1208,6 +1753,14 @@ fn bloom_rc_cascade2(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (tid >= 4096u) { return; }
 
     let probe_idx = tid >> 4u;
+    let hdr_flags = arena[0].q3.z;
+    let fseq      = arena[0].q1.y;
+    let rc_amort  = (hdr_flags & 2048u) != 0u;
+    if (rc_amort && fseq > 1u && ((probe_idx & 3u) != (fseq & 3u))) {
+        let prev = rc_buf[tid];
+        if (prev.r + prev.g + prev.b + prev.a > 0.0) { return; }
+    }
+
     let dir_idx   = tid & 15u;
     let px = probe_idx & 7u;
     let py = (probe_idx >> 3u) & 3u;
@@ -1218,10 +1771,9 @@ fn bloom_rc_cascade2(@builtin(global_invocation_id) gid : vec3<u32>) {
     let dv = ((f32(dir_idx >> 2u) + 0.5) / 4.0) * 2.0 - 1.0;
     let dir = oct_decode(vec2<f32>(du, dv));
 
-    let hdr_flags = arena[0].q3.z;
     let xray_on   = (hdr_flags & 2u) != 0u;
     let xray_p    = q16_to_f32(arena[0].q3.x);
-    let time_s    = f32(arena[0].q1.y) * 0.0166667;
+    let time_s    = f32(fseq) * 0.0166667;
 
     let res = trace_rc_interval(pos, dir, 1.15, 4.80, 7u, xray_on, xray_p, time_s);
     let sky = eval_sky_dome(dir) * 0.55;
@@ -1235,6 +1787,14 @@ fn bloom_rc_cascade1(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (tid >= 16384u) { return; }
 
     let probe_idx = tid >> 3u;
+    let hdr_flags = arena[0].q3.z;
+    let fseq      = arena[0].q1.y;
+    let rc_amort  = (hdr_flags & 2048u) != 0u;
+    if (rc_amort && fseq > 1u && ((probe_idx & 3u) != (fseq & 3u))) {
+        let prev = rc_buf[4096u + tid];
+        if (prev.r + prev.g + prev.b + prev.a > 0.0) { return; }
+    }
+
     let dir_idx   = tid & 7u;
     let px = probe_idx & 15u;
     let py = (probe_idx >> 4u) & 7u;
@@ -1245,10 +1805,9 @@ fn bloom_rc_cascade1(@builtin(global_invocation_id) gid : vec3<u32>) {
     let dv = ((f32(dir_idx >> 2u) + 0.5) / 2.0) * 2.0 - 1.0;
     let dir = oct_decode(vec2<f32>(du, dv));
 
-    let hdr_flags = arena[0].q3.z;
     let xray_on   = (hdr_flags & 2u) != 0u;
     let xray_p    = q16_to_f32(arena[0].q3.x);
-    let time_s    = f32(arena[0].q1.y) * 0.0166667;
+    let time_s    = f32(fseq) * 0.0166667;
 
     let near_v = trace_rc_interval(pos, dir, 0.28, 1.15, 7u, xray_on, xray_p, time_s);
     let far_v  = sample_rc2_trilinear(pos, dir);
@@ -1261,16 +1820,30 @@ fn bloom_rc_cascade0(@builtin(global_invocation_id) gid : vec3<u32>) {
     let probe_idx = gid.y * 256u + gid.x;
     if (probe_idx >= 2048u) { return; }
 
+    let hdr_flags = arena[0].q3.z;
+    let fseq      = arena[0].q1.y;
+    let rc_amort  = (hdr_flags & 2048u) != 0u;
+    let base = 20480u + probe_idx * 6u;
+    if (rc_amort && fseq > 1u && ((probe_idx & 3u) != (fseq & 3u))) {
+        let prev0 = rc_buf[base];
+        if (prev0.r + prev0.g + prev0.b + prev0.a > 0.0) { return; }
+    }
+
     let px = probe_idx & 15u;
     let py = (probe_idx >> 4u) & 7u;
     let pz = (probe_idx >> 7u) & 15u;
     let pos = rc_probe_pos(px, py, pz, vec3<f32>(16.0, 8.0, 16.0));
 
-    let hdr_flags = arena[0].q3.z;
     let xray_on   = (hdr_flags & 2u) != 0u;
     let xray_p    = q16_to_f32(arena[0].q3.x);
-    let time_s    = f32(arena[0].q1.y) * 0.0166667;
-    let valid     = select(0.0, 1.0, map_scene_dist(pos, xray_on, xray_p) >= -0.04);
+    let time_s    = f32(fseq) * 0.0166667;
+    let near0     = point_near_scene_mask(pos, 0.06);
+    var valid : f32 = 1.0;
+    if ((near0.x | near0.y) != 0u) {
+        valid = select(0.0, 1.0, map_scene_dist_masked(pos, xray_on, xray_p, near0.x, near0.y) >= -0.04);
+    }
+    let near34    = point_near_scene_mask(pos, 0.34);
+    let trace_near = (near34.x | near34.y) != 0u;
 
     let axes = array<vec3<f32>, 6>(
         vec3<f32>( 1.0,  0.0,  0.0),
@@ -1280,10 +1853,12 @@ fn bloom_rc_cascade0(@builtin(global_invocation_id) gid : vec3<u32>) {
         vec3<f32>( 0.0,  0.0,  1.0),
         vec3<f32>( 0.0,  0.0, -1.0)
     );
-    let base = 20480u + probe_idx * 6u;
     for (var k : u32 = 0u; k < 6u; k = k + 1u) {
         let dir = axes[k];
-        let near_v = trace_rc_interval(pos, dir, 0.04, 0.28, 5u, xray_on, xray_p, time_s);
+        var near_v = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        if (trace_near) {
+            near_v = trace_rc_interval(pos, dir, 0.04, 0.28, 5u, xray_on, xray_p, time_s);
+        }
         let far_v  = sample_rc1_trilinear(pos, dir);
         rc_buf[base + k] = vec4<f32>(near_v.rgb + near_v.a * far_v.rgb, valid);
     }
@@ -1304,7 +1879,9 @@ fn shade_full_hit(
     diff_field : bool,
     subframe_lock : bool,
     selected_id : u32,
-    time_s : f32
+    time_s : f32,
+    inst_mask : u32,
+    feat_mask : u32
 ) -> vec3<f32> {
     let m_cell = arena[8u + (hit.mat_id & 7u)];
     let s_cell = arena[16u + (clamp(hit.style_id, 1u, 8u) - 1u)];
@@ -1339,7 +1916,7 @@ fn shade_full_hit(
         var groove_w = tri_grain.y;
         var t_ax = safe_norm3(cross(select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.85), n), vec3<f32>(1.0, 0.0, 0.0));
         if (diff_field) {
-            let j2 = eval_diff_jet2(p, n);
+            let j2 = eval_diff_jet2_masked(p, n, hit.raw_d, inst_mask, feat_mask);
             ridge_polish = clamp(j2.H * 0.35, 0.0, 0.65);
             crevice_patina = clamp(-j2.H * 0.45, 0.0, 0.72);
             field_aniso = clamp(j2.aniso * 0.25, 0.0, 1.0);
@@ -1358,7 +1935,7 @@ fn shade_full_hit(
     let key_dir = vec3<f32>(-0.5145, 0.7503, -0.4150);
     let rim_dir = vec3<f32>( 0.7420, 0.3610,  0.5650);
 
-    let ao = calc_ao(p, n_eff, xray_on, xray_plane);
+    let ao = calc_ao_masked(p, n_eff, xray_on, xray_plane, inst_mask, feat_mask);
     let sh = calc_soft_shadow(p + n_eff * 0.018, key_dir, 11.0, xray_on, xray_plane);
 
     let ndv = clamp(dot(n_eff, -rd), 0.0, 1.0);
@@ -1406,10 +1983,14 @@ fn shade_full_hit(
         var prev_solid : bool = true;
         var cavity_crossings : f32 = 0.0;
 
-        for (var k : u32 = 0u; k < 16u; k = k + 1u) {
+        let refr_cull = compute_ray_cull(p_enter, refr_d, 0.0, 3.0, 0.06);
+        let r_imask = refr_cull.inst_mask | select(0u, (1u << (hit.inst_slot & 31u)), hit.inst_id > 0u && hit.inst_id <= 32u);
+        let r_fmask = refr_cull.feat_mask | feat_mask;
+        let t_in_max = min(3.0, max(refr_cull.t_exit, 0.08));
+        for (var k : u32 = 0u; k < 8u; k = k + 1u) {
             let samp_p = p_enter + refr_d * t_in;
-            let sd = map_scene_dist(samp_p, xray_on, xray_plane);
-            let step_s = clamp(abs(sd), 0.042, 0.22);
+            let sd = map_scene_dist_masked(samp_p, xray_on, xray_plane, r_imask, r_fmask);
+            let step_s = clamp(abs(sd), 0.06, 0.34);
             if (sd < 0.0025) {
                 solid_dist = solid_dist + step_s;
                 p_exit = samp_p;
@@ -1421,10 +2002,10 @@ fn shade_full_hit(
                 prev_solid = false;
             }
             t_in = t_in + step_s;
-            if (t_in > 3.0) { break; }
+            if (t_in > t_in_max) { break; }
         }
 
-        let n_exit = calc_normal(p_exit, xray_on, xray_plane);
+        let n_exit = calc_normal_masked(p_exit, xray_on, xray_plane, r_imask, r_fmask);
         let exit_raw = refract(refr_d, -n_exit, eta);
         let exit_d = safe_norm3(select(exit_raw, reflect(refr_d, -n_exit), dot(exit_raw, exit_raw) < 1e-5), refr_d);
 
@@ -1434,9 +2015,10 @@ fn shade_full_hit(
         let ro_out = p_exit + exit_d * 0.03;
 
         let refr_rough = clamp(eff_rough + 0.10, 0.04, 1.0);
-        let bg_r = eval_backdrop_ray(ro_out, exit_r, px_ang).r + eval_studio_env(exit_r, refr_rough).r * 0.34;
-        let bg_g = eval_backdrop_ray(ro_out, exit_d, px_ang).g + eval_studio_env(exit_d, refr_rough).g * 0.34;
-        let bg_b = eval_backdrop_ray(ro_out, exit_b, px_ang).b + eval_studio_env(exit_b, refr_rough).b * 0.34;
+        let bg_c = eval_backdrop_ray(ro_out, exit_d, px_ang);
+        let bg_r = bg_c.r + eval_studio_env(exit_r, refr_rough).r * 0.34;
+        let bg_g = bg_c.g + eval_studio_env(exit_d, refr_rough).g * 0.34;
+        let bg_b = bg_c.b + eval_studio_env(exit_b, refr_rough).b * 0.34;
         let caustic = 1.0 + 0.48 * clamp((eta - 1.0) * (1.0 - eff_rough), 0.0, 1.2);
         let refr_scene = vec3<f32>(bg_r, bg_g, bg_b) * caustic;
 
@@ -2411,8 +2993,168 @@ fn shade_text_input_widget(
 }
 
 // ----------------------------------------------------------------------------
-// 5. Main Cross-Platform Compute Entrypoint
+// 5. Split-Pass Depth Slice, Primary 3D Render & Overlay Passes
 // ----------------------------------------------------------------------------
+
+fn pack_hdr_u32(c_in : vec3<f32>) -> u32 {
+    let c = clamp(c_in, vec3<f32>(0.0), vec3<f32>(65408.0));
+    let max_c = max(c.x, max(c.y, c.z));
+    if (max_c < 1e-6) { return 0u; }
+    let exp_s = clamp(i32(floor(log2(max_c))) + 16, 0, 31);
+    let inv_s = exp2(f32(24 - exp_s));
+    let r = min(u32(floor(c.x * inv_s + 0.5)), 511u);
+    let g = min(u32(floor(c.y * inv_s + 0.5)), 511u);
+    let b = min(u32(floor(c.z * inv_s + 0.5)), 511u);
+    return r | (g << 9u) | (b << 18u) | (u32(exp_s) << 27u);
+}
+
+fn unpack_hdr_u32(u : u32) -> vec3<f32> {
+    if (u == 0u) { return vec3<f32>(0.0); }
+    let exp_s = i32(u >> 27u);
+    let scale = exp2(f32(exp_s - 24));
+    return vec3<f32>(f32(u & 511u), f32((u >> 9u) & 511u), f32((u >> 18u) & 511u)) * scale;
+}
+
+struct PrimaryRay {
+    eye    : vec3<f32>,
+    tgt    : vec3<f32>,
+    fwd    : vec3<f32>,
+    right  : vec3<f32>,
+    up_v   : vec3<f32>,
+    rd     : vec3<f32>,
+    fov_z  : f32,
+    px_ang : f32,
+};
+
+fn eval_primary_ray(px : vec2<f32>, fw : f32, fh : f32, metric_on : bool, lorentz_beta : f32) -> PrimaryRay {
+    let norm_xy = (px / vec2<f32>(fw, fh)) * 2.0 - vec2<f32>(1.0);
+    let cam = arena[1];
+    let eye = vec3<f32>(q16_to_f32(cam.q0.x), q16_to_f32(cam.q0.y), q16_to_f32(cam.q0.z));
+    let tgt = vec3<f32>(q16_to_f32(cam.q0.w), q16_to_f32(cam.q1.x), q16_to_f32(cam.q1.y));
+    let focal_mm = clamp(q16_to_f32(cam.q2.y), 18.0, 135.0);
+    let fov_z = max(focal_mm / 28.0, 0.7);
+    let fwd = safe_norm3(tgt - eye, vec3<f32>(0.0, 0.0, 1.0));
+    let right = safe_norm3(vec3<f32>(fwd.z, 0.0, -fwd.x), vec3<f32>(1.0, 0.0, 0.0));
+    let up_v = cross(fwd, right);
+    let aspect = fw / fh;
+    let uv_cam = vec2<f32>(norm_xy.x * aspect * 0.5, -norm_xy.y * 0.5);
+    var rd = safe_norm3(right * uv_cam.x + up_v * uv_cam.y + fwd * fov_z, vec3<f32>(0.0, 0.0, 1.0));
+    let px_ang = 1.0 / max(fh * fov_z, 1.0);
+    if (metric_on && abs(lorentz_beta) > 1e-4) {
+        let rdx = dot(rd, fwd);
+        let denom_b = max(1.0 + lorentz_beta * rdx, 0.08);
+        let boost_x = (rdx + lorentz_beta) / denom_b;
+        let perp = rd - fwd * rdx;
+        let perp_sc = sqrt(max(1.0 - lorentz_beta * lorentz_beta, 0.05)) / denom_b;
+        rd = safe_norm3(fwd * boost_x + perp * perp_sc, rd);
+    }
+    return PrimaryRay(eye, tgt, fwd, right, up_v, rd, fov_z, px_ang);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn bloom_depth_slice(@builtin(global_invocation_id) gid : vec3<u32>) {
+    if (gid.x == 0xFFFFFFFFu) {
+        textureStore(out_tex, vec2<i32>(0, 0), vec4<f32>(0.0));
+        rc_buf[0] = vec4<f32>(0.0);
+        scene_hdr[0] = 0u;
+    }
+    let dims = textureDimensions(out_tex);
+    let sw = (dims.x + 3u) >> 2u;
+    let sh = (dims.y + 3u) >> 2u;
+    if (gid.x >= sw || gid.y >= sh) { return; }
+    let s_idx = gid.y * sw + gid.x;
+    if (s_idx >= 524288u) { return; }
+
+    let fw = max(f32(dims.x), 1.0);
+    let fh = max(f32(dims.y), 1.0);
+    let px = vec2<f32>(min(f32(gid.x * 4u) + 2.0, fw - 0.5), min(f32(gid.y * 4u) + 2.0, fh - 0.5));
+    let hdr_flags = arena[0].q3.z;
+    let xray_on   = (hdr_flags & 2u) != 0u;
+    let studio_gi = (hdr_flags & 16u) != 0u;
+    let metric_on = (hdr_flags & 512u) != 0u;
+    let shells_on = (hdr_flags & 1024u) != 0u;
+    let xray_plane = q16_to_f32(arena[0].q3.x);
+    let reg = arena[2];
+    let metric_phi   = clamp(q16_to_f32(reg.q1.x), -0.45, 0.48);
+    let lorentz_beta = clamp(q16_to_f32(reg.q1.y), -0.90, 0.90);
+    let graze_w      = clamp(q16_to_f32(reg.q2.x), 0.04, 0.80);
+
+    let ray = eval_primary_ray(px, fw, fh, metric_on, lorentz_beta);
+    let max_t = select(32.0, 28.0, studio_gi);
+    let tile_ang  = ray.px_ang * 3.6;
+    let graze_ang = min(graze_w * 0.38, graze_w * 0.22 + 0.020) + 0.006;
+    let shell_ang = select(select(0.0, ray.px_ang * 1.6, studio_gi), max(graze_ang, ray.px_ang * 1.6), shells_on);
+    let total_ang = tile_ang + shell_ang;
+
+    if (metric_on && abs(metric_phi) > 1e-4) {
+        var lens_center = ray.tgt;
+        let inst_cnt_m = min(arena[0].q1.z, 32u);
+        let selected_id = arena[0].q3.y;
+        if (selected_id >= 1u && selected_id <= inst_cnt_m) {
+            let sel_i = arena[40u + (selected_id - 1u)];
+            lens_center = vec3<f32>(q16_to_f32(sel_i.q1.x), q16_to_f32(sel_i.q1.y), q16_to_f32(sel_i.q1.z));
+        }
+        let lc_vec = lens_center - ray.eye;
+        let lc_proj = max(dot(lc_vec, ray.rd), 0.25);
+        let lc_perp = lc_vec - ray.rd * lc_proj;
+        let b2 = dot(lc_perp, lc_perp);
+        let lens_bend = min(abs(metric_phi) * (1.8 / max(b2 + 0.35, 0.35)), 0.55);
+        let pad_m = 0.10 + abs(metric_phi) * 2.5;
+        let pc = compute_ray_cull_cone(ray.eye, ray.rd, 0.125, max_t, pad_m, total_ang, lc_proj, lens_bend);
+        var t_en = pc.t_enter;
+        var t_ex = pc.t_exit;
+        var has_any = ((pc.inst_mask | pc.feat_mask) != 0u) && (t_en < t_ex);
+        let lv = ray_sphere_interval(ray.eye, ray.rd, lens_center, 3.0 * abs(metric_phi) + 1.25 + lc_proj * tile_ang);
+        if (lv.y >= 0.125 && lv.x <= max_t) {
+            let lv_en = max(0.125, lv.x);
+            let lv_ex = min(max_t, lv.y);
+            if (has_any) {
+                t_en = min(t_en, lv_en);
+                t_ex = max(t_ex, lv_ex);
+            } else {
+                t_en = lv_en;
+                t_ex = lv_ex;
+                has_any = true;
+            }
+        }
+        if (!has_any || t_en >= t_ex) {
+            slice_buf[s_idx] = vec4<f32>(max_t, max_t, 0.0, 0.0);
+        } else {
+            slice_buf[s_idx] = vec4<f32>(t_en, t_ex, bitcast<f32>(pc.inst_mask), bitcast<f32>(pc.feat_mask));
+        }
+        return;
+    }
+
+    let inv_lip   = 0.88 / (1.0 + total_ang);
+    let pad_base  = select(0.08, 0.12, studio_gi || shells_on);
+    let pc = compute_ray_cull_cone(ray.eye, ray.rd, 0.125, max_t, pad_base, total_ang, max_t, 0.0);
+    if ((pc.inst_mask | pc.feat_mask) == 0u || pc.t_enter >= pc.t_exit) {
+        slice_buf[s_idx] = vec4<f32>(max_t, max_t, 0.0, 0.0);
+        return;
+    }
+
+    var ts = pc.t_enter;
+    var t_safe = pc.t_exit;
+    for (var s : u32 = 0u; s < 32u; s = s + 1u) {
+        if (ts >= pc.t_exit) {
+            t_safe = pc.t_exit;
+            break;
+        }
+        let r_shell = ts * total_ang + 0.032;
+        let d = map_scene_dist_masked(ray.eye + ray.rd * ts, xray_on, xray_plane, pc.inst_mask, pc.feat_mask);
+        if (d <= r_shell) {
+            t_safe = max(pc.t_enter, ts - r_shell - 0.045);
+            break;
+        }
+        ts = ts + max((d - r_shell) * inv_lip, 0.025);
+        if (ts >= pc.t_exit) {
+            t_safe = pc.t_exit;
+            break;
+        }
+        t_safe = max(pc.t_enter, ts - r_shell - 0.045);
+    }
+    slice_buf[s_idx] = vec4<f32>(t_safe, pc.t_exit, bitcast<f32>(pc.inst_mask), bitcast<f32>(pc.feat_mask));
+}
 
 @compute @workgroup_size(8, 8, 1)
 fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -2422,24 +3164,8 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
     let fw = max(f32(dims.x), 1.0);
     let fh = max(f32(dims.y), 1.0);
     let px = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
-    // Normalized screen space [-1..+1] matching CPU Q16 [-65536..+65536]
     let norm_xy = (px / vec2<f32>(fw, fh)) * 2.0 - vec2<f32>(1.0);
-
-    // 1. Physical Orbit Camera Setup (Exact parity with bloom_scene_raycast64)
-    let cam = arena[1];
-    let eye = vec3<f32>(q16_to_f32(cam.q0.x), q16_to_f32(cam.q0.y), q16_to_f32(cam.q0.z));
-    let tgt = vec3<f32>(q16_to_f32(cam.q0.w), q16_to_f32(cam.q1.x), q16_to_f32(cam.q1.y));
-    let focal_mm = clamp(q16_to_f32(cam.q2.y), 18.0, 135.0);
-    let fov_z = max(focal_mm / 28.0, 0.7);
-
-    let fwd = safe_norm3(tgt - eye, vec3<f32>(0.0, 0.0, 1.0));
-    let right = safe_norm3(vec3<f32>(fwd.z, 0.0, -fwd.x), vec3<f32>(1.0, 0.0, 0.0));
-    let up_v = cross(fwd, right);
-
     let aspect = fw / fh;
-    let uv_cam = vec2<f32>(norm_xy.x * aspect * 0.5, -norm_xy.y * 0.5);
-    var rd = safe_norm3(right * uv_cam.x + up_v * uv_cam.y + fwd * fov_z, vec3<f32>(0.0, 0.0, 1.0));
-    let px_ang = 1.0 / max(fh * fov_z, 1.0);
 
     let hdr_flags     = arena[0].q3.z;
     let xray_on       = (hdr_flags & 2u) != 0u;
@@ -2452,15 +3178,30 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
     let cine_on       = (hdr_flags & 256u) != 0u;
     let metric_on     = (hdr_flags & 512u) != 0u;
     let shells_on     = (hdr_flags & 1024u) != 0u;
+    let depth_slice   = (hdr_flags & 4096u) != 0u;
+    let split_ui      = (hdr_flags & 8192u) != 0u;
     let xray_plane    = q16_to_f32(arena[0].q3.x);
     let selected_id   = arena[0].q3.y;
     let time_s        = f32(arena[0].q1.y) * 0.0166667;
 
+    let cam = arena[1];
+    let focal_mm = clamp(q16_to_f32(cam.q2.y), 18.0, 135.0);
     let reg = arena[2];
     let metric_phi   = clamp(q16_to_f32(reg.q1.x), -0.45, 0.48);
     let lorentz_beta = clamp(q16_to_f32(reg.q1.y), -0.90, 0.90);
     let hitstop_f    = bitcast<i32>(reg.q1.w);
     let graze_w      = clamp(q16_to_f32(reg.q2.x), 0.04, 0.80);
+
+    // 1. Physical Orbit Camera Setup (Exact parity with bloom_scene_raycast64)
+    let ray = eval_primary_ray(px, fw, fh, metric_on, lorentz_beta);
+    let eye = ray.eye;
+    let tgt = ray.tgt;
+    let fwd = ray.fwd;
+    let right = ray.right;
+    let up_v = ray.up_v;
+    let fov_z = ray.fov_z;
+    let rd = ray.rd;
+    let px_ang = ray.px_ang;
 
     var lens_center = tgt;
     let inst_cnt_m = min(arena[0].q1.z, 32u);
@@ -2469,55 +3210,97 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
         lens_center = vec3<f32>(q16_to_f32(sel_i.q1.x), q16_to_f32(sel_i.q1.y), q16_to_f32(sel_i.q1.z));
     }
 
-    if (metric_on && abs(lorentz_beta) > 1e-4) {
-        let rdx = dot(rd, fwd);
-        let denom_b = max(1.0 + lorentz_beta * rdx, 0.08);
-        let boost_x = (rdx + lorentz_beta) / denom_b;
-        let perp = rd - fwd * rdx;
-        let perp_sc = sqrt(max(1.0 - lorentz_beta * lorentz_beta, 0.05)) / denom_b;
-        rd = safe_norm3(fwd * boost_x + perp * perp_sc, rd);
-    }
-
-    // Base background (exact parity when studio_gi == false for verifyGpuAlignment)
-    let sky_col = eval_sky_dome(rd);
-    var bg = eval_backdrop_ray(eye, rd, px_ang);
-
     // 2. Primary 3D SDF / Geodesic Metric Raymarch (Exact CPU Q16.16 parity when !studio_gi && !metric_on)
-    var col = bg;
+    var col = vec3<f32>(0.0);
     var hit_found = false;
     var trapped_horizon = false;
     var einstein_glow : f32 = 0.0;
     var t : f32 = 0.125;
-    var cur_p  = eye + rd * t;
-    var cur_rd = rd;
-    let max_steps : u32 = select(64u, 80u, studio_gi || metric_on);
     let hit_eps   : f32 = select(0.0078125, 0.0020, studio_gi);
     let min_step  : f32 = select(0.0078125, 0.0030, studio_gi);
     let max_t     : f32 = select(32.0, 28.0, studio_gi);
+    var t_limit   : f32 = max_t;
+    var max_steps : u32 = select(select(64u, 48u, studio_gi), 80u, metric_on);
+    var p_inst_mask : u32 = all_inst_mask();
+    var p_feat_mask : u32 = 0xFFFFFFFFu;
+    if (depth_slice) {
+        let sw = (dims.x + 3u) >> 2u;
+        let sh = (dims.y + 3u) >> 2u;
+        let tx = gid.x >> 2u;
+        let ty = gid.y >> 2u;
+        var u_im : u32 = 0u;
+        var u_fm : u32 = 0u;
+        var t_min : f32 = max_t;
+        var t_max : f32 = 0.0;
+        for (var dy : i32 = -1; dy <= 1; dy = dy + 1) {
+            let ny = u32(clamp(i32(ty) + dy, 0, i32(sh) - 1));
+            for (var dx : i32 = -1; dx <= 1; dx = dx + 1) {
+                let nx = u32(clamp(i32(tx) + dx, 0, i32(sw) - 1));
+                let s_idx = ny * sw + nx;
+                if (s_idx < 524288u) {
+                    let sl = slice_buf[s_idx];
+                    u_im = u_im | bitcast<u32>(sl.z);
+                    u_fm = u_fm | bitcast<u32>(sl.w);
+                    if (sl.x < sl.y) {
+                        t_min = min(t_min, sl.x);
+                        t_max = max(t_max, sl.y);
+                    }
+                }
+            }
+        }
+        p_inst_mask = u_im;
+        p_feat_mask = u_fm;
+        if (t_min >= t_max || (!metric_on && (p_inst_mask | p_feat_mask) == 0u)) {
+            max_steps = 0u;
+            t = max_t;
+            t_limit = max_t;
+        } else {
+            t = max(0.125, t_min);
+            t_limit = min(max_t, t_max);
+            if (metric_on) { max_steps = 48u; }
+        }
+    } else {
+        let pad_fb = select(select(0.06, 0.08, studio_gi), max(0.28, graze_w), shells_on) + select(0.0, abs(metric_phi) * 3.0, metric_on);
+        let pc = compute_ray_cull(eye, rd, 0.125, max_t, pad_fb);
+        p_inst_mask = pc.inst_mask;
+        p_feat_mask = pc.feat_mask;
+        t = pc.t_enter;
+        t_limit = pc.t_exit;
+        var has_lens = false;
+        if (metric_on && abs(metric_phi) > 1e-4) {
+            let lv = ray_sphere_interval(eye, rd, lens_center, 3.0 * abs(metric_phi) + 1.25);
+            if (lv.y >= 0.125 && lv.x <= max_t) {
+                has_lens = true;
+                t = min(t, max(0.125, lv.x));
+                t_limit = max(t_limit, min(max_t, lv.y));
+            }
+        }
+        if (((p_inst_mask | p_feat_mask) == 0u && !has_lens) || t >= t_limit) {
+            max_steps = 0u;
+        } else if (metric_on) {
+            max_steps = 48u;
+        }
+    }
+    var cur_p  = eye + rd * t;
+    var cur_rd = rd;
     var min_edge_d : f32 = 1e5;
     var edge_p     : vec3<f32> = eye;
 
     for (var s : u32 = 0u; s < max_steps; s = s + 1u) {
-        if (t >= max_t) { break; }
+        if (t >= t_limit) { break; }
         let p = cur_p;
-        let d = map_scene_dist(p, xray_on, xray_plane);
+        let d = map_scene_dist_masked(p, xray_on, xray_plane, p_inst_mask, p_feat_mask);
         let cone_d = d / max(t, 0.25);
         if (cone_d < min_edge_d) {
             min_edge_d = cone_d;
             edge_p = p;
         }
-        if (d < hit_eps) {
-            let hit_info = map_scene_full(p, xray_on, xray_plane);
-            let n = calc_normal(p, xray_on, xray_plane);
-            col = shade_full_hit(
-                hit_info, p, n, cur_rd, px_ang,
-                xray_on, xray_plane, trc_safe, cb_geom, studio_gi,
-                rc_on, diff_field, subframe_lock, selected_id, time_s
-            );
+        let eps_now = select(hit_eps, max(hit_eps, t * px_ang * 0.35), studio_gi);
+        if (d < eps_now) {
             hit_found = true;
             break;
         }
-        let step_d = max(d, min_step);
+        let step_d = select(max(d, min_step), max(d, max(min_step, t * 0.0008)), studio_gi);
         if (metric_on) {
             let r_vec = cur_p - lens_center;
             let r_len = length(r_vec);
@@ -2540,8 +3323,26 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
             cur_p = eye + rd * t;
         }
     }
-    if (!hit_found && !trapped_horizon && metric_on) {
-        col = eval_backdrop_ray(eye, cur_rd, px_ang);
+    if (hit_found) {
+        let p_hit = cur_p;
+        let hit_near = point_near_scene_mask(p_hit, 0.32);
+        let h_im = hit_near.x & p_inst_mask;
+        let h_fm = hit_near.y & p_feat_mask;
+        let use_im = select(p_inst_mask, h_im, (h_im | h_fm) != 0u);
+        let use_fm = select(p_feat_mask, h_fm, (h_im | h_fm) != 0u);
+        let hit_info = map_scene_full_masked(p_hit, xray_on, xray_plane, use_im, use_fm);
+        let n = calc_normal_masked(p_hit, xray_on, xray_plane, use_im, use_fm);
+        col = shade_full_hit(
+            hit_info, p_hit, n, cur_rd, px_ang,
+            xray_on, xray_plane, trc_safe, cb_geom, studio_gi,
+            rc_on, diff_field, subframe_lock, selected_id, time_s,
+            use_im, use_fm
+        );
+    } else if (!trapped_horizon) {
+        let bg_rd = select(rd, cur_rd, metric_on);
+        if (!(studio_gi && rd.y < -0.001 && ((-1.25 - eye.y) / rd.y) > 0.0 && ((-1.25 - eye.y) / rd.y) < 28.0)) {
+            col = eval_backdrop_ray(eye, bg_rd, px_ang);
+        }
     }
 
     // Studio Floor GI: Contact AO + Soft Shadows + Radiance Cascades Floor Bounce + Planar Reflection
@@ -2552,35 +3353,59 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
             let fp = eye + rd * tf;
             var fcol = eval_floor_grid(fp, tf, abs(rd.y), px_ang);
 
-            // Key-light ground soft shadow + 2-tap ambient proximity occlusion
+            // Key-light ground soft shadow + bounded 2-tap ambient proximity occlusion
             let key_dir = vec3<f32>(-0.5145, 0.7503, -0.4150);
             let sh_f = calc_soft_shadow(fp + vec3<f32>(0.0, 0.018, 0.0), key_dir, 8.5, xray_on, xray_plane);
-            let prox1 = clamp(map_scene_dist(fp + vec3<f32>(0.0, 0.12, 0.0), xray_on, xray_plane) / 0.16, 0.0, 1.0);
-            let prox2 = clamp(map_scene_dist(fp + vec3<f32>(0.0, 0.30, 0.0), xray_on, xray_plane) / 0.38, 0.0, 1.0);
-            let ao_f = clamp(min(prox1, prox2), 0.16, 1.0);
+            var ao_f : f32 = 1.0;
+            let fm = point_near_scene_mask(fp, 0.45);
+            if ((fm.x | fm.y) != 0u) {
+                let prox1 = clamp(map_scene_dist_masked(fp + vec3<f32>(0.0, 0.12, 0.0), xray_on, xray_plane, fm.x, fm.y) / 0.16, 0.0, 1.0);
+                let prox2 = clamp(map_scene_dist_masked(fp + vec3<f32>(0.0, 0.30, 0.0), xray_on, xray_plane, fm.x, fm.y) / 0.38, 0.0, 1.0);
+                ao_f = clamp(min(prox1, prox2), 0.16, 1.0);
+            }
             fcol = fcol * (0.36 + 0.64 * sh_f) * (0.38 + 0.62 * ao_f);
             if (rc_on) {
-                let floor_gi = sample_rc0_irradiance(fp, vec3<f32>(0.0, 1.0, 0.0));
-                fcol = fcol + floor_gi * 0.22 * ao_f;
+                let rc_rel = abs(fp - rc_cage_center());
+                let rc_ext = rc_half_ext() * 1.15;
+                if (rc_rel.x <= rc_ext.x && rc_rel.y <= rc_ext.y && rc_rel.z <= rc_ext.z) {
+                    let floor_gi = sample_rc0_irradiance(fp, vec3<f32>(0.0, 1.0, 0.0));
+                    fcol = fcol + floor_gi * 0.22 * ao_f;
+                }
             }
 
-            // 24-Step Glossy Planar Reflection Ray
+            // Bounding-Sphere-Culled Glossy Planar Reflection Ray (near-field <= 14m)
             let refl_rd = reflect(rd, vec3<f32>(0.0, 1.0, 0.0));
             let refl_ro = fp + vec3<f32>(0.0, 0.016, 0.0);
-            var tr : f32 = 0.05;
             var refl_col = eval_sky_dome(refl_rd) * 0.85;
-            for (var rs : u32 = 0u; rs < 24u; rs = rs + 1u) {
-                if (tr > 11.0) { break; }
-                let rp = refl_ro + refl_rd * tr;
-                let rd_s = map_scene_dist(rp, xray_on, xray_plane);
-                if (rd_s < 0.006) {
-                    let rhit = map_scene_full(rp, xray_on, xray_plane);
-                    let rn = calc_normal(rp, xray_on, xray_plane);
-                    let lit = shade_direct_hit(rhit, rp, rn, refl_rd, trc_safe, time_s);
-                    refl_col = mix(refl_col, lit, exp(-tr * 0.16));
-                    break;
+            if (tf < 14.0) {
+                let rfc = compute_ray_cull(refl_ro, refl_rd, 0.05, 11.0, 0.06);
+                if ((rfc.inst_mask | rfc.feat_mask) != 0u && rfc.t_enter < rfc.t_exit) {
+                    var tr = rfc.t_enter;
+                    var refl_hit = false;
+                    var refl_p = refl_ro;
+                    for (var rs : u32 = 0u; rs < 14u; rs = rs + 1u) {
+                        if (tr > rfc.t_exit) { break; }
+                        let rp = refl_ro + refl_rd * tr;
+                        let rd_s = map_scene_dist_masked(rp, xray_on, xray_plane, rfc.inst_mask, rfc.feat_mask);
+                        if (rd_s < 0.006) {
+                            refl_hit = true;
+                            refl_p = rp;
+                            break;
+                        }
+                        tr = tr + max(rd_s, 0.04);
+                    }
+                    if (refl_hit) {
+                        let rn_m = point_near_scene_mask(refl_p, 0.12);
+                        let r_im = rn_m.x & rfc.inst_mask;
+                        let r_fm = rn_m.y & rfc.feat_mask;
+                        let rim = select(rfc.inst_mask, r_im, (r_im | r_fm) != 0u);
+                        let rfm = select(rfc.feat_mask, r_fm, (r_im | r_fm) != 0u);
+                        let rhit = map_scene_full_masked(refl_p, xray_on, xray_plane, rim, rfm);
+                        let rn = calc_normal_masked(refl_p, xray_on, xray_plane, rim, rfm);
+                        let lit = shade_direct_hit(rhit, refl_p, rn, refl_rd, trc_safe, time_s);
+                        refl_col = mix(refl_col, lit, exp(-tr * 0.16));
+                    }
                 }
-                tr = tr + max(rd_s, 0.035);
             }
             let fres_f = clamp(0.16 + 0.20 * pow(1.0 - clamp(abs(rd.y), 0.0, 1.0), 4.0), 0.16, 0.32);
             fcol = mix(fcol, refl_col, fres_f * exp(-tf * 0.06));
@@ -2615,16 +3440,16 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
                 }
             }
 
-            col = mix(sky_col, fcol, exp(-tf * 0.065));
+            col = mix(eval_sky_dome(rd), fcol, exp(-tf * 0.065));
         }
     }
 
     // Subpixel Cone-Traced Silhouette Edge Antialiasing (Studio GI mode only)
     if (!hit_found && studio_gi && min_edge_d < px_ang * 1.35) {
         let edge_cov = 1.0 - smoothstep(0.0, px_ang * 1.35, min_edge_d);
-        let ehit = map_scene_full(edge_p, xray_on, xray_plane);
+        let ehit = map_scene_full_masked(edge_p, xray_on, xray_plane, p_inst_mask, p_feat_mask);
         if (ehit.inst_id != 0u) {
-            let en = calc_normal(edge_p, xray_on, xray_plane);
+            let en = calc_normal_masked(edge_p, xray_on, xray_plane, p_inst_mask, p_feat_mask);
             let elit = shade_direct_hit(ehit, edge_p, en, cur_rd, trc_safe, time_s);
             col = mix(col, elit, edge_cov * 0.72);
         }
@@ -2655,7 +3480,7 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
         let exposure = clamp(q16_to_f32(cam.q3.x), 0.25, 4.0);
         let depth_s = select(18.0, t, hit_found);
         let coc = clamp(abs(depth_s - focus_d) / max(depth_s, 0.5) * (focal_mm / (fstop * 28.0)), 0.0, 0.65);
-        col = mix(col, bg * 0.75 + col * 0.25, coc * 0.45) * exposure;
+        col = mix(col, eval_sky_dome(rd) * 0.75 + col * 0.25, coc * 0.45) * exposure;
 
         let inst_cnt_f = min(arena[0].q1.z, 32u);
         for (var fi : u32 = 0u; fi < inst_cnt_f; fi = fi + 1u) {
@@ -2682,8 +3507,42 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
         }
     }
 
-    // 3. Wave64 (u32x2) Culled 64-Byte SVG-UI + Liquid Glass + Inline Labels + TextInput/IME
     let ui_cnt = min(arena[0].q2.y, 16u);
+    let glyph_cnt = min(arena[0].q2.z, 16u);
+    let latex_cnt = min(arena[0].q2.w, 16u);
+    let wc = u32(clamp((norm_xy.x + 1.0) * 4.0, 0.0, 7.0));
+    let wr = u32(clamp((norm_xy.y + 1.0) * 4.0, 0.0, 7.0));
+    let bit_idx = wr * 8u + wc;
+    let dom_hit = (ui_cnt > 0u) && wave64_test_u32x2(arena[3].q3.x, arena[3].q3.y, bit_idx);
+    let px_idx = gid.y * dims.x + gid.x;
+
+    if (split_ui && px_idx < 8388608u && (dom_hit || glyph_cnt > 0u || latex_cnt > 0u)) {
+        scene_hdr[px_idx] = pack_hdr_u32(col);
+    } else {
+        col = aces_tonemap(col);
+        col = pow(max(col, vec3<f32>(1e-6)), vec3<f32>(1.0 / 2.2));
+        textureStore(out_tex, vec2<i32>(gid.xy), vec4<f32>(col, 1.0));
+    }
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn bloom_ui_overlay(@builtin(global_invocation_id) gid : vec3<u32>) {
+    if (gid.x == 0xFFFFFFFFu) {
+        rc_buf[0] = slice_buf[0] + vec4<f32>(f32(mesh_buf[0].q0.x));
+    }
+    let dims = textureDimensions(out_tex);
+    if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+    let px_idx = gid.y * dims.x + gid.x;
+    if (px_idx >= 8388608u) { return; }
+
+    let fw = max(f32(dims.x), 1.0);
+    let fh = max(f32(dims.y), 1.0);
+    let px = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
+    let norm_xy = (px / vec2<f32>(fw, fh)) * 2.0 - vec2<f32>(1.0);
+    let aspect = fw / fh;
+
+    let ui_cnt = min(arena[0].q2.y, 16u);
+    let glyph_cnt = min(arena[0].q2.z, 16u);
     let latex_cnt = min(arena[0].q2.w, 16u);
     let wc = u32(clamp((norm_xy.x + 1.0) * 4.0, 0.0, 7.0));
     let wr = u32(clamp((norm_xy.y + 1.0) * 4.0, 0.0, 7.0));
@@ -2691,6 +3550,14 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
 
     let dom_lo = arena[3].q3.x;
     let dom_hi = arena[3].q3.y;
+    let dom_hit = (ui_cnt > 0u) && wave64_test_u32x2(dom_lo, dom_hi, bit_idx);
+    if (!(dom_hit || glyph_cnt > 0u || latex_cnt > 0u)) { return; }
+
+    var col = unpack_hdr_u32(scene_hdr[px_idx]);
+    let hdr_flags = arena[0].q3.z;
+    let studio_gi = (hdr_flags & 16u) != 0u;
+    let time_s = f32(arena[0].q1.y) * 0.0166667;
+    let focused_nid = arena[3].q2.w & 0xFFFFu;
 
     var has_topleft_logo = false;
     if (arena[0].q2.z > 0u && arena[168u].q0.y > 0u) {
@@ -2698,7 +3565,8 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
         has_topleft_logo = (logo_p.x < -0.80) && (logo_p.y < -0.75);
     }
 
-    if (wave64_test_u32x2(dom_lo, dom_hi, bit_idx)) {
+    // 3. Wave64 (u32x2) Culled 64-Byte SVG-UI + Liquid Glass + Inline Labels + TextInput/IME
+    if (dom_hit) {
         for (var i : u32 = 0u; i < ui_cnt; i = i + 1u) {
             let nd = arena[152u + i];
             if (!wave64_test_u32x2(nd.q3.z, nd.q3.w, bit_idx)) { continue; }
@@ -2714,8 +3582,13 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
 
             let style_st = nd.q3.x;
             let action_op = nd.q3.y & 0xFFFFu;
-            let hovered = (style_st & 0x10u) != 0u;
-            let fill_c = unpack_rgb24((style_st >> 8u) & 0xFFFFFFu);
+            let node_caps = nd.q3.y & 0xFFFF0000u;
+            let is_focused  = (focused_nid != 0u) && (nid == focused_nid);
+            let is_disabled = (node_caps & 0x20000u) != 0u;
+            let is_checked  = (node_caps & 0x80000u) != 0u;
+            let hovered = !is_disabled && ((style_st & 0x10u) != 0u);
+            let fill_raw = unpack_rgb24((style_st >> 8u) & 0xFFFFFFu);
+            let fill_c = select(fill_raw, fill_raw * 0.45, is_disabled);
             let bound_v = clamp(q16_to_f32(nd.q2.w), 0.0, 1.0);
             let jet_d1 = clamp(abs(q16_to_f32(nd.q2.z)) * 4.0, 0.0, 1.2);
 
@@ -2740,12 +3613,16 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
                     let a = 1.0 - smoothstep(-aa * 0.5, aa * 1.2, d_ring);
                     col = mix(col, rc, a * 0.94);
                 }
+                if (is_focused && abs(d_ring) < aa * 2.4) {
+                    let f_a = 1.0 - smoothstep(aa * 0.4, aa * 2.4, abs(d_ring));
+                    col = mix(col, vec3<f32>(0.32, 0.96, 1.00) * 1.45, f_a * 0.90);
+                }
             } else {
                 let rx = q16_to_f32(nd.q2.x);
                 let qd = abs(lp) - max(hsz - vec2<f32>(rx), vec2<f32>(0.001));
                 let sdf = min(max(qd.x, qd.y), 0.0) + length(max(qd, vec2<f32>(0.0))) - rx;
 
-                if (sdf < 0.0035) {
+                if (sdf < select(0.0035, 0.0055, is_focused)) {
                     if (is_text_input) {
                         col = shade_text_input_widget(col, norm_xy, center, hsz, sdf, fill_c, hovered, aspect, fh, i);
                     } else if (prim == 5u) {
@@ -2761,6 +3638,9 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
                         let ripple = (0.5 + 0.5 * sin(length(lp) * 95.0 - time_s * 9.0)) * jet_d1 * 0.32;
                         let trans = clamp(vec3<f32>(1.0) - (vec3<f32>(1.0) - fill_c) * (0.22 + 0.52 * bevel), vec3<f32>(0.16), vec3<f32>(1.0));
                         var glass = col * trans * 0.50 + fill_c * (0.27 + 0.24 * bevel + top_sheen + ripple + select(0.0, 0.12, hovered));
+                        if (is_checked) {
+                            glass = glass + fill_c * 0.14;
+                        }
 
                         // Slider Bar Fill + Thumb Indicator
                         if (prim == 4u && sdf < -0.0015) {
@@ -2817,9 +3697,14 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
                             }
                         }
 
-                        col = mix(col, glass, select(0.0, select(0.85, 0.91, hovered), sdf < 0.0));
+                        let body_alpha = select(0.85, 0.45, is_disabled);
+                        col = mix(col, glass, select(0.0, select(body_alpha, 0.91, hovered), sdf < 0.0));
                         let rim = 1.0 - smoothstep(0.0, 0.003, abs(sdf));
-                        col = mix(col, fill_c * select(1.08, 1.42, hovered), rim * 0.86);
+                        col = mix(col, fill_c * select(1.08, 1.42, hovered), rim * select(0.86, 0.45, is_disabled));
+                    }
+                    if (is_focused && abs(sdf) < 0.0045) {
+                        let f_rim = 1.0 - smoothstep(0.001, 0.0045, abs(sdf));
+                        col = mix(col, vec3<f32>(0.32, 0.96, 1.00) * 1.45, f_rim * 0.92);
                     }
                 }
             }
@@ -2827,7 +3712,6 @@ fn bloom_render_frame(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
 
     // 4. Vector <path>/<line> SDF Icon Glyphs (Slots 168..183)
-    let glyph_cnt = min(arena[0].q2.z, 16u);
     for (var g : u32 = 0u; g < glyph_cnt; g = g + 1u) {
         let gl = arena[168u + g];
         let scnt = min(gl.q0.y, 5u);

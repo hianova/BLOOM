@@ -1816,6 +1816,148 @@ LEAN_EXPORT lean_obj_res bloom_jsi_verify_searu_core(uint64_t seed) {
             SEARU_REQ(fir_ok, "FLOW v9.0.0 flow_ir_builder QTT Linear/Unitary FIR1 witness certified");
         }
 
+        /* 11. Domain-Agnostic Agent-Native UI SDK (Snapshot / Query / Guarded Act / Roving Focus / JSON) */
+        {
+            bloom_arena_init_default(gp_arena, 640U, 360U);
+            BloomFlexContainer64 ui_flex;
+            bloom_flex_init64(&ui_flex, BLOOM_FLEX_ROW, BLOOM_JUSTIFY_SPACE_BETWEEN, BLOOM_ALIGN_CENTER,
+                              0, -40000, 56000, 5000, 1024, 1536);
+            BloomUiNode64 *nds = gp_arena->map.ui_nodes;
+            memset(nds, 0, sizeof(gp_arena->map.ui_nodes));
+            for (uint32_t i = 0U; i < 4U; ++i) {
+                nds[i].node_id = i + 1U;
+                nds[i].prim_type = BLOOM_UI_PRIM_RECT_GLASS;
+                nds[i].bind_channel = (i < 2U) ? i : 0xFFU;
+                nds[i].half_w_q16 = 10000;
+                nds[i].half_h_q16 = 4000;
+                nds[i].corner_radius_q16 = 1536;
+                nds[i].scale_jet_v_q16 = BLOOM_Q16_ONE;
+                nds[i].style_and_state = BLOOM_UI_STATE_GLASS_BIT | (0x20D8FFU << 8U);
+                nds[i].action_opcode = (BLOOM_ACTION_CUSTOM_BASE + i) | BLOOM_UI_CAP_FOCUSABLE;
+            }
+            nds[0].action_opcode |= BLOOM_UI_CAP_TOGGLE;
+            nds[1].action_opcode |= BLOOM_UI_CAP_DISABLED;
+            nds[2].action_opcode |= BLOOM_UI_CAP_AGENT_GUARD;
+            nds[3].prim_type = BLOOM_UI_PRIM_SLIDER_BAR;
+            gp_arena->map.frame_hdr.ui_count = 4U;
+            bloom_flex_apply64(&ui_flex, nds, 4U, 0);
+            bloom_ui_set_node_label(gp_arena, 0U, "TOGGLE");
+            bloom_ui_set_node_label(gp_arena, 1U, "LOCKED");
+            bloom_ui_set_node_label(gp_arena, 2U, "GUARDED");
+            bloom_ui_set_node_label(gp_arena, 3U, "SLIDER");
+            uint32_t dlo = 0U, dhi = 0U;
+            for (uint32_t i = 0U; i < 4U; ++i) {
+                dlo |= nds[i].tile_mask_lo32;
+                dhi |= nds[i].tile_mask_hi32;
+            }
+            gp_arena->map.dom.compiled_node_count = 4U;
+            gp_arena->map.dom.dom_mask_lo32 = dlo;
+            gp_arena->map.dom.dom_mask_hi32 = dhi;
+
+            BloomUiSnapshot snap;
+            SEARU_REQ(bloom_ui_snapshot_arena(gp_arena, &snap) && snap.node_count == 4U &&
+                      strncmp(snap.nodes[2].label, "GUARDED", 7U) == 0 && snap.nodes[2].guarded &&
+                      snap.nodes[1].disabled,
+                      "UI SDK snapshot captures generic labels & capability flags");
+
+            BloomUiQuery q;
+            memset(&q, 0, sizeof(q));
+            q.only_enabled = true;
+            q.required_caps = BLOOM_UI_CAP_FOCUSABLE;
+            BloomUiNodeView qv[4];
+            size_t qn = bloom_ui_query_arena(gp_arena, &q, qv, 4U);
+            SEARU_REQ(qn == 3U, "UI SDK query filters enabled focusable nodes");
+
+            BloomUiActRequest areq;
+            BloomUiActResult ares;
+            memset(&areq, 0, sizeof(areq));
+            areq.source = BLOOM_UI_SRC_AGENT;
+            areq.act_kind = BLOOM_UI_ACT_ROVE_NEXT;
+            SEARU_REQ(bloom_ui_agent_act(gp_arena, &areq, &ares) == BLOOM_UI_STATUS_OK &&
+                      ares.focused_node_id == 1U && ares.agent_seq == 1U,
+                      "UI SDK roving focus skips nothing on first enabled node");
+
+            /* ROVE_NEXT from node 1 must skip disabled node 2 and land on node 3 */
+            SEARU_REQ(bloom_ui_agent_act(gp_arena, &areq, &ares) == BLOOM_UI_STATUS_OK &&
+                      ares.focused_node_id == 3U,
+                      "UI SDK roving focus skips DISABLED node");
+
+            /* Guarded node 3 refuses unapproved agent click, accepts allow_guarded=true */
+            areq.node_id = 3U;
+            areq.act_kind = BLOOM_UI_ACT_CLICK;
+            areq.allow_guarded = false;
+            SEARU_REQ(bloom_ui_agent_act(gp_arena, &areq, &ares) == BLOOM_UI_STATUS_VETOED_GUARD,
+                      "UI SDK fail-closed veto on AGENT_GUARD without approval");
+            areq.allow_guarded = true;
+            SEARU_REQ(bloom_ui_agent_act(gp_arena, &areq, &ares) == BLOOM_UI_STATUS_OK &&
+                      ares.fired_action == (BLOOM_ACTION_CUSTOM_BASE + 2U),
+                      "UI SDK allow_guarded=true permits guarded action");
+
+            /* Disabled node 2 rejects click; node 1 toggles checked + reg_bank[0] */
+            areq.node_id = 2U;
+            SEARU_REQ(bloom_ui_agent_act(gp_arena, &areq, &ares) == BLOOM_UI_STATUS_DISABLED,
+                      "UI SDK DISABLED node rejects action");
+            areq.node_id = 1U;
+            areq.act_kind = BLOOM_UI_ACT_TOGGLE;
+            SEARU_REQ(bloom_ui_agent_act(gp_arena, &areq, &ares) == BLOOM_UI_STATUS_OK &&
+                      ares.checked && gp_arena->map.reg_bank.channels_q16[0] == BLOOM_Q16_ONE,
+                      "UI SDK TOGGLE syncs checked state & RegBank");
+
+            /* SET_VALUE on slider node 4 */
+            areq.node_id = 4U;
+            areq.act_kind = BLOOM_UI_ACT_SET_VALUE;
+            areq.value_q16 = 32768;
+            SEARU_REQ(bloom_ui_agent_act(gp_arena, &areq, &ares) == BLOOM_UI_STATUS_OK &&
+                      ares.new_value_q16 == 32768,
+                      "UI SDK SET_VALUE updates slider bound value");
+
+            /* FIR1 circuit guard veto when gate bit=0 and approve when gate bit=1 */
+            static flow_ir_builder_ws_t ui_fir_ws;
+            flow_ir_builder_init(&ui_fir_ws, "ui_guard");
+            ui_fir_ws.ir_prog.num_inputs = 6U;
+            ui_fir_ws.ir_prog.num_vals = 6U;
+            for (uint32_t k = 0U; k < 6U; ++k) {
+                ui_fir_ws.ir_prog.inputs[k] = k;
+                ui_fir_ws.ir_prog.vals[k].width = 16U;
+                ui_fir_ws.ir_prog.vals[k].is_classical = 0U;
+                ui_fir_ws.ir_prog.vals[k].name[0] = 'i';
+                ui_fir_ws.ir_prog.vals[k].name[1] = (char)('0' + k);
+            }
+            uint32_t c_allow_op = flow_ir_emit_const(&ui_fir_ws.ir_prog, 16U,
+                                                     (uint64_t)BLOOM_ACTION_CUSTOM_BASE, "allow_op");
+            uint32_t xor_op = flow_ir_emit_op2(&ui_fir_ws.ir_prog, FLOW_IR_OP_XOR_VEC, 16U, 1U, c_allow_op, "xor_op");
+            uint32_t eq_op = flow_ir_emit_op1(&ui_fir_ws.ir_prog, FLOW_IR_OP_EQ_ZERO, 1U, xor_op, 0ULL, "eq_op");
+            SEARU_REQ(eq_op != UINT32_MAX, "UI SDK FIR1 guard ops emitted");
+            ui_fir_ws.ir_prog.outputs[0] = eq_op;
+            ui_fir_ws.ir_prog.num_outputs = 1U;
+            SEARU_REQ(flow_ir_builder_seal(&ui_fir_ws), "UI SDK FIR1 guard circuit sealed");
+
+            areq.node_id = 3U;
+            areq.act_kind = BLOOM_UI_ACT_CLICK;
+            SEARU_REQ(bloom_ui_agent_act_with_fir(gp_arena, &areq, &ui_fir_ws.ir_reloaded, &ares) == BLOOM_UI_STATUS_VETOED_GUARD,
+                      "UI SDK FIR1 guard vetoes disallowed op");
+            areq.node_id = 1U;
+            SEARU_REQ(bloom_ui_agent_act_with_fir(gp_arena, &areq, &ui_fir_ws.ir_reloaded, &ares) == BLOOM_UI_STATUS_OK,
+                      "UI SDK FIR1 guard approves permitted op");
+
+            /* Modal focus trap blocks non-modal node 1 and accepts modal node 4 */
+            bloom_ui_set_node_caps(&nds[3], BLOOM_UI_CAP_MODAL, 0U);
+            areq.node_id = 1U;
+            areq.act_kind = BLOOM_UI_ACT_CLICK;
+            SEARU_REQ(bloom_ui_agent_act(gp_arena, &areq, &ares) == BLOOM_UI_STATUS_MODAL_TRAP,
+                      "UI SDK modal trap blocks background node");
+            areq.node_id = 4U;
+            SEARU_REQ(bloom_ui_agent_act(gp_arena, &areq, &ares) == BLOOM_UI_STATUS_OK,
+                      "UI SDK modal node executes during active modal");
+
+            char json_buf[2048];
+            SEARU_REQ(bloom_ui_snapshot_arena(gp_arena, &snap), "Re-snapshot succeeds");
+            size_t jlen = bloom_ui_snapshot_to_json(&snap, json_buf, sizeof(json_buf));
+            SEARU_REQ(jlen > 40U && json_buf[0] == '{' && strstr(json_buf, "\"nodes\":[") != NULL &&
+                      strstr(json_buf, "\"modal_active\":true") != NULL,
+                      "UI SDK pure-GPR JSON serialization valid");
+        }
+
         free(gp_pcm);
         free(rw_ring);
         free(rw_rig_saved);

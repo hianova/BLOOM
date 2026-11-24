@@ -709,6 +709,44 @@ int32_t bloom_ui_eval_glass_transmittance_q16(uint32_t fill_rgb24, int32_t bevel
 }
 
 /* 5. Wave64 Hit-Testing, Pointer Capture, Zero-BLR SEARU Solver & FLOW v9.0.0 Tactile Springs */
+static bool ui_has_active_modal(const BloomUiNode64 *nodes, uint32_t count) {
+    if (!nodes) return false;
+    for (uint32_t i = 0U; i < count; ++i) {
+        if ((nodes[i].action_opcode & BLOOM_UI_CAP_MODAL) != 0U &&
+            (nodes[i].action_opcode & BLOOM_UI_CAP_DISABLED) == 0U) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ui_apply_toggle_node(BloomUiNode64 *nd, BloomRegBank64 *bank) {
+    if (!nd) return;
+    if ((nd->action_opcode & BLOOM_UI_CAP_CHECKED) != 0U) {
+        nd->action_opcode &= ~BLOOM_UI_CAP_CHECKED;
+        nd->bound_value_q16 = 0;
+    } else {
+        nd->action_opcode |= BLOOM_UI_CAP_CHECKED;
+        nd->bound_value_q16 = BLOOM_Q16_ONE;
+    }
+    if (bank && nd->bind_channel < BLOOM_REG_CHANNELS) {
+        bloom_reg_bank_set_q16(bank, nd->bind_channel, nd->bound_value_q16);
+    }
+}
+
+static void ui_sync_xray_if_needed(BloomEngineArena *arena, uint32_t op, int32_t val_q16) {
+    if (!arena || op != BLOOM_ACTION_SCRUB_XRAY) return;
+    int32_t plane_q16 = (val_q16 - 32768) * 4;
+    arena->map.frame_hdr.xray_plane_q16 = plane_q16;
+    arena->map.frame_hdr.flags |= BLOOM_FLAG_XRAY_ENABLED;
+    arena->map.section_spec.plane_dist_q16 = plane_q16;
+    if (arena->map.section_spec.section_mode != BLOOM_SEC_MODE_OFF) {
+        ui_stamp_mac(&arena->map.section_spec, 0x5EC70064ULL,
+                     &arena->map.section_spec.mac_lo32,
+                     &arena->map.section_spec.mac_hi32);
+    }
+}
+
 uint32_t bloom_ui_step_pointer_arena(BloomEngineArena *arena,
                                      int32_t cursor_x_q16,
                                      int32_t cursor_y_q16,
@@ -722,6 +760,7 @@ uint32_t bloom_ui_step_pointer_arena(BloomEngineArena *arena,
     BloomUiNode64 *nodes = arena->map.ui_nodes;
 
     uint32_t count = (hdr->ui_count > BLOOM_MAX_UI_NODES) ? BLOOM_MAX_UI_NODES : hdr->ui_count;
+    bool modal_active = ui_has_active_modal(nodes, count);
     dom->cursor_norm_x_q16 = cursor_x_q16;
     dom->cursor_norm_y_q16 = cursor_y_q16;
 
@@ -736,7 +775,9 @@ uint32_t bloom_ui_step_pointer_arena(BloomEngineArena *arena,
     /* If a slider/scrub node holds Pointer Capture, scrub continuously even outside AABB! */
     if (mouse_down && dom->captured_node_id != 0U) {
         for (uint32_t i = 0U; i < count; ++i) {
-            if (nodes[i].node_id == dom->captured_node_id) {
+            if (nodes[i].node_id == dom->captured_node_id &&
+                (nodes[i].action_opcode & BLOOM_UI_CAP_DISABLED) == 0U &&
+                (!modal_active || (nodes[i].action_opcode & BLOOM_UI_CAP_MODAL) != 0U)) {
                 int64_t hw64 = (nodes[i].half_w_q16 > 1024)
                     ? ui_clamp64_to_32((int64_t)nodes[i].half_w_q16, 1024, 16 * BLOOM_Q16_ONE)
                     : 16384LL;
@@ -778,10 +819,12 @@ uint32_t bloom_ui_step_pointer_arena(BloomEngineArena *arena,
         nd->style_and_state &= ~(BLOOM_UI_STATE_HOVER_BIT |
                                  (mouse_down ? 0U : (BLOOM_UI_STATE_ACTIVE_BIT | BLOOM_UI_STATE_CAPTURED_BIT)));
 
+        bool eligible = ((nd->action_opcode & BLOOM_UI_CAP_DISABLED) == 0U) &&
+                        (!modal_active || (nd->action_opcode & BLOOM_UI_CAP_MODAL) != 0U);
         bool hit = false;
         if (!in_dom_tile || !bloom_wave64_test_u32x2(nd->tile_mask_lo32, nd->tile_mask_hi32, cbit)) {
             dom->wave64_cull_skips++;
-        } else {
+        } else if (eligible) {
             int64_t dx64 = (int64_t)cursor_x_q16 - (int64_t)nd->offset_x_q16;
             int64_t dy64 = (int64_t)cursor_y_q16 - (int64_t)nd->offset_y_q16;
             if (dx64 < 0) dx64 = -dx64;
@@ -803,6 +846,14 @@ uint32_t bloom_ui_step_pointer_arena(BloomEngineArena *arena,
                 }
                 fired_action = nd->action_opcode & 0xFFFFU;
                 dom->last_action_opcode = fired_action;
+                if ((nd->action_opcode & BLOOM_UI_CAP_TOGGLE) != 0U) {
+                    ui_apply_toggle_node(nd, bank);
+                }
+                uint32_t foc = ((nd->action_opcode & BLOOM_UI_CAP_FOCUSABLE) != 0U)
+                    ? nd->node_id
+                    : BLOOM_DOM_FOCUSED_NODE(dom);
+                dom->reserved0 = BLOOM_DOM_PACK_STATE(foc, BLOOM_UI_SRC_HUMAN,
+                                                      BLOOM_UI_STATUS_OK, BLOOM_DOM_AGENT_SEQ(dom));
             }
         }
 
@@ -1408,4 +1459,518 @@ void bloom_window_init64(BloomWindow64 *win,
     win->fb_h_px = (uint32_t)((((uint64_t)win->logical_h_px) * (uint64_t)win->dpi_scale_q16) >> 16);
     win->target_fps = (target_fps > 0U) ? target_fps : 60U;
     win->host_flags = BLOOM_WIN_FLAG_VSYNC;
+}
+
+/* 8. Domain-Agnostic Agent-Native UI SDK (Snapshot / Query / Guarded Act / Roving Focus) */
+static void ui_fill_node_view(const BloomEngineArena *arena,
+                              uint32_t idx,
+                              uint32_t focused_nid,
+                              BloomUiNodeView *out) {
+    const BloomUiNode64 *nd = &arena->map.ui_nodes[idx];
+    uint32_t raw_op = nd->action_opcode;
+    memset(out, 0, sizeof(*out));
+    out->slot_index = idx;
+    out->node_id = nd->node_id;
+    out->prim_type = nd->prim_type;
+    out->action_op = raw_op & BLOOM_UI_OP_MASK;
+    out->caps = raw_op & BLOOM_UI_CAP_MASK;
+    out->bind_channel = nd->bind_channel;
+    out->bound_value_q16 = nd->bound_value_q16;
+    out->offset_x_q16 = nd->offset_x_q16;
+    out->offset_y_q16 = nd->offset_y_q16;
+    out->half_w_q16 = nd->half_w_q16;
+    out->half_h_q16 = nd->half_h_q16;
+    out->hovered = (nd->style_and_state & BLOOM_UI_STATE_HOVER_BIT) != 0U;
+    out->active = (nd->style_and_state & BLOOM_UI_STATE_ACTIVE_BIT) != 0U;
+    out->focused = (focused_nid != 0U) && (nd->node_id == focused_nid);
+    out->disabled = (out->caps & BLOOM_UI_CAP_DISABLED) != 0U;
+    out->checked = (out->caps & BLOOM_UI_CAP_CHECKED) != 0U;
+    out->guarded = (out->caps & BLOOM_UI_CAP_AGENT_GUARD) != 0U;
+    out->modal = (out->caps & BLOOM_UI_CAP_MODAL) != 0U;
+    for (size_t k = 0U; k < 15U; ++k) {
+        char ch = arena->map.ui_labels[idx][k];
+        if (ch == '\0') break;
+        out->label[k] = ch;
+    }
+    out->label[15] = '\0';
+}
+
+void bloom_ui_set_node_label(BloomEngineArena *arena, uint32_t slot_idx, const char *label) {
+    if (!arena || slot_idx >= BLOOM_MAX_UI_NODES) return;
+    memset(arena->map.ui_labels[slot_idx], 0, 16U);
+    if (!label) return;
+    size_t out_k = 0U;
+    for (size_t i = 0U; label[i] != '\0' && out_k < 15U; ++i) {
+        uint8_t c = (uint8_t)label[i];
+        if (c >= 0x20U && c <= 0x7EU) {
+            arena->map.ui_labels[slot_idx][out_k++] = (char)c;
+        }
+    }
+    arena->map.ui_labels[slot_idx][out_k] = '\0';
+}
+
+void bloom_ui_set_node_caps(BloomUiNode64 *node, uint32_t caps_enable, uint32_t caps_disable) {
+    if (!node) return;
+    uint32_t op = node->action_opcode & BLOOM_UI_OP_MASK;
+    uint32_t caps = node->action_opcode & BLOOM_UI_CAP_MASK;
+    caps = (caps | (caps_enable & BLOOM_UI_CAP_MASK)) & ~(caps_disable & BLOOM_UI_CAP_MASK);
+    node->action_opcode = op | caps;
+}
+
+bool bloom_ui_snapshot_arena(const BloomEngineArena *arena, BloomUiSnapshot *out_snap) {
+    if (!arena || !out_snap) return false;
+    memset(out_snap, 0, sizeof(*out_snap));
+    const BloomFrameHeader64 *hdr = &arena->map.frame_hdr;
+    const BloomDomState64 *dom = &arena->map.dom;
+    uint32_t count = (hdr->ui_count > BLOOM_MAX_UI_NODES) ? BLOOM_MAX_UI_NODES : hdr->ui_count;
+    uint32_t focused_nid = BLOOM_DOM_FOCUSED_NODE(dom);
+
+    out_snap->node_count = count;
+    out_snap->focused_node_id = focused_nid;
+    out_snap->hovered_node_id = dom->hovered_node_id;
+    out_snap->active_node_id = dom->active_node_id;
+    out_snap->captured_node_id = dom->captured_node_id;
+    out_snap->focused_input_id = dom->focused_input_id;
+    out_snap->last_action_op = dom->last_action_opcode;
+    out_snap->last_source = BLOOM_DOM_LAST_SOURCE(dom);
+    out_snap->last_status = BLOOM_DOM_LAST_STATUS(dom);
+    out_snap->agent_seq = BLOOM_DOM_AGENT_SEQ(dom);
+    out_snap->modal_active = ui_has_active_modal(arena->map.ui_nodes, count);
+    out_snap->frame_seq = hdr->frame_seq;
+
+    for (uint32_t c = 0U; c < BLOOM_REG_CHANNELS; ++c) {
+        out_snap->reg_channels_q16[c] = arena->map.reg_bank.channels_q16[c];
+    }
+    uint8_t blen = arena->map.text_input.byte_len;
+    if (blen > BLOOM_TEXT_INPUT_CAP) blen = BLOOM_TEXT_INPUT_CAP;
+    for (uint8_t k = 0U; k < blen; ++k) {
+        out_snap->text_input_utf8[k] = arena->map.text_input.utf8_buf[k];
+    }
+    out_snap->text_input_utf8[blen] = '\0';
+
+    for (uint32_t i = 0U; i < count; ++i) {
+        ui_fill_node_view(arena, i, focused_nid, &out_snap->nodes[i]);
+    }
+    return true;
+}
+
+static bool ui_str_starts_with(const char *hay, const char *prefix) {
+    if (!prefix || prefix[0] == '\0') return true;
+    if (!hay) return false;
+    for (size_t i = 0U; prefix[i] != '\0'; ++i) {
+        if (hay[i] != prefix[i]) return false;
+    }
+    return true;
+}
+
+size_t bloom_ui_query_arena(const BloomEngineArena *arena,
+                            const BloomUiQuery *query,
+                            BloomUiNodeView *out_views,
+                            size_t max_views) {
+    if (!arena || !out_views || max_views == 0U) return 0U;
+    uint32_t count = (arena->map.frame_hdr.ui_count > BLOOM_MAX_UI_NODES)
+        ? BLOOM_MAX_UI_NODES
+        : arena->map.frame_hdr.ui_count;
+    uint32_t focused_nid = BLOOM_DOM_FOCUSED_NODE(&arena->map.dom);
+    size_t matched = 0U;
+    for (uint32_t i = 0U; i < count && matched < max_views; ++i) {
+        BloomUiNodeView view;
+        ui_fill_node_view(arena, i, focused_nid, &view);
+        if (query != NULL) {
+            if (query->node_id != 0U && view.node_id != query->node_id) continue;
+            if (query->prim_type != 0U && view.prim_type != query->prim_type) continue;
+            if (query->action_op != 0U && view.action_op != (query->action_op & BLOOM_UI_OP_MASK)) continue;
+            if ((view.caps & query->required_caps) != (query->required_caps & BLOOM_UI_CAP_MASK)) continue;
+            if ((view.caps & (query->excluded_caps & BLOOM_UI_CAP_MASK)) != 0U) continue;
+            if (query->only_focused && !view.focused) continue;
+            if (query->only_enabled && view.disabled) continue;
+            if (!ui_str_starts_with(view.label, query->label_prefix)) continue;
+        }
+        out_views[matched++] = view;
+    }
+    return matched;
+}
+
+static uint32_t ui_finish_act_status(BloomEngineArena *arena,
+                                     BloomDomState64 *dom,
+                                     BloomUiActResult *out_res,
+                                     uint32_t status,
+                                     uint32_t target_nid,
+                                     uint32_t src,
+                                     int32_t val_q16,
+                                     bool checked) {
+    uint32_t focused = BLOOM_DOM_FOCUSED_NODE(dom);
+    uint32_t seq = BLOOM_DOM_AGENT_SEQ(dom);
+    dom->reserved0 = BLOOM_DOM_PACK_STATE(focused, src, status, seq);
+    ui_stamp_mac(dom, 0xD0A00064ULL, &dom->mac_lo32, &dom->mac_hi32);
+    if (arena && status == BLOOM_UI_STATUS_OK) {
+        arena->map.frame_hdr.flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+    }
+    if (out_res) {
+        out_res->status = status;
+        out_res->fired_action = BLOOM_ACTION_NONE;
+        out_res->target_node_id = target_nid;
+        out_res->focused_node_id = focused;
+        out_res->source = src;
+        out_res->agent_seq = seq;
+        out_res->new_value_q16 = val_q16;
+        out_res->checked = checked;
+    }
+    return status;
+}
+
+bool bloom_ui_fill_guard_inputs(const BloomEngineArena *arena,
+                                const BloomUiActRequest *req,
+                                uint64_t out_vec[6]) {
+    if (!out_vec) return false;
+    for (size_t i = 0U; i < 6U; ++i) {
+        out_vec[i] = UINT64_C(0);
+    }
+    if (!arena || !req) return false;
+    const BloomDomState64 *dom = &arena->map.dom;
+    uint32_t count = (arena->map.frame_hdr.ui_count > BLOOM_MAX_UI_NODES)
+        ? BLOOM_MAX_UI_NODES
+        : arena->map.frame_hdr.ui_count;
+    uint32_t cur_focus = BLOOM_DOM_FOCUSED_NODE(dom);
+    uint32_t target_nid = (req->node_id != 0U) ? req->node_id : cur_focus;
+    for (uint32_t i = 0U; i < count; ++i) {
+        if (arena->map.ui_nodes[i].node_id == target_nid && target_nid != 0U) {
+            uint32_t raw_op = arena->map.ui_nodes[i].action_opcode;
+            out_vec[0] = (uint64_t)target_nid;
+            out_vec[1] = (uint64_t)(raw_op & BLOOM_UI_OP_MASK);
+            out_vec[2] = (uint64_t)((raw_op >> 16U) & 0xFFFFU);
+            out_vec[3] = (uint64_t)req->act_kind;
+            out_vec[4] = (uint64_t)(uint32_t)req->value_q16;
+            out_vec[5] = (uint64_t)dom->reserved0;
+            return true;
+        }
+    }
+    return false;
+}
+
+uint32_t bloom_ui_agent_act(BloomEngineArena *arena,
+                            const BloomUiActRequest *req,
+                            BloomUiActResult *out_res) {
+    if (!arena || !req) {
+        if (out_res) {
+            memset(out_res, 0, sizeof(*out_res));
+            out_res->status = BLOOM_UI_STATUS_INVALID_ARG;
+        }
+        return BLOOM_UI_STATUS_INVALID_ARG;
+    }
+    BloomFrameHeader64 *hdr = &arena->map.frame_hdr;
+    BloomDomState64 *dom = &arena->map.dom;
+    BloomUiNode64 *nodes = arena->map.ui_nodes;
+    uint32_t count = (hdr->ui_count > BLOOM_MAX_UI_NODES) ? BLOOM_MAX_UI_NODES : hdr->ui_count;
+    uint32_t src = (req->source <= BLOOM_UI_SRC_SYSTEM) ? req->source : BLOOM_UI_SRC_AGENT;
+    bool modal_active = ui_has_active_modal(nodes, count);
+    uint32_t cur_focus = BLOOM_DOM_FOCUSED_NODE(dom);
+    uint32_t seq = BLOOM_DOM_AGENT_SEQ(dom);
+
+    if (req->act_kind == BLOOM_UI_ACT_ROVE_NEXT || req->act_kind == BLOOM_UI_ACT_ROVE_PREV) {
+        uint32_t elig_slots[BLOOM_MAX_UI_NODES];
+        uint32_t elig_cnt = 0U;
+        uint32_t cur_pos = count;
+        for (uint32_t i = 0U; i < count; ++i) {
+            uint32_t c = nodes[i].action_opcode;
+            if ((c & BLOOM_UI_CAP_DISABLED) != 0U) continue;
+            if (modal_active && (c & BLOOM_UI_CAP_MODAL) == 0U) continue;
+            if ((c & BLOOM_UI_CAP_FOCUSABLE) == 0U && nodes[i].prim_type == BLOOM_UI_PRIM_NONE) continue;
+            if (nodes[i].node_id == cur_focus) cur_pos = elig_cnt;
+            elig_slots[elig_cnt++] = i;
+        }
+        if (elig_cnt == 0U) {
+            return ui_finish_act_status(arena, dom, out_res, BLOOM_UI_STATUS_NOT_FOUND, 0U, src, 0, false);
+        }
+        uint32_t next_pos = 0U;
+        if (req->act_kind == BLOOM_UI_ACT_ROVE_NEXT) {
+            next_pos = (cur_pos < elig_cnt) ? ((cur_pos + 1U) % elig_cnt) : 0U;
+        } else {
+            next_pos = (cur_pos < elig_cnt) ? ((cur_pos + elig_cnt - 1U) % elig_cnt) : (elig_cnt - 1U);
+        }
+        uint32_t next_idx = elig_slots[next_pos];
+        uint32_t next_nid = nodes[next_idx].node_id;
+        if (src == BLOOM_UI_SRC_AGENT) {
+            seq = (seq + 1U) & 0xFFU;
+        }
+        dom->reserved0 = BLOOM_DOM_PACK_STATE(next_nid, src, BLOOM_UI_STATUS_OK, seq);
+        if (nodes[next_idx].prim_type == BLOOM_UI_PRIM_TEXT_INPUT ||
+            (nodes[next_idx].action_opcode & BLOOM_UI_OP_MASK) == BLOOM_ACTION_FOCUS_INPUT) {
+            dom->focused_input_id = next_nid;
+        }
+        ui_stamp_mac(dom, 0xD0A00064ULL, &dom->mac_lo32, &dom->mac_hi32);
+        hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+        if (out_res) {
+            out_res->status = BLOOM_UI_STATUS_OK;
+            out_res->fired_action = BLOOM_ACTION_NONE;
+            out_res->target_node_id = next_nid;
+            out_res->focused_node_id = next_nid;
+            out_res->source = src;
+            out_res->agent_seq = seq;
+            out_res->new_value_q16 = nodes[next_idx].bound_value_q16;
+            out_res->checked = (nodes[next_idx].action_opcode & BLOOM_UI_CAP_CHECKED) != 0U;
+        }
+        return BLOOM_UI_STATUS_OK;
+    }
+
+    uint32_t target_nid = (req->node_id != 0U) ? req->node_id : cur_focus;
+    uint32_t idx = count;
+    for (uint32_t i = 0U; i < count; ++i) {
+        if (nodes[i].node_id == target_nid && target_nid != 0U) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx >= count) {
+        return ui_finish_act_status(arena, dom, out_res, BLOOM_UI_STATUS_NOT_FOUND, target_nid, src, 0, false);
+    }
+
+    BloomUiNode64 *nd = &nodes[idx];
+    uint32_t op = nd->action_opcode & BLOOM_UI_OP_MASK;
+    uint32_t caps = nd->action_opcode & BLOOM_UI_CAP_MASK;
+
+    if ((nd->action_opcode & BLOOM_UI_CAP_DISABLED) != 0U) {
+        return ui_finish_act_status(arena, dom, out_res, BLOOM_UI_STATUS_DISABLED, target_nid,
+                                    src, nd->bound_value_q16,
+                                    (nd->action_opcode & BLOOM_UI_CAP_CHECKED) != 0U);
+    }
+    if (modal_active && (nd->action_opcode & BLOOM_UI_CAP_MODAL) == 0U) {
+        return ui_finish_act_status(arena, dom, out_res, BLOOM_UI_STATUS_MODAL_TRAP, target_nid,
+                                    src, nd->bound_value_q16,
+                                    (nd->action_opcode & BLOOM_UI_CAP_CHECKED) != 0U);
+    }
+    if (src == BLOOM_UI_SRC_AGENT) {
+        bool allowed = true;
+        if (req->guard_verdict == BLOOM_UI_GUARD_VETO) {
+            allowed = false;
+        } else if ((nd->action_opcode & BLOOM_UI_CAP_AGENT_GUARD) != 0U &&
+                   !req->allow_guarded &&
+                   req->guard_verdict != BLOOM_UI_GUARD_ALLOW) {
+            allowed = false;
+        }
+        if (!allowed) {
+            return ui_finish_act_status(arena, dom, out_res, BLOOM_UI_STATUS_VETOED_GUARD, target_nid,
+                                        src, nd->bound_value_q16,
+                                        (nd->action_opcode & BLOOM_UI_CAP_CHECKED) != 0U);
+        }
+    }
+
+    uint32_t fired_action = BLOOM_ACTION_NONE;
+    switch (req->act_kind) {
+        case BLOOM_UI_ACT_CLICK:
+            dom->active_node_id = nd->node_id;
+            dom->click_dispatch_count++;
+            fired_action = op;
+            if ((caps & BLOOM_UI_CAP_TOGGLE) != 0U) {
+                ui_apply_toggle_node(nd, &arena->map.reg_bank);
+            }
+            if ((caps & BLOOM_UI_CAP_FOCUSABLE) != 0U) {
+                cur_focus = nd->node_id;
+            }
+            break;
+
+        case BLOOM_UI_ACT_TOGGLE:
+            nd->action_opcode |= BLOOM_UI_CAP_TOGGLE;
+            ui_apply_toggle_node(nd, &arena->map.reg_bank);
+            dom->click_dispatch_count++;
+            fired_action = op;
+            if ((caps & BLOOM_UI_CAP_FOCUSABLE) != 0U) {
+                cur_focus = nd->node_id;
+            }
+            break;
+
+        case BLOOM_UI_ACT_SET_VALUE:
+            nd->bound_value_q16 = ui_clamp32(req->value_q16, 0, BLOOM_Q16_ONE);
+            if (nd->bind_channel < BLOOM_REG_CHANNELS) {
+                bloom_reg_bank_set_q16(&arena->map.reg_bank, nd->bind_channel, nd->bound_value_q16);
+            }
+            ui_sync_xray_if_needed(arena, op, nd->bound_value_q16);
+            fired_action = op;
+            if ((caps & BLOOM_UI_CAP_FOCUSABLE) != 0U) {
+                cur_focus = nd->node_id;
+            }
+            break;
+
+        case BLOOM_UI_ACT_FOCUS:
+            cur_focus = nd->node_id;
+            if (nd->prim_type == BLOOM_UI_PRIM_TEXT_INPUT || op == BLOOM_ACTION_FOCUS_INPUT) {
+                dom->focused_input_id = nd->node_id;
+                arena->map.text_input.bound_node_id = nd->node_id;
+                arena->map.text_input.focused = 1U;
+            }
+            break;
+
+        case BLOOM_UI_ACT_TEXT_CHAR:
+            dom->focused_input_id = nd->node_id;
+            arena->map.text_input.bound_node_id = nd->node_id;
+            arena->map.text_input.focused = 1U;
+            if (!bloom_text_input_insert_char64(&arena->map.text_input, (char)req->char_byte)) {
+                return ui_finish_act_status(arena, dom, out_res, BLOOM_UI_STATUS_INVALID_ARG, target_nid,
+                                            src, nd->bound_value_q16,
+                                            (nd->action_opcode & BLOOM_UI_CAP_CHECKED) != 0U);
+            }
+            cur_focus = nd->node_id;
+            fired_action = op;
+            break;
+
+        case BLOOM_UI_ACT_TEXT_BACKSPACE:
+            dom->focused_input_id = nd->node_id;
+            arena->map.text_input.bound_node_id = nd->node_id;
+            arena->map.text_input.focused = 1U;
+            (void)bloom_text_input_backspace64(&arena->map.text_input);
+            cur_focus = nd->node_id;
+            fired_action = op;
+            break;
+
+        default:
+            return ui_finish_act_status(arena, dom, out_res, BLOOM_UI_STATUS_INVALID_ARG, target_nid,
+                                        src, nd->bound_value_q16,
+                                        (nd->action_opcode & BLOOM_UI_CAP_CHECKED) != 0U);
+    }
+
+    if (src == BLOOM_UI_SRC_AGENT) {
+        seq = (seq + 1U) & 0xFFU;
+    }
+    dom->last_action_opcode = (fired_action != BLOOM_ACTION_NONE) ? fired_action : dom->last_action_opcode;
+    dom->reserved0 = BLOOM_DOM_PACK_STATE(cur_focus, src, BLOOM_UI_STATUS_OK, seq);
+    ui_stamp_mac(dom, 0xD0A00064ULL, &dom->mac_lo32, &dom->mac_hi32);
+
+    /* Pulse FLOW v9.0.0 2-Jet tactile spring on acted UI node */
+    {
+        uint64_t *st = arena->map.flow_states[BLOOM_FLOW_CH_UI_NODE0 + idx];
+        const uint64_t (*charts)[8] = (const uint64_t (*)[8])arena->map.flow_charts;
+        flow_step_atlas(st, st, charts, BLOOM_FLOW_CHART_MASK, 60293, 0U);
+        nd->scale_jet_v_q16 = ui_clamp32((int32_t)(int64_t)st[3], 49152, 85196);
+        nd->scale_jet_d1_q16 = (int32_t)(st[4] & 0x7FFFFFFFULL);
+    }
+    hdr->flags &= ~BLOOM_FLAG_IDLE_SLEEP;
+
+    if (out_res) {
+        out_res->status = BLOOM_UI_STATUS_OK;
+        out_res->fired_action = fired_action;
+        out_res->target_node_id = nd->node_id;
+        out_res->focused_node_id = cur_focus;
+        out_res->source = src;
+        out_res->agent_seq = seq;
+        out_res->new_value_q16 = nd->bound_value_q16;
+        out_res->checked = (nd->action_opcode & BLOOM_UI_CAP_CHECKED) != 0U;
+    }
+    return BLOOM_UI_STATUS_OK;
+}
+
+typedef struct {
+    char  *buf;
+    size_t cap;
+    size_t pos;
+} UiJsonWriter;
+
+#if defined(__GNUC__) || defined(__clang__)
+#define BLOOM_UI_NOINLINE __attribute__((noinline))
+#else
+#define BLOOM_UI_NOINLINE
+#endif
+
+static void ui_jw_ch(UiJsonWriter *w, char ch) {
+    if (w->pos + 1U < w->cap) {
+        w->buf[w->pos] = ch;
+    }
+    w->pos++;
+}
+
+static BLOOM_UI_NOINLINE void ui_jw_str_raw(UiJsonWriter *w, const char *s) {
+    if (!s) return;
+    for (size_t i = 0U; s[i] != '\0'; ++i) {
+        ui_jw_ch(w, s[i]);
+    }
+}
+
+static BLOOM_UI_NOINLINE void ui_jw_u32(UiJsonWriter *w, uint32_t v) {
+    char tmp[12];
+    size_t n = 0U;
+    if (v == 0U) {
+        ui_jw_ch(w, '0');
+        return;
+    }
+    while (v > 0U && n < sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (v % 10U));
+        v /= 10U;
+    }
+    while (n > 0U) {
+        ui_jw_ch(w, tmp[--n]);
+    }
+}
+
+static BLOOM_UI_NOINLINE void ui_jw_i32(UiJsonWriter *w, int32_t v) {
+    uint32_t mag;
+    if (v < 0) {
+        ui_jw_ch(w, '-');
+        mag = (uint32_t)(-(int64_t)v);
+    } else {
+        mag = (uint32_t)v;
+    }
+    ui_jw_u32(w, mag);
+}
+
+static BLOOM_UI_NOINLINE void ui_jw_bool(UiJsonWriter *w, bool b) {
+    ui_jw_str_raw(w, b ? "true" : "false");
+}
+
+static BLOOM_UI_NOINLINE void ui_jw_json_str(UiJsonWriter *w, const char *s) {
+    ui_jw_ch(w, '"');
+    if (s) {
+        for (size_t i = 0U; s[i] != '\0'; ++i) {
+            uint8_t u = (uint8_t)s[i];
+            if (u == '"' || u == '\\') {
+                ui_jw_ch(w, '\\');
+                ui_jw_ch(w, (char)u);
+            } else if (u >= 0x20U && u <= 0x7EU) {
+                ui_jw_ch(w, (char)u);
+            }
+        }
+    }
+    ui_jw_ch(w, '"');
+}
+
+size_t bloom_ui_snapshot_to_json(const BloomUiSnapshot *snap, char *out_buf, size_t cap) {
+    if (!snap || !out_buf || cap == 0U) return 0U;
+    UiJsonWriter w;
+    w.buf = out_buf;
+    w.cap = cap;
+    w.pos = 0U;
+
+    ui_jw_str_raw(&w, "{\"frame_seq\":"); ui_jw_u32(&w, snap->frame_seq);
+    ui_jw_str_raw(&w, ",\"focused_node_id\":"); ui_jw_u32(&w, snap->focused_node_id);
+    ui_jw_str_raw(&w, ",\"hovered_node_id\":"); ui_jw_u32(&w, snap->hovered_node_id);
+    ui_jw_str_raw(&w, ",\"active_node_id\":"); ui_jw_u32(&w, snap->active_node_id);
+    ui_jw_str_raw(&w, ",\"modal_active\":"); ui_jw_bool(&w, snap->modal_active);
+    ui_jw_str_raw(&w, ",\"last_source\":"); ui_jw_u32(&w, snap->last_source);
+    ui_jw_str_raw(&w, ",\"last_status\":"); ui_jw_u32(&w, snap->last_status);
+    ui_jw_str_raw(&w, ",\"agent_seq\":"); ui_jw_u32(&w, snap->agent_seq);
+    ui_jw_str_raw(&w, ",\"last_action_op\":"); ui_jw_u32(&w, snap->last_action_op);
+    ui_jw_str_raw(&w, ",\"text_input\":"); ui_jw_json_str(&w, snap->text_input_utf8);
+    ui_jw_str_raw(&w, ",\"nodes\":[");
+
+    uint32_t n = (snap->node_count > BLOOM_MAX_UI_NODES) ? BLOOM_MAX_UI_NODES : snap->node_count;
+    for (uint32_t i = 0U; i < n; ++i) {
+        const BloomUiNodeView *nv = &snap->nodes[i];
+        if (i > 0U) ui_jw_ch(&w, ',');
+        ui_jw_str_raw(&w, "{\"slot\":"); ui_jw_u32(&w, nv->slot_index);
+        ui_jw_str_raw(&w, ",\"node_id\":"); ui_jw_u32(&w, nv->node_id);
+        ui_jw_str_raw(&w, ",\"prim\":"); ui_jw_u32(&w, nv->prim_type);
+        ui_jw_str_raw(&w, ",\"op\":"); ui_jw_u32(&w, nv->action_op);
+        ui_jw_str_raw(&w, ",\"caps\":"); ui_jw_u32(&w, nv->caps >> 16U);
+        ui_jw_str_raw(&w, ",\"value_q16\":"); ui_jw_i32(&w, nv->bound_value_q16);
+        ui_jw_str_raw(&w, ",\"focused\":"); ui_jw_bool(&w, nv->focused);
+        ui_jw_str_raw(&w, ",\"disabled\":"); ui_jw_bool(&w, nv->disabled);
+        ui_jw_str_raw(&w, ",\"checked\":"); ui_jw_bool(&w, nv->checked);
+        ui_jw_str_raw(&w, ",\"guarded\":"); ui_jw_bool(&w, nv->guarded);
+        ui_jw_str_raw(&w, ",\"modal\":"); ui_jw_bool(&w, nv->modal);
+        ui_jw_str_raw(&w, ",\"label\":"); ui_jw_json_str(&w, nv->label);
+        ui_jw_ch(&w, '}');
+    }
+    ui_jw_str_raw(&w, "]}");
+
+    size_t written = (w.pos < cap) ? w.pos : (cap - 1U);
+    out_buf[written] = '\0';
+    return written;
 }

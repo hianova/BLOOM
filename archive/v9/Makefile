@@ -32,12 +32,13 @@ SDL3_LIBS       := $(shell if command -v pkg-config >/dev/null 2>&1 && pkg-confi
 	elif [ -d /opt/homebrew/lib ]; then echo "-L/opt/homebrew/lib -Wl,-rpath,/opt/homebrew/lib -lSDL3"; \
 	else echo "-L/usr/local/lib -Wl,-rpath,/usr/local/lib -lSDL3"; fi)
 
-FLOW_DIR     ?= $(abspath ../FLOW)
+FLOW_DIR     ?= $(abspath ../../../FLOW)
 FLOW_BUILD   := $(FLOW_DIR)/build/lean
 LEAN_SYSROOT := $(shell $(LEAN) --print-prefix)
 
-BUILD_DIR    := build
-LIBBLOOM_A   := $(BUILD_DIR)/libbloom.a
+BUILD_DIR       := build
+LIBBLOOM_A      := $(BUILD_DIR)/libbloom.a
+LIBBLOOM_WIRE_A := $(BUILD_DIR)/libbloom_wire.a
 BLOOM_BIN    := $(BUILD_DIR)/bloom
 BLOOM_OLEAN  := $(BUILD_DIR)/Bloom.olean
 SCHEMA_HDR   := $(BUILD_DIR)/bloom_schema_abi.h
@@ -56,8 +57,8 @@ HOST_CFLAGS := -std=c17 -Wall -Wextra -Wpedantic -Werror $(UBTRAP_FLAGS) -O2 -fP
 CLI_CFLAGS  := -std=c17 -Wall -Wextra -Wpedantic -Werror $(UBTRAP_FLAGS) -O2 -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -isystem "$(FLOW_DIR)/sdk"
 JSI_CFLAGS  := -std=c17 -Wall -Wextra -Werror $(UBTRAP_FLAGS) -O2 -fPIC -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -isystem "$(FLOW_DIR)/sdk" -isystem "$(LEAN_SYSROOT)/include"
 
-ALL_C_SRCS := src/bloom_scene.c src/bloom_ui.c src/bloom_prefab.c src/bloom_lean_jsi.c src/bloom_gpu_host.c src/bloom_cli.c
-CORE_OBJS  := $(BUILD_DIR)/bloom_scene.o $(BUILD_DIR)/bloom_ui.o $(BUILD_DIR)/bloom_prefab.o
+ALL_C_SRCS := src/bloom_wire.c src/bloom_scene.c src/bloom_ui.c src/bloom_prefab.c src/bloom_lean_jsi.c src/bloom_gpu_host.c src/bloom_cli.c
+CORE_OBJS  := $(BUILD_DIR)/bloom_wire.o $(BUILD_DIR)/bloom_scene.o $(BUILD_DIR)/bloom_ui.o $(BUILD_DIR)/bloom_prefab.o
 JSI_OBJ    := $(BUILD_DIR)/bloom_lean_jsi.o
 HOST_OBJ   := $(BUILD_DIR)/bloom_gpu_host.o
 CLI_OBJ    := $(BUILD_DIR)/bloom_cli.o
@@ -77,7 +78,7 @@ LIBBLOOM_DYN := $(BUILD_DIR)/libbloom.$(DYN_EXT)
 # Pure Single-Track Cross-Platform Verified SDK & Zero-Lean Native Runner Build
 # AOT Bloom.lean -> build/studio.bloom (16KB) -> Pure C17 build/bloom (SDL3 GPU)
 # ==============================================================================
-all: cpp-gate $(LIBBLOOM_A) $(LIBBLOOM_DYN) $(GEN_SPV) $(GEN_MSL) $(BLOOM_BIN) $(BLOOM_OLEAN) $(STUDIO_IMG)
+all: cpp-gate $(LIBBLOOM_WIRE_A) $(LIBBLOOM_A) $(LIBBLOOM_DYN) $(GEN_SPV) $(GEN_MSL) $(BLOOM_BIN) $(BLOOM_OLEAN) $(STUDIO_IMG)
 
 verify: all test mutate-check
 
@@ -114,6 +115,9 @@ $(BUILD_DIR):
 upstream-deps:
 	$(MAKE) -C "$(FLOW_DIR)" build/lean/Flow.olean
 
+$(BUILD_DIR)/bloom_wire.o: src/bloom_wire.c include/bloom_abi.h include/bloom_scene.h include/bloom_prefab.h $(SCHEMA_HDR) | $(BUILD_DIR)
+	$(CC) $(CORE_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/bloom_scene.o: src/bloom_scene.c include/bloom_abi.h include/bloom_scene.h $(SCHEMA_HDR) | $(BUILD_DIR)
 	$(CC) $(CORE_CFLAGS) -c $< -o $@
 
@@ -132,6 +136,10 @@ $(STATIC_STAMP): $(ALL_C_SRCS) include/*.h $(SCHEMA_HDR) | $(BUILD_DIR) upstream
 		$(ALL_C_SRCS) \
 		-- -std=c17 -Iinclude -I$(BUILD_DIR) -isystem "$(FLOW_DIR)/core" -isystem "$(FLOW_DIR)/sdk" -isystem "$(LEAN_SYSROOT)/include" $(SDL3_CFLAGS)
 	@touch $@
+
+$(LIBBLOOM_WIRE_A): $(BUILD_DIR)/bloom_wire.o $(STATIC_STAMP)
+	@rm -f $@
+	$(AR) rcs $@ $(BUILD_DIR)/bloom_wire.o
 
 $(LIBBLOOM_A): $(CORE_OBJS) $(STATIC_STAMP)
 	@rm -f $@
@@ -175,8 +183,12 @@ $(SHADER_STAMP): $(WGSL_SRC) | $(BUILD_DIR)
 	sed -e 's/mesh_buf \[\[user(fake0)\]\]/mesh_buf [[buffer(1)]]/g' \
 	    -e 's/arena \[\[user(fake0)\]\]/arena [[buffer(0)]]/g' \
 	    -e 's/rc_buf \[\[user(fake0)\]\]/rc_buf [[buffer(2)]]/g' \
+	    -e 's/slice_buf \[\[user(fake0)\]\]/slice_buf [[buffer(3)]]/g' \
+	    -e 's/scene_hdr \[\[user(fake0)\]\]/scene_hdr [[buffer(4)]]/g' \
 	    -e 's/out_tex \[\[user(fake0)\]\]/out_tex [[texture(0)]]/g' \
 	    -e 's/bloom_rc_cascade\([012]\)_(/bloom_rc_cascade\1(/g' \
+	    -e 's/bloom_depth_slice_(/bloom_depth_slice(/g' \
+	    -e 's/bloom_ui_overlay_(/bloom_ui_overlay(/g' \
 	    -e 's/bloom_fir1_hunt_(/bloom_fir1_hunt(/g' \
 	    -e 's/bloom_fir1_bitslice_(/bloom_fir1_bitslice(/g' \
 	    -e 's/bloom_searu_solve_(/bloom_searu_solve(/g' \

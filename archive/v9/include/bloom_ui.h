@@ -2,6 +2,7 @@
 #define BLOOM_UI_H
 
 #include "bloom_abi.h"
+#include "flow_ir.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,6 +54,53 @@ extern "C" {
 #define BLOOM_ACTION_TOGGLE_TRC    5U
 #define BLOOM_ACTION_FOCUS_INPUT   6U
 #define BLOOM_ACTION_CUSTOM_BASE   16U
+
+/* Generic UI Node Capability & Behavior Bits (stored in upper 16 bits of action_opcode) */
+#define BLOOM_UI_OP_MASK           0x0000FFFFU
+#define BLOOM_UI_CAP_MASK          0xFFFF0000U
+#define BLOOM_UI_CAP_FOCUSABLE     (1U << 16)
+#define BLOOM_UI_CAP_DISABLED      (1U << 17)
+#define BLOOM_UI_CAP_TOGGLE        (1U << 18)
+#define BLOOM_UI_CAP_CHECKED       (1U << 19)
+#define BLOOM_UI_CAP_AGENT_GUARD   (1U << 20)
+#define BLOOM_UI_CAP_MODAL         (1U << 21)
+
+/* Agent-Native UI Bridge Sources, Action Kinds & Status Codes */
+#define BLOOM_UI_SRC_NONE          0U
+#define BLOOM_UI_SRC_HUMAN         1U
+#define BLOOM_UI_SRC_AGENT         2U
+#define BLOOM_UI_SRC_SYSTEM        3U
+
+#define BLOOM_UI_ACT_CLICK          0U
+#define BLOOM_UI_ACT_SET_VALUE      1U
+#define BLOOM_UI_ACT_TOGGLE         2U
+#define BLOOM_UI_ACT_FOCUS          3U
+#define BLOOM_UI_ACT_ROVE_NEXT      4U
+#define BLOOM_UI_ACT_ROVE_PREV      5U
+#define BLOOM_UI_ACT_TEXT_CHAR      6U
+#define BLOOM_UI_ACT_TEXT_BACKSPACE 7U
+
+#define BLOOM_UI_STATUS_OK           0U
+#define BLOOM_UI_STATUS_VETOED_GUARD 1U
+#define BLOOM_UI_STATUS_NOT_FOUND    2U
+#define BLOOM_UI_STATUS_DISABLED     3U
+#define BLOOM_UI_STATUS_MODAL_TRAP   4U
+#define BLOOM_UI_STATUS_INVALID_ARG  5U
+
+#define BLOOM_UI_GUARD_NONE          0U
+#define BLOOM_UI_GUARD_ALLOW         1U
+#define BLOOM_UI_GUARD_VETO          2U
+
+/* Packed DOM focus / provenance / agent-seq field inside BloomDomState64.reserved0 */
+#define BLOOM_DOM_FOCUSED_NODE(dom) ((uint32_t)((dom)->reserved0 & 0xFFFFU))
+#define BLOOM_DOM_LAST_SOURCE(dom)  ((uint32_t)(((dom)->reserved0 >> 16U) & 0xFU))
+#define BLOOM_DOM_LAST_STATUS(dom)  ((uint32_t)(((dom)->reserved0 >> 20U) & 0xFU))
+#define BLOOM_DOM_AGENT_SEQ(dom)    ((uint32_t)(((dom)->reserved0 >> 24U) & 0xFFU))
+#define BLOOM_DOM_PACK_STATE(focused_nid, src, status, agent_seq) \
+    ((((uint32_t)(focused_nid)) & 0xFFFFU) |                      \
+     ((((uint32_t)(src)) & 0xFU) << 16U) |                        \
+     ((((uint32_t)(status)) & 0xFU) << 20U) |                     \
+     ((((uint32_t)(agent_seq)) & 0xFFU) << 24U))
 
 /* Flexbox Layout Modes */
 #define BLOOM_FLEX_ROW    0U
@@ -193,6 +241,124 @@ void bloom_window_init64(BloomWindow64 *win,
                          uint32_t logical_h,
                          int32_t dpi_scale_q16,
                          uint32_t target_fps);
+
+/* 8. Domain-Agnostic Agent-Native UI SDK (Snapshot / Query / Guarded Act / Roving Focus) */
+typedef struct {
+    uint32_t slot_index;
+    uint32_t node_id;
+    uint32_t prim_type;
+    uint32_t action_op;
+    uint32_t caps;
+    uint32_t bind_channel;
+    int32_t  bound_value_q16;
+    int32_t  offset_x_q16;
+    int32_t  offset_y_q16;
+    int32_t  half_w_q16;
+    int32_t  half_h_q16;
+    bool     hovered;
+    bool     active;
+    bool     focused;
+    bool     disabled;
+    bool     checked;
+    bool     guarded;
+    bool     modal;
+    char     label[16];
+} BloomUiNodeView;
+
+typedef struct {
+    uint32_t        node_count;
+    uint32_t        focused_node_id;
+    uint32_t        hovered_node_id;
+    uint32_t        active_node_id;
+    uint32_t        captured_node_id;
+    uint32_t        focused_input_id;
+    uint32_t        last_action_op;
+    uint32_t        last_source;
+    uint32_t        last_status;
+    uint32_t        agent_seq;
+    bool            modal_active;
+    uint32_t        frame_seq;
+    int32_t         reg_channels_q16[BLOOM_REG_CHANNELS];
+    char            text_input_utf8[40];
+    BloomUiNodeView nodes[BLOOM_MAX_UI_NODES];
+} BloomUiSnapshot;
+
+typedef struct {
+    uint32_t node_id;
+    uint32_t prim_type;
+    uint32_t action_op;
+    uint32_t required_caps;
+    uint32_t excluded_caps;
+    bool     only_focused;
+    bool     only_enabled;
+    const char *label_prefix;
+} BloomUiQuery;
+
+typedef struct {
+    uint32_t node_id;
+    uint32_t act_kind;
+    int32_t  value_q16;
+    uint32_t source;
+    bool     allow_guarded;
+    uint8_t  guard_verdict;
+    uint8_t  char_byte;
+} BloomUiActRequest;
+
+typedef struct {
+    uint32_t status;
+    uint32_t fired_action;
+    uint32_t target_node_id;
+    uint32_t focused_node_id;
+    uint32_t source;
+    uint32_t agent_seq;
+    int32_t  new_value_q16;
+    bool     checked;
+} BloomUiActResult;
+
+void bloom_ui_set_node_label(BloomEngineArena *arena, uint32_t slot_idx, const char *label);
+
+void bloom_ui_set_node_caps(BloomUiNode64 *node, uint32_t caps_enable, uint32_t caps_disable);
+
+bool bloom_ui_snapshot_arena(const BloomEngineArena *arena, BloomUiSnapshot *out_snap);
+
+size_t bloom_ui_query_arena(const BloomEngineArena *arena,
+                            const BloomUiQuery *query,
+                            BloomUiNodeView *out_views,
+                            size_t max_views);
+
+bool bloom_ui_fill_guard_inputs(const BloomEngineArena *arena,
+                                const BloomUiActRequest *req,
+                                uint64_t out_vec[6]);
+
+uint32_t bloom_ui_agent_act(BloomEngineArena *arena,
+                            const BloomUiActRequest *req,
+                            BloomUiActResult *out_res);
+
+static inline uint32_t bloom_ui_agent_act_with_fir(BloomEngineArena *arena,
+                                                   const BloomUiActRequest *req,
+                                                   const flow_ir_prog_t *fir_guard,
+                                                   BloomUiActResult *out_res) {
+    if (!arena || !req) {
+        return bloom_ui_agent_act(arena, req, out_res);
+    }
+    BloomUiActRequest eff = *req;
+    if (fir_guard != NULL && eff.source == BLOOM_UI_SRC_AGENT) {
+        uint64_t in_vec[FLOW_IR_MAX_IO];
+        uint64_t out_vec[FLOW_IR_MAX_IO];
+        for (size_t i = 0U; i < FLOW_IR_MAX_IO; ++i) {
+            in_vec[i] = UINT64_C(0);
+            out_vec[i] = UINT64_C(0);
+        }
+        bool has_node = bloom_ui_fill_guard_inputs(arena, req, in_vec);
+        bool eval_ok = has_node && flow_ir_eval_u64(fir_guard, in_vec, out_vec);
+        eff.guard_verdict = (eval_ok && out_vec[0] != UINT64_C(0))
+            ? (uint8_t)BLOOM_UI_GUARD_ALLOW
+            : (uint8_t)BLOOM_UI_GUARD_VETO;
+    }
+    return bloom_ui_agent_act(arena, &eff, out_res);
+}
+
+size_t bloom_ui_snapshot_to_json(const BloomUiSnapshot *snap, char *out_buf, size_t cap);
 
 #ifdef __cplusplus
 }

@@ -50,6 +50,10 @@ extern "C" {
 /* Radiance Cascades & Sub-Frame Modal DSP Audio Parameters */
 #define BLOOM_RC_VEC4_COUNT      32768U
 #define BLOOM_RC_BUFFER_BYTES    ((size_t)BLOOM_RC_VEC4_COUNT * 16ULL)
+#define BLOOM_SLICE_MAX_TILES    524288U
+#define BLOOM_SLICE_BUFFER_BYTES ((size_t)BLOOM_SLICE_MAX_TILES * 16ULL) /* 8 MiB (up to 3840x2160 @ 1/4 res) */
+#define BLOOM_SCENE_HDR_MAX_PX   8388608U
+#define BLOOM_SCENE_HDR_BYTES    ((size_t)BLOOM_SCENE_HDR_MAX_PX * 4ULL) /* 32 MiB packed RGB9E5 HDR */
 #define BLOOM_AUDIO_SAMPLE_RATE  48000U
 #define BLOOM_AUDIO_MAX_VOICES   8U
 #define BLOOM_AUDIO_MODES        4U
@@ -86,6 +90,9 @@ extern "C" {
 #define BLOOM_FLAG_CINE_OPTICS       (1U << 8)
 #define BLOOM_FLAG_METRIC_FIELD      (1U << 9)
 #define BLOOM_FLAG_GAMEPLAY_SHELLS   (1U << 10)
+#define BLOOM_FLAG_RC_AMORTIZED      (1U << 11)
+#define BLOOM_FLAG_DEPTH_SLICE       (1U << 12)
+#define BLOOM_FLAG_SPLIT_UI          (1U << 13)
 
 /* Canonical Reactive Register Channels within BloomRegBank64 (Slot 2) */
 #define BLOOM_REG_CHANNELS        12U

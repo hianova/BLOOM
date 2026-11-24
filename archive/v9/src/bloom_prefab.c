@@ -1492,6 +1492,13 @@ uint32_t bloom_gameplay_step64(BloomGameplayState64 *gp,
         }
     }
 
+    int32_t cutoff_q16 = gp->hyst_exit_q16;
+    if (gp->hyst_enter_q16 > cutoff_q16) cutoff_q16 = gp->hyst_enter_q16;
+    if (gp->delta_hit_q16 > cutoff_q16) cutoff_q16 = gp->delta_hit_q16;
+    cutoff_q16 += 8192;
+    const BloomPrefabInst64 *pl = &arena->map.instances[player_slot];
+    int32_t ra = pf_inst_ccd_radius_q16(arena, pl);
+
     int32_t min_clr = BLOOM_MAX_Q16;
     uint32_t nearest_slot = UINT32_MAX;
     for (uint32_t j = 0U; j < inst_n; ++j) {
@@ -1501,8 +1508,23 @@ uint32_t bloom_gameplay_step64(BloomGameplayState64 *gp,
             (BLOOM_INST_FLAG_ACTIVE | BLOOM_INST_FLAG_COLLIDABLE)) {
             continue;
         }
-        int32_t wit[3], nrm[3];
-        int32_t clr = bloom_scene_eval_pair_clearance_q16(arena, player_slot, j, wit, nrm);
+        int32_t rb = pf_inst_ccd_radius_q16(arena, oj);
+        int64_t dx = (int64_t)pl->pos_q16[0] - (int64_t)oj->pos_q16[0];
+        int64_t dy = (int64_t)pl->pos_q16[1] - (int64_t)oj->pos_q16[1];
+        int64_t dz = (int64_t)pl->pos_q16[2] - (int64_t)oj->pos_q16[2];
+        uint64_t ax = pf_abs64(dx), ay = pf_abs64(dy), az = pf_abs64(dz);
+        uint32_t sh = 0U;
+        while (((ax | ay | az) >> sh) > 0x3FFFFFFFULL && sh < 48U) ++sh;
+        uint64_t sx = ax >> sh, sy = ay >> sh, sz = az >> sh;
+        int64_t dist_q16 = (int64_t)(pf_isqrt_u64(sx * sx + sy * sy + sz * sz) << sh);
+        int64_t sphere_clr = dist_q16 - (int64_t)ra - (int64_t)rb;
+        int32_t clr;
+        if (sphere_clr > (int64_t)cutoff_q16) {
+            clr = pf_clamp64_to_32(sphere_clr, -BLOOM_MAX_Q16, BLOOM_MAX_Q16);
+        } else {
+            int32_t wit[3], nrm[3];
+            clr = bloom_scene_eval_pair_clearance_q16(arena, player_slot, j, wit, nrm);
+        }
         if (clr < min_clr) {
             min_clr = clr;
             nearest_slot = j;
