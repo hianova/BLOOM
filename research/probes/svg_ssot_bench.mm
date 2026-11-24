@@ -2579,7 +2579,7 @@ static std::string bench_exp1_parse(BloomSvgBlueprint &bp) {
         std::string svg;
         int iters;
     };
-    const char *studio_path = "/Users/kuangtalin/Documents/BLOOM/archive/v9/specs/studio_inspector.svg";
+    const char *studio_path = "/Users/kuangtalin/Documents/BLOOM/research/probes/fixtures/studio_inspector_v9.svg";
     std::string studio_svg = read_text_file(studio_path);
     if (studio_svg.empty()) {
         fprintf(stderr, "FAILED to read %s\n", studio_path);
@@ -3017,7 +3017,7 @@ static std::string bench_exp5_gpu_4k(Ctx &ctx,
     dtd.depthCompareFunction = MTLCompareFunctionLessEqual; dtd.depthWriteEnabled = NO;
     id<MTLDepthStencilState> ds_test = [ctx.dev newDepthStencilStateWithDescriptor:dtd];
 
-    std::string studio_svg = read_text_file("/Users/kuangtalin/Documents/BLOOM/archive/v9/specs/studio_inspector.svg");
+    std::string studio_svg = read_text_file("/Users/kuangtalin/Documents/BLOOM/research/probes/fixtures/studio_inspector_v9.svg");
     std::string ide_svg = make_synthetic_svg(500, true);
 
     auto run_v9_compute = [&](uint32_t n_widgets, const char *label, double &med_ms, double &p95_ms, uint32_t &chk) {
