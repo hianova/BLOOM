@@ -24,11 +24,13 @@ make -C /Users/kuangtalin/Documents/BLOOM/research/probes clean && make -C /User
 | **[`08_object_ssot_3d.md`](./08_object_ssot_3d.md)** | **3D Constraint-Native Object SSOT 實測**：準確幾何只於 `init` 烘焙（`12 B/vtx`, `6.42×` 壓縮），Runtime 只傳 `48 B/obj` 約束狀態（**`3.65×` GPU / `10.7×` WC 勝過業界 `64B+512B` 蒙皮**）；**`ComputeCull+Indirect` (`0.419 ms`) 勝過 Metal 3 Object+Mesh (`0.812 ms`)**；Track B `Tight-Proxy O(1)` (`0.376 ms`) 與 `[[clip_distance]]` 單 CB 完成 **4K 3D+HUD 僅 `0.959 ms` (`1,042.5 fps`)** |
 | **[`09_format_information_density.md`](./09_format_information_density.md)** | **`../INFO` 格式資訊密度實測（3A vs 3B vs 3C vs SVG vs GLB64）**：以 `INFO eval-bpb` + `info_decomp` SHA-256 + `eval-mdl-group` + `ncd` 證實 **W3C SVG HUD 資訊密度僅 `6.2%` (`25,286 B -> 1,591 B INF1`)**；**`3c_bobj_col` (`BOBC`) 勝出（`s3 [scene] 23,100 B / INF1 8,292 B`；`hud 4,967 B / INF1 556 B`，比 XML/SVG 少 `2.0×–2.86×` MDL）**，搭配 `3c_bobj_row` (`BOBR`) 零解析 `6.2 us` 與 `126.1 B` 熱增量 |
 | **[`10_ecosystem_package_inventory.md`](./10_ecosystem_package_inventory.md)** | **前端框架與遊戲/3D 引擎全域盤點及必要套件清單**：拆解 React/RN/Flutter/Tailwind/shadcn/GPUI/ImGui 與 UE5/Unity/Godot/Bevy/Three.js(R3F)/wgpu 等核心子系統，精準對照 BLOOM M1 現況缺口，定義 Core / P0–P2 官方套件 / 離線烘焙 / 外部非目標邊界與 5 條防膨脹紅線 |
+| **[`11_embodied_ui_sdk_grounding.md`](./11_embodied_ui_sdk_grounding.md)** | **Embodied UI SDK 與 Pixel-Exact Grounding 實證**：實證 `opt3_halfres_id_pass` (`+0.396 ms` 勝過 `opt2` MRT Tile `+1.192 ms`)、Occlusion-Aware UI+3D GPU 錨點拾取，以及 Track V2 硬體 TBDR `16×8` Render-and-Compare (`3/3` 分類、`7.71°`、`1.335 ms`、`maxTG=1024`) |
 | **[`probes/m1_silicon_probe.mm`](./probes/m1_silicon_probe.mm)** | 原生 Metal 矽片物理探針（輸出 `build/m1_probe_results.json`） |
 | **[`probes/gpui_component_bench.mm`](./probes/gpui_component_bench.mm)** | `zed-main` GPUI vs BLOOM 元件對標探針（輸出 `build/gpui_bench_results.json`） |
 | **[`probes/svg_ssot_bench.mm`](./probes/svg_ssot_bench.mm)** | Tri-Layer SVG-SSOT 編譯、熱重載保狀態與 4K TBDR 對標探針（輸出 `build/svg_ssot_results.json`） |
 | **[`probes/object_ssot_bench.mm`](./probes/object_ssot_bench.mm)** | 3D Constraint-Native Object SSOT 壓縮、Cluster Cull (Compute vs Mesh Shader)、Tight-Proxy、剖切與 4K 合成探針（輸出 `build/object_ssot_results.json`） |
 | **[`probes/format_ssot_bench.cpp`](./probes/format_ssot_bench.cpp)** + **[`probes/run_format_info_eval.py`](./probes/run_format_info_eval.py)** | `3A / 3B / 3C (BOBR+BOBC) / GLB64 / 2D HUD` 128-bit bit-exact 編解碼與 `../INFO` MDL/NCD 資訊密度評測驅動（輸出 `build/format_info_results.json`） |
+| **[`probes/embodied_grounding_bench.mm`](./probes/embodied_grounding_bench.mm)** | 4K Grounding (`opt1/opt2/opt3`)、Occlusion-Aware 錨點與 Track V2 硬體 Render-and-Compare 視覺定位探針（輸出 `build/embodied_grounding_results.json`） |
 
 ---
 

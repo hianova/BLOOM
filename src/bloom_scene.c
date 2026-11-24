@@ -90,6 +90,8 @@ struct BloomScene {
     /* GPU-ready flattened output arrays */
     BloomObjectState48 *gpu_states;
     uint32_t gpu_state_cnt, gpu_state_cap;
+    uint32_t *gpu_obj_slots;
+    uint32_t gpu_obj_slot_cap;
     BloomMeshletHeader32 *gpu_meshlets;
     uint32_t gpu_meshlet_cnt, gpu_meshlet_cap;
 
@@ -98,6 +100,7 @@ struct BloomScene {
     uint32_t ui_cnt, ui_cap;
     BloomHandle captured_ui;
     BloomHandle hovered_ui;
+    BloomHandle focused_ui;
     bool pointer_down;
     float last_ptr_x, last_ptr_y;
 
@@ -143,10 +146,14 @@ static inline uint16_t handle_gen(BloomHandle h) {
 
 static bool grow_array(void **ptr, uint32_t *cap, uint32_t needed, size_t elem_size) {
     if (needed <= *cap) return true;
-    uint32_t ncap = *cap ? (*cap * 2u) : 16u;
+    uint32_t old_cap = *cap;
+    uint32_t ncap = old_cap ? (old_cap * 2u) : 16u;
     while (ncap < needed) ncap *= 2u;
     void *np = realloc(*ptr, (size_t)ncap * elem_size);
     if (!np) return false;
+    if (ncap > old_cap) {
+        memset((uint8_t *)np + (size_t)old_cap * elem_size, 0, (size_t)(ncap - old_cap) * elem_size);
+    }
     *ptr = np;
     *cap = ncap;
     return true;
@@ -260,6 +267,7 @@ void bloom_scene_destroy(BloomScene *s) {
     free(s->analytics);
     free(s->analytic_keys);
     free(s->gpu_states);
+    free(s->gpu_obj_slots);
     free(s->gpu_meshlets);
     free(s->uis);
     free(s->opaque_quads);
@@ -339,8 +347,13 @@ uint16_t bloom_scene_add_template(BloomScene *s, const char *name, uint32_t mesh
     SceneTemplate *t = &s->templates[s->tpl_cnt++];
     memset(t, 0, sizeof(*t));
     if (name) snprintf(t->name, sizeof(t->name), "%s", name);
+    uint32_t max_vtx = 0u;
+    for (uint32_t m = 0u; m < meshlet_cnt; ++m) {
+        uint32_t end = hdrs[m].vtx_offset + hdrs[m].vtx_cnt;
+        if (end > max_vtx) max_vtx = end;
+    }
     t->meshlet_cnt = meshlet_cnt;
-    t->vtx_cnt = meshlet_cnt * BLOOM_CLUSTER_VTX;
+    t->vtx_cnt = max_vtx > 0u ? max_vtx : 1u;
     t->idx_bytes = idx_bytes;
     t->gpu_vtx_base = vbase;
     t->gpu_idx_base = ibase;
@@ -711,8 +724,12 @@ void bloom_scene_sync_transforms(BloomScene *s) {
         if (!grow_array((void **)&s->gpu_states, &s->gpu_state_cap, s->gpu_state_cnt + 1u, sizeof(BloomObjectState48))) {
             return;
         }
+        if (!grow_array((void **)&s->gpu_obj_slots, &s->gpu_obj_slot_cap, s->gpu_state_cnt + 1u, sizeof(uint32_t))) {
+            return;
+        }
         uint32_t g_idx = s->gpu_state_cnt++;
         s->gpu_states[g_idx] = s->objs[i].world_state;
+        s->gpu_obj_slots[g_idx] = i;
 
         uint16_t tid = s->objs[i].cspec.template_id;
         if (tid < s->tpl_cnt) {
@@ -792,6 +809,13 @@ BloomHandle bloom_scene_add_ui(BloomScene *s, const BloomUiNodeDesc *desc) {
     if (desc->label) snprintf(u->label_buf, sizeof(u->label_buf), "%s", desc->label);
     u->desc.id = u->id_buf;
     u->desc.label = u->label_buf;
+    if (u->desc.kind == BLOOM_UI_MODAL) u->desc.modal_trap = true;
+    if (u->desc.action_mask == 0u && !u->desc.disabled) {
+        if (desc->kind == BLOOM_UI_BUTTON) u->desc.action_mask = BLOOM_ACT_CLICK | BLOOM_ACT_FOCUS;
+        else if (desc->kind == BLOOM_UI_SLIDER) u->desc.action_mask = BLOOM_ACT_CLICK | BLOOM_ACT_DRAG | BLOOM_ACT_FOCUS;
+        else if (desc->kind == BLOOM_UI_VLIST) u->desc.action_mask = BLOOM_ACT_SCROLL | BLOOM_ACT_FOCUS;
+        else if (desc->kind == BLOOM_UI_MODAL || desc->kind == BLOOM_UI_PANEL) u->desc.action_mask = BLOOM_ACT_FOCUS;
+    }
     u->key = bloom_fnv1a64(u->id_buf);
     u->slider_t = 0.5f;
 
@@ -815,11 +839,38 @@ BloomHandle bloom_scene_add_ui(BloomScene *s, const BloomUiNodeDesc *desc) {
     return u->self;
 }
 
+static void destroy_ui_recursive(BloomScene *s, BloomHandle target) {
+    for (uint32_t i = 1u; i < s->ui_cnt; ++i) {
+        if (s->uis[i].alive && s->uis[i].desc.parent == target) {
+            destroy_ui_recursive(s, s->uis[i].self);
+        }
+    }
+    uint32_t idx = handle_index(target);
+    if (idx > 0u && idx < s->ui_cnt && s->uis[idx].alive && s->uis[idx].gen == handle_gen(target)) {
+        s->uis[idx].alive = false;
+        if (s->captured_ui == target) s->captured_ui = BLOOM_HANDLE_NULL;
+        if (s->hovered_ui == target) s->hovered_ui = BLOOM_HANDLE_NULL;
+        if (s->focused_ui == target) s->focused_ui = BLOOM_HANDLE_NULL;
+    }
+}
+
+bool bloom_scene_destroy_ui(BloomScene *s, BloomHandle ui) {
+    if (!s || ui == BLOOM_HANDLE_NULL) return false;
+    uint32_t idx = handle_index(ui);
+    if (idx == 0u || idx >= s->ui_cnt || !s->uis[idx].alive || s->uis[idx].gen != handle_gen(ui)) {
+        return false;
+    }
+    destroy_ui_recursive(s, ui);
+    s->ui_dirty = true;
+    return true;
+}
+
 void bloom_scene_clear_ui(BloomScene *s) {
     if (!s) return;
     s->ui_cnt = 1u;
     s->captured_ui = BLOOM_HANDLE_NULL;
     s->hovered_ui = BLOOM_HANDLE_NULL;
+    s->focused_ui = BLOOM_HANDLE_NULL;
     s->ui_dirty = true;
 }
 
@@ -870,7 +921,8 @@ bool bloom_scene_get_ui_toggle(const BloomScene *s, BloomHandle ui) {
 
 static void emit_quad(BloomScene *s, float x, float y, float w, float h,
                       uint32_t fill, uint32_t border, float r_px, float bw_px,
-                      uint16_t clip_id, uint16_t z_order) {
+                      uint16_t clip_id, uint16_t z_order,
+                      uint16_t ui_slot, uint8_t part_id, uint32_t qflags) {
     if (w <= 0.5f || h <= 0.5f) return;
     BloomQuadHot q;
     q.bounds_q14_2[0] = f32_to_q14_2(x);
@@ -883,18 +935,31 @@ static void emit_quad(BloomScene *s, float x, float y, float w, float h,
     uint8_t bq = f32_to_q6_2(bw_px);
     for (int k = 0; k < 4; ++k) { q.radii_q6_2[k] = rq; q.borders_q6_2[k] = bq; }
     q.clip_id = clip_id;
-    q.style_id = 0u;
-    q.z_flags = z_order;
+    q.style_id = ui_slot;
+    q.z_flags = ((uint32_t)z_order & 0xFFFFu) | (((uint32_t)part_id & 0xFFu) << 16u) | qflags;
 
-    bool is_opaque = ((fill >> 24u) == 0xFFu) && rq == 0u && bq == 0u;
+    bool is_opaque = ((fill >> 24u) == 0xFFu) && rq == 0u && bq == 0u && ((qflags & BLOOM_QUAD_FLAG_GROUND_ONLY) == 0u);
     if (is_opaque) {
         if (grow_array((void **)&s->opaque_quads, &s->opq_cap, s->opq_cnt + 1u, sizeof(BloomQuadHot))) {
             s->opaque_quads[s->opq_cnt++] = q;
         }
-    } else if (((fill >> 24u) > 0u) || (bq > 0u && (border >> 24u) > 0u)) {
+    } else if (((fill >> 24u) > 0u) || (bq > 0u && (border >> 24u) > 0u) || ((qflags & BLOOM_QUAD_FLAG_GROUND_ONLY) != 0u)) {
         if (grow_array((void **)&s->alpha_quads, &s->alp_cap, s->alp_cnt + 1u, sizeof(BloomQuadHot))) {
             s->alpha_quads[s->alp_cnt++] = q;
         }
+    }
+}
+
+static void sort_quads_by_z(BloomQuadHot *q, uint32_t cnt) {
+    for (uint32_t i = 1u; i < cnt; ++i) {
+        BloomQuadHot key = q[i];
+        uint32_t kz = key.z_flags & 0xFFFFu;
+        uint32_t j = i;
+        while (j > 0u && (q[j - 1u].z_flags & 0xFFFFu) > kz) {
+            q[j] = q[j - 1u];
+            --j;
+        }
+        q[j] = key;
     }
 }
 
@@ -950,8 +1015,16 @@ static void layout_ui_recursive(BloomScene *s, uint32_t ui_idx, uint16_t clip_id
 
     uint32_t fill = u->desc.fill_rgba8;
     if (u->desc.kind == BLOOM_UI_BUTTON && u->toggle_on) fill = BLOOM_RGBA(0x2E, 0x6A, 0xA4, 0xFF);
-    emit_quad(s, u->x, u->y, u->w, u->h, fill, u->desc.border_rgba8,
-              u->desc.radius_px, u->desc.border_px, clip_id, (uint16_t)(z_base + 1u));
+    uint32_t qf = (u->desc.kind == BLOOM_UI_TEXT && (fill >> 24u) == 0u && (u->desc.border_rgba8 >> 24u) == 0u)
+                      ? BLOOM_QUAD_FLAG_GROUND_ONLY : 0u;
+    uint32_t bdr = u->desc.border_rgba8;
+    float bw = u->desc.border_px;
+    if (u->self == s->focused_ui && !u->desc.disabled && bw <= 0.1f) {
+        bdr = BLOOM_RGBA(0x50, 0xE0, 0xFF, 0xFF);
+        bw = 1.5f;
+    }
+    emit_quad(s, u->x, u->y, u->w, u->h, fill, bdr,
+              u->desc.radius_px, bw, clip_id, (uint16_t)(z_base + 1u), (uint16_t)ui_idx, 0u, qf);
 
     if (u->desc.kind == BLOOM_UI_SLIDER) {
         float track_h = 8.0f;
@@ -959,10 +1032,13 @@ static void layout_ui_recursive(BloomScene *s, uint32_t ui_idx, uint16_t clip_id
         float track_x = u->x + 12.0f;
         float track_w = u->w - 24.0f;
         if (track_w > 4.0f) {
-            emit_quad(s, track_x, track_y, track_w, track_h, BLOOM_RGBA(0x1A, 0x22, 0x30, 0xFF), 0u, 4.0f, 0.0f, clip_id, (uint16_t)(z_base + 2u));
-            emit_quad(s, track_x, track_y, track_w * u->slider_t, track_h, BLOOM_RGBA(0x38, 0xD0, 0xFF, 0xFF), 0u, 4.0f, 0.0f, clip_id, (uint16_t)(z_base + 3u));
+            emit_quad(s, track_x, track_y, track_w, track_h, BLOOM_RGBA(0x1A, 0x22, 0x30, 0xFF), 0u, 4.0f, 0.0f,
+                      clip_id, (uint16_t)(z_base + 2u), (uint16_t)ui_idx, 1u, 0u);
+            emit_quad(s, track_x, track_y, track_w * u->slider_t, track_h, BLOOM_RGBA(0x38, 0xD0, 0xFF, 0xFF), 0u, 4.0f, 0.0f,
+                      clip_id, (uint16_t)(z_base + 3u), (uint16_t)ui_idx, 2u, 0u);
             float kx = track_x + track_w * u->slider_t - 7.0f;
-            emit_quad(s, kx, track_y - 4.0f, 14.0f, 16.0f, BLOOM_RGBA(0xF4, 0xF8, 0xFF, 0xFF), BLOOM_RGBA(0x0A, 0x14, 0x20, 0xFF), 7.0f, 1.5f, clip_id, (uint16_t)(z_base + 4u));
+            emit_quad(s, kx, track_y - 4.0f, 14.0f, 16.0f, BLOOM_RGBA(0xF4, 0xF8, 0xFF, 0xFF), BLOOM_RGBA(0x0A, 0x14, 0x20, 0xFF), 7.0f, 1.5f,
+                      clip_id, (uint16_t)(z_base + 4u), (uint16_t)ui_idx, 3u, 0u);
         }
     }
 
@@ -978,7 +1054,8 @@ static void layout_ui_recursive(BloomScene *s, uint32_t ui_idx, uint16_t clip_id
                 uint32_t row_id = first_row + r;
                 float ry = u->y + offset_y + (float)r * rh + 2.0f;
                 uint32_t rcol = (row_id & 1u) ? BLOOM_RGBA(0x1A, 0x22, 0x2E, 0xDD) : BLOOM_RGBA(0x21, 0x2B, 0x3A, 0xDD);
-                emit_quad(s, u->x + 6.0f, ry, u->w - 12.0f, rh - 4.0f, rcol, 0u, 4.0f, 0.0f, vclip, (uint16_t)(z_base + 2u));
+                emit_quad(s, u->x + 6.0f, ry, u->w - 12.0f, rh - 4.0f, rcol, 0u, 4.0f, 0.0f,
+                          vclip, (uint16_t)(z_base + 2u), (uint16_t)ui_idx, (uint8_t)((row_id + 1u) & 0xFFu), 0u);
                 char row_lbl[64];
                 snprintf(row_lbl, sizeof(row_lbl), "#%04u  node_state_row", row_id);
                 emit_text(s, u->key ^ row_id, u->x + 14.0f, ry + 5.0f, u->w - 28.0f, rh,
@@ -1016,7 +1093,7 @@ static void layout_ui_recursive(BloomScene *s, uint32_t ui_idx, uint16_t clip_id
     }
 
     float pad = u->desc.pad;
-    float hdr_h = (u->desc.kind == BLOOM_UI_PANEL && u->label_buf[0])
+    float hdr_h = ((u->desc.kind == BLOOM_UI_PANEL || u->desc.kind == BLOOM_UI_MODAL) && u->label_buf[0])
                       ? ((u->desc.font_px > 0.0f ? u->desc.font_px : 15.0f) + 12.0f)
                       : 0.0f;
     float gap = u->desc.gap;
@@ -1079,6 +1156,8 @@ void bloom_scene_layout_ui(BloomScene *s, float vp_w, float vp_h) {
         layout_ui_recursive(s, i, 0u, z_acc);
         z_acc += 500u;
     }
+    sort_quads_by_z(s->opaque_quads, s->opq_cnt);
+    sort_quads_by_z(s->alpha_quads, s->alp_cnt);
 }
 
 static bool point_in_ui(const UiSlot *u, float x, float y) {
@@ -1114,9 +1193,35 @@ static void apply_ui_binding(BloomScene *s, UiSlot *u) {
     }
 }
 
+static uint16_t active_modal_min_z(const BloomScene *s) {
+    uint16_t mz = 0u;
+    for (uint32_t i = 1u; i < s->ui_cnt; ++i) {
+        const UiSlot *u = &s->uis[i];
+        if (u->alive && (u->desc.kind == BLOOM_UI_MODAL || u->desc.modal_trap) && u->z_order > mz) {
+            mz = u->z_order;
+        }
+    }
+    return mz;
+}
+
+bool bloom_scene_set_ui_focused(BloomScene *s, BloomHandle ui) {
+    if (!s) return false;
+    if (ui == BLOOM_HANDLE_NULL) { s->focused_ui = BLOOM_HANDLE_NULL; s->ui_dirty = true; return true; }
+    const UiSlot *u = get_ui_mut(s, ui);
+    if (!u || u->desc.disabled || u->z_order < active_modal_min_z(s)) return false;
+    s->focused_ui = u->self;
+    s->ui_dirty = true;
+    return true;
+}
+
+BloomHandle bloom_scene_get_focused_ui(const BloomScene *s) {
+    return s ? s->focused_ui : BLOOM_HANDLE_NULL;
+}
+
 bool bloom_scene_handle_input(BloomScene *s, const BloomInputEvent *ev) {
     if (!s || !ev) return false;
     bool consumed = false;
+    uint16_t modal_z = active_modal_min_z(s);
 
     if (ev->type == BLOOM_EVENT_POINTER_DOWN) {
         s->pointer_down = true;
@@ -1126,19 +1231,22 @@ bool bloom_scene_handle_input(BloomScene *s, const BloomInputEvent *ev) {
         uint16_t best_z = 0u;
         for (uint32_t i = 1u; i < s->ui_cnt; ++i) {
             const UiSlot *u = &s->uis[i];
-            if (!u->alive || (u->desc.kind != BLOOM_UI_BUTTON && u->desc.kind != BLOOM_UI_SLIDER)) continue;
-            if (point_in_ui(u, ev->x, ev->y) && u->z_order >= best_z) {
+            if (!u->alive || u->desc.disabled || u->z_order < modal_z) continue;
+            if ((u->desc.kind == BLOOM_UI_BUTTON || u->desc.kind == BLOOM_UI_SLIDER || u->desc.kind == BLOOM_UI_MODAL) &&
+                point_in_ui(u, ev->x, ev->y) && u->z_order >= best_z) {
                 best_z = u->z_order;
                 best_i = i;
             }
         }
         if (best_i > 0u) {
             UiSlot *u = &s->uis[best_i];
-            s->captured_ui = u->self;
+            s->focused_ui = u->self;
             if (u->desc.kind == BLOOM_UI_BUTTON) {
+                s->captured_ui = u->self;
                 u->toggle_on = !u->toggle_on;
                 apply_ui_binding(s, u);
             } else if (u->desc.kind == BLOOM_UI_SLIDER) {
+                s->captured_ui = u->self;
                 float tx = u->x + 12.0f, tw = u->w - 24.0f;
                 u->slider_t = tw > 1.0f ? clamp_f32((ev->x - tx) / tw, 0.0f, 1.0f) : 0.5f;
                 apply_ui_binding(s, u);
@@ -1149,18 +1257,26 @@ bool bloom_scene_handle_input(BloomScene *s, const BloomInputEvent *ev) {
     } else if (ev->type == BLOOM_EVENT_POINTER_MOVE) {
         if (s->pointer_down && s->captured_ui != BLOOM_HANDLE_NULL) {
             UiSlot *u = get_ui_mut(s, s->captured_ui);
-            if (u && u->desc.kind == BLOOM_UI_SLIDER) {
+            if (u && !u->desc.disabled && u->desc.kind == BLOOM_UI_SLIDER) {
                 float tx = u->x + 12.0f, tw = u->w - 24.0f;
                 u->slider_t = tw > 1.0f ? clamp_f32((ev->x - tx) / tw, 0.0f, 1.0f) : 0.5f;
                 apply_ui_binding(s, u);
                 s->ui_dirty = true;
                 consumed = true;
             }
-        } else if (s->pointer_down && s->captured_ui == BLOOM_HANDLE_NULL) {
+        } else if (s->pointer_down && s->captured_ui == BLOOM_HANDLE_NULL && modal_z == 0u) {
             /* Drag empty viewport -> orbit camera */
             s->camera.yaw += (ev->x - s->last_ptr_x) * 0.005f;
             s->camera.pitch = clamp_f32(s->camera.pitch + (ev->y - s->last_ptr_y) * 0.004f, -1.2f, 1.2f);
             s->camera_dirty = true;
+        } else if (!s->pointer_down) {
+            uint32_t hi = 0u; uint16_t hz = 0u;
+            for (uint32_t i = 1u; i < s->ui_cnt; ++i) {
+                const UiSlot *u = &s->uis[i];
+                if (!u->alive || u->desc.disabled || u->z_order < modal_z) continue;
+                if (point_in_ui(u, ev->x, ev->y) && u->z_order >= hz) { hz = u->z_order; hi = i; }
+            }
+            s->hovered_ui = hi ? s->uis[hi].self : BLOOM_HANDLE_NULL;
         }
         s->last_ptr_x = ev->x;
         s->last_ptr_y = ev->y;
@@ -1171,16 +1287,31 @@ bool bloom_scene_handle_input(BloomScene *s, const BloomInputEvent *ev) {
         bool hit_vlist = false;
         for (uint32_t i = s->ui_cnt; i > 1u; --i) {
             UiSlot *u = &s->uis[i - 1u];
-            if (u->alive && u->desc.kind == BLOOM_UI_VLIST && point_in_ui(u, ev->x, ev->y)) {
+            if (u->alive && !u->desc.disabled && u->z_order >= modal_z &&
+                u->desc.kind == BLOOM_UI_VLIST && point_in_ui(u, ev->x, ev->y)) {
                 bloom_scene_set_ui_scroll(s, u->self, u->scroll_y - ev->dy * 16.0f);
                 hit_vlist = true;
                 consumed = true;
                 break;
             }
         }
-        if (!hit_vlist) {
+        if (!hit_vlist && modal_z == 0u) {
             s->camera.pos[2] += ev->dy * 0.25f;
             s->camera_dirty = true;
+        }
+    } else if (ev->type == BLOOM_EVENT_KEY_DOWN && (ev->key_code == 48u || ev->key_code == 9u) && s->ui_cnt > 1u) {
+        /* Roving TabIndex with Modal Focus Trap */
+        uint32_t cur = (s->focused_ui != BLOOM_HANDLE_NULL) ? handle_index(s->focused_ui) : 0u;
+        for (uint32_t step = 1u; step < s->ui_cnt; ++step) {
+            uint32_t idx = ((cur + step - 1u) % (s->ui_cnt - 1u)) + 1u;
+            const UiSlot *u = &s->uis[idx];
+            if (!u->alive || u->desc.disabled || u->z_order < modal_z) continue;
+            if ((u->desc.action_mask & (BLOOM_ACT_CLICK | BLOOM_ACT_DRAG | BLOOM_ACT_SCROLL)) != 0u) {
+                s->focused_ui = u->self;
+                s->ui_dirty = true;
+                consumed = true;
+                break;
+            }
         }
     } else if (ev->type == BLOOM_EVENT_RESIZE) {
         s->ui_dirty = true;
@@ -1325,5 +1456,81 @@ bool bloom_timeline_step(BloomScene *s, float dt_sec) {
         return false;
     }
     bloom_timeline_scrub(s, next_t);
+    return true;
+}
+
+/* ============================================================================
+ * Unified Embodied Inspection Getters
+ * ============================================================================ */
+
+uint32_t bloom_scene_get_object_slot_count(const BloomScene *s) {
+    return s ? (s->gpu_state_cnt + 1u) : 0u;
+}
+
+bool bloom_scene_get_object_meta(const BloomScene *s, uint32_t slot, BloomObjectMeta *out) {
+    if (!s || !out || slot == 0u || slot > s->gpu_state_cnt) return false;
+    uint32_t obj_idx = s->gpu_obj_slots[slot - 1u];
+    if (obj_idx == 0u || obj_idx >= s->obj_cap || !s->objs[obj_idx].alive) return false;
+    const ObjectSlot *o = &s->objs[obj_idx];
+    out->handle = make_handle(obj_idx, o->gen);
+    out->key = o->key;
+    out->id = o->id;
+    out->world_state = o->world_state;
+    memcpy(out->local_dof, o->local_dof, 12u);
+    out->cutaway = (o->flags & BLOOM_OBJ_FLAG_CUTAWAY) != 0u;
+    return true;
+}
+
+uint32_t bloom_scene_get_analytic_count(const BloomScene *s) {
+    return s ? s->ana_cnt : 0u;
+}
+
+bool bloom_scene_get_analytic_meta(const BloomScene *s, uint32_t idx, BloomAnalyticMeta *out) {
+    if (!s || !out || idx >= s->ana_cnt) return false;
+    out->index = idx;
+    out->key = s->analytic_keys ? s->analytic_keys[idx] : 0u;
+    out->prim = s->analytics[idx];
+    return true;
+}
+
+uint32_t bloom_scene_get_ui_count(const BloomScene *s) {
+    return s ? s->ui_cnt : 0u;
+}
+
+bool bloom_scene_get_ui_meta(const BloomScene *s, uint32_t slot, BloomUiMeta *out) {
+    if (!s || !out || slot == 0u || slot >= s->ui_cnt || !s->uis[slot].alive) return false;
+    const UiSlot *u = &s->uis[slot];
+    out->handle = u->self;
+    out->key = u->key;
+    out->id = u->id_buf;
+    out->label = u->label_buf;
+    out->kind = u->desc.kind;
+    out->x = u->x; out->y = u->y; out->w = u->w; out->h = u->h;
+    out->clip_x = u->clip_x; out->clip_y = u->clip_y; out->clip_w = u->clip_w; out->clip_h = u->clip_h;
+    out->z_order = u->z_order;
+    out->disabled = u->desc.disabled;
+    out->modal_trap = u->desc.modal_trap;
+    out->focused = (u->self == s->focused_ui);
+    out->hovered = (u->self == s->hovered_ui);
+    out->toggle_on = u->toggle_on;
+    out->slider_t = u->slider_t;
+    out->scroll_y = u->scroll_y;
+    out->action_mask = u->desc.action_mask;
+    out->bind_obj_key = u->desc.bind_obj_key;
+    out->bind_dof_slot = u->desc.bind_dof_slot;
+    return true;
+}
+
+bool bloom_scene_get_template_mesh(const BloomScene *s, uint16_t template_id,
+                                   uint32_t *out_mcnt, const BloomMeshletHeader32 **out_hdrs,
+                                   const BloomVtx12 **out_verts, const uint8_t **out_lidx,
+                                   uint32_t *out_idx_bytes) {
+    if (!s || template_id >= s->tpl_cnt) return false;
+    const SceneTemplate *t = &s->templates[template_id];
+    if (out_mcnt) *out_mcnt = t->meshlet_cnt;
+    if (out_hdrs) *out_hdrs = t->hdrs;
+    if (out_verts) *out_verts = t->verts;
+    if (out_lidx) *out_lidx = t->local_idx;
+    if (out_idx_bytes) *out_idx_bytes = t->idx_bytes;
     return true;
 }

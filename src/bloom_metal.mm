@@ -4,16 +4,30 @@
 #include "bloom_atlas.h"
 #include "bloom_gpu.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 static constexpr uint32_t kRingSlots = 3u;
 static constexpr uint32_t kAtlasDim = 1024u;
 static constexpr uint32_t kMaxGlyphsPerFrame = 32768u;
+
+struct GroundParamsGpu {
+    uint32_t vp_w, vp_h, pick_x, pick_y;
+    uint32_t max_slots, half_shift;
+    float    pos_scale;
+    uint32_t pad0;
+};
+BLOOM_STATIC_ASSERT(sizeof(GroundParamsGpu) == 32, "GroundParamsGpu must be 32 bytes");
+
+struct GroundRequest {
+    uint32_t pick_x, pick_y, max_slots, half_shift, id_w, id_h;
+};
 
 static inline size_t align256(size_t n) {
     return (n + 255u) & ~size_t(255u);
@@ -60,6 +74,19 @@ struct BloomGpu {
     id<MTLTexture> depth_tex = nil;
     id<MTLTexture> hl_color_tex = nil;
     uint32_t cur_w = 0u, cur_h = 0u;
+
+    /* Lazy on-demand Adaptive Half-Res Grounding & Picking resources */
+    std::string ground_shader_path;
+    id<MTLLibrary> ground_lib = nil;
+    id<MTLRenderPipelineState> p_id_mesh = nil;
+    id<MTLRenderPipelineState> p_id_proxy = nil;
+    id<MTLRenderPipelineState> p_id_hud = nil;
+    id<MTLComputePipelineState> p_ground_red = nil;
+    id<MTLTexture> ground_id_tex = nil;
+    id<MTLTexture> ground_depth_tex = nil;
+    id<MTLBuffer> b_ground_stats = nil;
+    id<MTLBuffer> b_ground_pick = nil;
+    uint32_t ground_id_w = 0u, ground_id_h = 0u;
 
     BloomGpuStats stats{};
     std::atomic<double> async_last_gpu_ms{0.0};
@@ -166,6 +193,13 @@ BloomGpu *bloom_gpu_create(void *ca_metal_layer, const char *shader_path) {
     }
 
     BloomGpu *g = new BloomGpu();
+    {
+        std::string sp(spath);
+        size_t pos = sp.rfind("bloom_core.metal");
+        g->ground_shader_path = (pos != std::string::npos)
+                                    ? (sp.substr(0, pos) + "bloom_grounding.metal")
+                                    : "shaders/bloom_grounding.metal";
+    }
     g->dev = MTLCreateSystemDefaultDevice();
     if (!g->dev) { delete g; return nullptr; }
     g->q = [g->dev newCommandQueue];
@@ -264,8 +298,72 @@ void bloom_gpu_destroy(BloomGpu *gpu) {
     delete gpu;
 }
 
+static bool ensure_grounding_ready(BloomGpu *g, uint32_t id_w, uint32_t id_h, uint32_t max_slots) {
+    if (!g->ground_lib) {
+        NSError *err = nil;
+        NSString *src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:g->ground_shader_path.c_str()]
+                                                  encoding:NSUTF8StringEncoding error:&err];
+        if (!src || err) {
+            fprintf(stderr, "Cannot read grounding shader %s: %s\n", g->ground_shader_path.c_str(),
+                    err ? err.localizedDescription.UTF8String : "?");
+            return false;
+        }
+        MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+        opts.languageVersion = MTLLanguageVersion3_0;
+        g->ground_lib = [g->dev newLibraryWithSource:src options:opts error:&err];
+        if (!g->ground_lib || err) {
+            fprintf(stderr, "Grounding shader compile failed: %s\n", err ? err.localizedDescription.UTF8String : "?");
+            return false;
+        }
+        auto make_id_r = [&](const char *vf, const char *ff) -> id<MTLRenderPipelineState> {
+            MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
+            d.vertexFunction = [g->ground_lib newFunctionWithName:[NSString stringWithUTF8String:vf]];
+            d.fragmentFunction = [g->ground_lib newFunctionWithName:[NSString stringWithUTF8String:ff]];
+            d.colorAttachments[0].pixelFormat = MTLPixelFormatR32Uint;
+            d.colorAttachments[0].blendingEnabled = NO;
+            d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+            NSError *pe = nil;
+            id<MTLRenderPipelineState> p = [g->dev newRenderPipelineStateWithDescriptor:d error:&pe];
+            if (!p || pe) fprintf(stderr, "ID PSO %s/%s failed: %s\n", vf, ff, pe ? pe.localizedDescription.UTF8String : "?");
+            return p;
+        };
+        g->p_id_mesh = make_id_r("v_meshlet_id", "f_meshlet_id");
+        g->p_id_proxy = make_id_r("v_proxy_id", "f_proxy_id");
+        g->p_id_hud = make_id_r("v_hud_id", "f_hud_id");
+        g->p_ground_red = make_cpso(g->dev, g->ground_lib, "k_compute_ground_reduce");
+        if (!g->p_id_mesh || !g->p_id_proxy || !g->p_id_hud || !g->p_ground_red) return false;
+        g->stats.max_tg_ground = (uint32_t)g->p_ground_red.maxTotalThreadsPerThreadgroup;
+        g->stats.grounding_active = true;
+    }
+    if (g->ground_id_w != id_w || g->ground_id_h != id_h || !g->ground_id_tex) {
+        g->ground_id_w = id_w;
+        g->ground_id_h = id_h;
+        MTLTextureDescriptor *itd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint
+                                                                                       width:id_w height:id_h mipmapped:NO];
+        itd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        itd.storageMode = MTLStorageModePrivate;
+        itd.allowGPUOptimizedContents = YES;
+        g->ground_id_tex = [g->dev newTextureWithDescriptor:itd];
+
+        MTLTextureDescriptor *gdd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                                                       width:id_w height:id_h mipmapped:NO];
+        gdd.usage = MTLTextureUsageRenderTarget;
+        gdd.storageMode = MTLStorageModeMemoryless;
+        gdd.allowGPUOptimizedContents = YES;
+        g->ground_depth_tex = [g->dev newTextureWithDescriptor:gdd];
+    }
+    size_t req_bytes = std::max<size_t>(1u, max_slots) * sizeof(BloomGroundedGpu32);
+    if (!g->b_ground_stats || g->b_ground_stats.length < req_bytes) {
+        g->b_ground_stats = [g->dev newBufferWithLength:req_bytes options:MTLResourceStorageModeShared];
+    }
+    if (!g->b_ground_pick) {
+        g->b_ground_pick = [g->dev newBufferWithLength:sizeof(BloomPickGpuResult) options:MTLResourceStorageModeShared];
+    }
+    return true;
+}
+
 static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint32_t vp_h,
-                            bool force, bool headless) {
+                            bool force, bool headless, const GroundRequest *greq) {
     if (!g || !scene || vp_w == 0u || vp_h == 0u) return false;
     if (!bloom_scene_is_dirty(scene) && !force) {
         g->stats.idle_skipped_frames++;
@@ -501,6 +599,80 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
     }
     [enc endEncoding];
 
+    if (greq) {
+        MTLRenderPassDescriptor *irpd = [MTLRenderPassDescriptor renderPassDescriptor];
+        irpd.colorAttachments[0].texture = g->ground_id_tex;
+        irpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+        irpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+        irpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+        irpd.depthAttachment.texture = g->ground_depth_tex;
+        irpd.depthAttachment.loadAction = MTLLoadActionClear;
+        irpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+        irpd.depthAttachment.clearDepth = 1.0;
+
+        id<MTLRenderCommandEncoder> genc = [cmd renderCommandEncoderWithDescriptor:irpd];
+        if (mh_cnt > 0u && g->priv_vtx && g->priv_lidx) {
+            [genc setDepthStencilState:g->ds_3d_write];
+            [genc setCullMode:MTLCullModeBack];
+            [genc setRenderPipelineState:g->p_id_mesh];
+            [genc setVertexBuffer:g->priv_surv_ids offset:0 atIndex:0];
+            [genc setVertexBuffer:g->wc_ring[s] offset:off_mh atIndex:1];
+            [genc setVertexBuffer:g->priv_vtx offset:0 atIndex:2];
+            [genc setVertexBuffer:g->priv_lidx offset:0 atIndex:3];
+            [genc setVertexBuffer:g->wc_ring[s] offset:off_st atIndex:4];
+            [genc setVertexBytes:&u length:sizeof(u) atIndex:5];
+            [genc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexType:MTLIndexTypeUInt16
+                            indexBuffer:g->priv_id_idx16 indexBufferOffset:0
+                         indirectBuffer:g->ind_args[s] indirectBufferOffset:0];
+        }
+        if (pr_cnt > 0u) {
+            BloomFrameUniforms hfu = u;
+            hfu.vp_w = (float)greq->id_w;
+            hfu.vp_h = (float)greq->id_h;
+            [genc setDepthStencilState:g->ds_3d_write];
+            [genc setCullMode:MTLCullModeNone];
+            [genc setRenderPipelineState:g->p_id_proxy];
+            [genc setVertexBuffer:g->wc_ring[s] offset:off_pr atIndex:0];
+            [genc setVertexBytes:&u length:sizeof(u) atIndex:1];
+            [genc setFragmentBuffer:g->wc_ring[s] offset:off_pr atIndex:0];
+            [genc setFragmentBytes:&hfu length:sizeof(hfu) atIndex:1];
+            [genc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:pr_cnt];
+        }
+        [genc setCullMode:MTLCullModeNone];
+        [genc setDepthStencilState:g->ds_ui_opq];
+        GroundParamsGpu gp{vp_w, vp_h, greq->pick_x, greq->pick_y, greq->max_slots, greq->half_shift,
+                           (float)(1u << greq->half_shift), 0u};
+        if (opq_cnt > 0u) {
+            [genc setRenderPipelineState:g->p_id_hud];
+            [genc setVertexBuffer:g->wc_ring[s] offset:off_oq atIndex:0];
+            [genc setVertexBuffer:g->wc_ring[s] offset:off_cl atIndex:1];
+            [genc setVertexBytes:&u length:sizeof(u) atIndex:2];
+            [genc setFragmentBuffer:g->wc_ring[s] offset:off_oq atIndex:0];
+            [genc setFragmentBytes:&gp length:sizeof(gp) atIndex:1];
+            [genc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:opq_cnt];
+        }
+        if (alp_cnt > 0u) {
+            [genc setRenderPipelineState:g->p_id_hud];
+            [genc setVertexBuffer:g->wc_ring[s] offset:off_aq atIndex:0];
+            [genc setVertexBuffer:g->wc_ring[s] offset:off_cl atIndex:1];
+            [genc setVertexBytes:&u length:sizeof(u) atIndex:2];
+            [genc setFragmentBuffer:g->wc_ring[s] offset:off_aq atIndex:0];
+            [genc setFragmentBytes:&gp length:sizeof(gp) atIndex:1];
+            [genc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:alp_cnt];
+        }
+        [genc endEncoding];
+
+        id<MTLComputeCommandEncoder> rce = [cmd computeCommandEncoder];
+        [rce setComputePipelineState:g->p_ground_red];
+        [rce setTexture:g->ground_id_tex atIndex:0];
+        [rce setBuffer:g->b_ground_stats offset:0 atIndex:0];
+        [rce setBuffer:g->b_ground_pick offset:0 atIndex:1];
+        [rce setBytes:&gp length:sizeof(gp) atIndex:2];
+        [rce dispatchThreadgroups:MTLSizeMake((greq->id_w + 15u) / 16u, (greq->id_h + 15u) / 16u, 1u)
+            threadsPerThreadgroup:MTLSizeMake(16u, 16u, 1u)];
+        [rce endEncoding];
+    }
+
     if (drawable) [cmd presentDrawable:drawable];
 
     dispatch_semaphore_t sem = g->sem;
@@ -513,7 +685,9 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
     if (headless) {
         [cmd waitUntilCompleted];
         g->stats.surviving_meshlets = ia[1];
-        g->stats.last_gpu_ms = (cmd.GPUEndTime - cmd.GPUStartTime) * 1000.0;
+        double ms = (cmd.GPUEndTime - cmd.GPUStartTime) * 1000.0;
+        g->stats.last_gpu_ms = ms;
+        if (greq) g->stats.last_ground_ms = ms;
     } else {
         g->stats.last_gpu_ms = g->async_last_gpu_ms.load(std::memory_order_relaxed);
     }
@@ -529,12 +703,45 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
 
 bool bloom_gpu_render_drawable(BloomGpu *gpu, BloomScene *scene,
                                uint32_t vp_w, uint32_t vp_h, bool force) {
-    return render_internal(gpu, scene, vp_w, vp_h, force, false);
+    return render_internal(gpu, scene, vp_w, vp_h, force, false, nullptr);
 }
 
 bool bloom_gpu_render_headless(BloomGpu *gpu, BloomScene *scene,
                                uint32_t vp_w, uint32_t vp_h, bool force) {
-    return render_internal(gpu, scene, vp_w, vp_h, force, true);
+    return render_internal(gpu, scene, vp_w, vp_h, force, true, nullptr);
+}
+
+bool bloom_gpu_render_grounded(BloomGpu *gpu, BloomScene *scene,
+                               uint32_t vp_w, uint32_t vp_h,
+                               uint32_t pick_x, uint32_t pick_y,
+                               BloomGroundedGpu32 *out_stats, uint32_t max_slots,
+                               BloomPickGpuResult *out_pick) {
+    if (!gpu || !scene || vp_w == 0u || vp_h == 0u || max_slots < 3u) return false;
+    uint32_t half_shift = (vp_w > 2048u) ? 1u : 0u;
+    uint32_t id_w = vp_w >> half_shift;
+    uint32_t id_h = vp_h >> half_shift;
+    if (!ensure_grounding_ready(gpu, id_w, id_h, max_slots)) return false;
+
+    auto *gs = static_cast<BloomGroundedGpu32 *>(gpu->b_ground_stats.contents);
+    for (uint32_t i = 0u; i < max_slots; ++i) {
+        gs[i].visible_px = 0u;
+        gs[i].min_x = UINT32_MAX;
+        gs[i].min_y = UINT32_MAX;
+        gs[i].max_x = 0u;
+        gs[i].max_y = 0u;
+        gs[i].best_anchor = 0u;
+        gs[i].part_sample = 0u;
+        gs[i].min_depth_u32 = UINT32_MAX;
+    }
+    auto *pk = static_cast<BloomPickGpuResult *>(gpu->b_ground_pick.contents);
+    pk->ground_id = 0u; pk->depth_bits = 0u; pk->px = pick_x; pk->py = pick_y;
+
+    GroundRequest req{pick_x, pick_y, max_slots, half_shift, id_w, id_h};
+    if (!render_internal(gpu, scene, vp_w, vp_h, true, true, &req)) return false;
+
+    if (out_stats) memcpy(out_stats, gs, (size_t)max_slots * sizeof(BloomGroundedGpu32));
+    if (out_pick) *out_pick = *pk;
+    return true;
 }
 
 uint32_t bloom_gpu_headless_checksum(BloomGpu *g) {
@@ -586,6 +793,38 @@ bool bloom_gpu_save_headless_ppm(BloomGpu *g, const char *ppm_path) {
         fwrite(rgb.data(), 1u, rgb.size(), fp);
     }
     fclose(fp);
+    return true;
+}
+
+bool bloom_gpu_readback_headless_rgba8(BloomGpu *g, uint8_t *out_rgba8, uint32_t max_bytes,
+                                       uint32_t *out_w, uint32_t *out_h) {
+    if (!g || !g->hl_color_tex || !out_rgba8) return false;
+    uint32_t w = (uint32_t)g->hl_color_tex.width;
+    uint32_t h = (uint32_t)g->hl_color_tex.height;
+    size_t row_bytes = (size_t)w * 4u;
+    size_t tot_bytes = row_bytes * (size_t)h;
+    if ((size_t)max_bytes < tot_bytes) return false;
+
+    id<MTLBuffer> rb = [g->dev newBufferWithLength:tot_bytes options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = [g->q commandBuffer];
+    id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+    [bl copyFromTexture:g->hl_color_tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+             sourceSize:MTLSizeMake(w, h, 1) toBuffer:rb destinationOffset:0
+      destinationBytesPerRow:row_bytes destinationBytesPerImage:tot_bytes];
+    [bl endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    const uint8_t *bgra = static_cast<const uint8_t *>(rb.contents);
+    size_t npx = (size_t)w * (size_t)h;
+    for (size_t i = 0u; i < npx; ++i) {
+        out_rgba8[i * 4u + 0u] = bgra[i * 4u + 2u];
+        out_rgba8[i * 4u + 1u] = bgra[i * 4u + 1u];
+        out_rgba8[i * 4u + 2u] = bgra[i * 4u + 0u];
+        out_rgba8[i * 4u + 3u] = bgra[i * 4u + 3u];
+    }
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
     return true;
 }
 

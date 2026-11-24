@@ -22,6 +22,9 @@ typedef struct {
     uint32_t total_meshlets;
     bool     memoryless_depth_active;
     bool     private_opt_atlas_active;
+    bool     grounding_active;
+    uint32_t max_tg_ground;
+    double   last_ground_ms;
 } BloomGpuStats;
 
 /**
@@ -44,6 +47,21 @@ uint32_t bloom_gpu_headless_checksum(BloomGpu *gpu);
 
 /** Read back headless target strictly for explicit offline PPM inspection/testing. */
 bool bloom_gpu_save_headless_ppm(BloomGpu *gpu, const char *ppm_path);
+
+/** Read back headless BGRA8 target into RGBA8 buffer (max_bytes >= w*h*4). */
+bool bloom_gpu_readback_headless_rgba8(BloomGpu *gpu, uint8_t *out_rgba8, uint32_t max_bytes,
+                                       uint32_t *out_w, uint32_t *out_h);
+
+/**
+ * Adaptive Half-Res ID Grounding + Picking (Single CommandBuffer):
+ * Runs pure RGB pass followed by adaptive half-res R32Uint ID render + GPU reduction.
+ * Normal render calls pay zero ID allocation and 0.000 ms latency overhead.
+ */
+bool bloom_gpu_render_grounded(BloomGpu *gpu, BloomScene *scene,
+                               uint32_t vp_w, uint32_t vp_h,
+                               uint32_t pick_x, uint32_t pick_y,
+                               BloomGroundedGpu32 *out_stats, uint32_t max_slots,
+                               BloomPickGpuResult *out_pick);
 
 BloomGpuStats bloom_gpu_get_stats(const BloomGpu *gpu);
 

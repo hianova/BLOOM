@@ -15,8 +15,19 @@ typedef enum {
     BLOOM_UI_BUTTON = 1,
     BLOOM_UI_SLIDER = 2,
     BLOOM_UI_TEXT   = 3,
-    BLOOM_UI_VLIST  = 4
+    BLOOM_UI_VLIST  = 4,
+    BLOOM_UI_MODAL  = 5
 } BloomUiKind;
+
+enum {
+    BLOOM_ACT_NONE    = 0u,
+    BLOOM_ACT_CLICK   = 1u << 0,
+    BLOOM_ACT_DRAG    = 1u << 1,
+    BLOOM_ACT_SCROLL  = 1u << 2,
+    BLOOM_ACT_FOCUS   = 1u << 3,
+    BLOOM_ACT_SET_DOF = 1u << 4,
+    BLOOM_ACT_CUTAWAY = 1u << 5
+};
 
 typedef enum {
     BLOOM_FLEX_COL = 0,
@@ -69,7 +80,46 @@ typedef struct {
     uint8_t bind_dof_slot; /* 0..2 = DOF, 3 = clip_plane.d */
     uint32_t vlist_total_rows;
     float vlist_row_h;
+    bool disabled;
+    bool modal_trap;
+    uint32_t action_mask;
 } BloomUiNodeDesc;
+
+typedef struct {
+    BloomHandle handle;
+    uint64_t    key;
+    const char *id;
+    const char *label;
+    BloomUiKind kind;
+    float       x, y, w, h;
+    float       clip_x, clip_y, clip_w, clip_h;
+    uint16_t    z_order;
+    bool        disabled;
+    bool        modal_trap;
+    bool        focused;
+    bool        hovered;
+    bool        toggle_on;
+    float       slider_t;
+    float       scroll_y;
+    uint32_t    action_mask;
+    uint64_t    bind_obj_key;
+    uint8_t     bind_dof_slot;
+} BloomUiMeta;
+
+typedef struct {
+    BloomHandle        handle;
+    uint64_t           key;
+    const char        *id;
+    BloomObjectState48 world_state;
+    float              local_dof[3];
+    bool               cutaway;
+} BloomObjectMeta;
+
+typedef struct {
+    uint32_t            index;
+    uint64_t            key;
+    BloomAnalyticPrim32 prim;
+} BloomAnalyticMeta;
 
 typedef struct {
     uint64_t node_key;
@@ -149,11 +199,26 @@ uint32_t bloom_scene_get_analytics(const BloomScene *scene, const BloomAnalyticP
 
 /** Tri-Layer 2D UI, Flexbox, VirtualList & Hit-Test */
 BloomHandle bloom_scene_add_ui(BloomScene *scene, const BloomUiNodeDesc *desc);
+bool bloom_scene_destroy_ui(BloomScene *scene, BloomHandle ui);
 void bloom_scene_clear_ui(BloomScene *scene);
 bool bloom_scene_set_ui_label(BloomScene *scene, BloomHandle ui, const char *label);
 bool bloom_scene_set_ui_scroll(BloomScene *scene, BloomHandle ui, float scroll_y);
+bool bloom_scene_set_ui_focused(BloomScene *scene, BloomHandle ui);
+BloomHandle bloom_scene_get_focused_ui(const BloomScene *scene);
 float bloom_scene_get_ui_slider(const BloomScene *scene, BloomHandle ui);
 bool bloom_scene_get_ui_toggle(const BloomScene *scene, BloomHandle ui);
+
+/** Unified Embodied Inspection Getters (for SDK & Vision Modules) */
+uint32_t bloom_scene_get_object_slot_count(const BloomScene *scene);
+bool bloom_scene_get_object_meta(const BloomScene *scene, uint32_t slot, BloomObjectMeta *out);
+uint32_t bloom_scene_get_analytic_count(const BloomScene *scene);
+bool bloom_scene_get_analytic_meta(const BloomScene *scene, uint32_t idx, BloomAnalyticMeta *out);
+uint32_t bloom_scene_get_ui_count(const BloomScene *scene);
+bool bloom_scene_get_ui_meta(const BloomScene *scene, uint32_t slot, BloomUiMeta *out);
+bool bloom_scene_get_template_mesh(const BloomScene *scene, uint16_t template_id,
+                                   uint32_t *out_mcnt, const BloomMeshletHeader32 **out_hdrs,
+                                   const BloomVtx12 **out_verts, const uint8_t **out_lidx,
+                                   uint32_t *out_idx_bytes);
 
 void bloom_scene_layout_ui(BloomScene *scene, float vp_w, float vp_h);
 bool bloom_scene_handle_input(BloomScene *scene, const BloomInputEvent *ev);

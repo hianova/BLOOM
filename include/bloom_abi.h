@@ -22,6 +22,24 @@ extern "C" {
 #define BLOOM_RGBA(r, g, b, a) \
     (((uint32_t)(a) << 24u) | ((uint32_t)(b) << 16u) | ((uint32_t)(g) << 8u) | (uint32_t)(r))
 
+/* Grounding Packed 32-bit ID: [domain:2 | slot:14 | part:8 | qdepth8:8] */
+enum {
+    BLOOM_GROUND_EMPTY    = 0u,
+    BLOOM_GROUND_MESH     = 1u,
+    BLOOM_GROUND_ANALYTIC = 2u,
+    BLOOM_GROUND_UI       = 3u
+};
+#define BLOOM_QUAD_FLAG_GROUND_ONLY (UINT32_C(1) << 28)
+#define BLOOM_GROUND_KEY_MASK       UINT32_C(0xFFFF0000)
+
+static inline uint32_t bloom_ground_pack(uint32_t domain, uint32_t slot, uint32_t part) {
+    return ((domain & 3u) << 30u) | ((slot & 0x3FFFu) << 16u) | ((part & 0xFFu) << 8u);
+}
+static inline uint32_t bloom_ground_domain(uint32_t g)   { return (g >> 30u) & 3u; }
+static inline uint32_t bloom_ground_slot(uint32_t g)     { return (g >> 16u) & 0x3FFFu; }
+static inline uint32_t bloom_ground_part(uint32_t g)     { return (g >> 8u)  & 0xFFu; }
+static inline uint32_t bloom_ground_depth_q8(uint32_t g) { return g & 0xFFu; }
+
 /* ============================================================================
  * GPU-Direct Compact POD Structures (Zero-Padding C17 / C++17 / MSL Parity)
  * ============================================================================ */
@@ -152,6 +170,26 @@ typedef struct {
     uint32_t prim_count;
 } BloomFrameUniforms;
 BLOOM_STATIC_ASSERT(sizeof(BloomFrameUniforms) == 80, "BloomFrameUniforms must be 80 bytes");
+
+typedef struct {
+    uint32_t visible_px;
+    uint32_t min_x;
+    uint32_t min_y;
+    uint32_t max_x;
+    uint32_t max_y;
+    uint32_t best_anchor;
+    uint32_t part_sample;
+    uint32_t min_depth_u32;
+} BloomGroundedGpu32;
+BLOOM_STATIC_ASSERT(sizeof(BloomGroundedGpu32) == 32, "BloomGroundedGpu32 must be 32 bytes");
+
+typedef struct {
+    uint32_t ground_id;
+    uint32_t depth_bits;
+    uint32_t px;
+    uint32_t py;
+} BloomPickGpuResult;
+BLOOM_STATIC_ASSERT(sizeof(BloomPickGpuResult) == 16, "BloomPickGpuResult must be 16 bytes");
 
 /* ============================================================================
  * Layer 0 Host / External Simulation Projection & Camera / Input Types

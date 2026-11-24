@@ -18,10 +18,12 @@ JSON_OBJ = $(BUILD_DIR)/object_ssot_results.json
 
 BIN_FMT = $(BUILD_DIR)/format_ssot_bench
 JSON_FMT = $(BUILD_DIR)/format_info_results.json
+BIN_GROUND = $(BUILD_DIR)/embodied_grounding_bench
+JSON_GROUND = $(BUILD_DIR)/embodied_grounding_results.json
 
-.PHONY: all run run-gpui run-svg run-obj run-fmt run-all clean
+.PHONY: all run run-gpui run-svg run-obj run-fmt run-ground run-all clean
 
-all: $(BIN_SILICON) $(BIN_GPUI) $(BIN_SVG) $(BIN_OBJ) $(BIN_FMT)
+all: $(BIN_SILICON) $(BIN_GPUI) $(BIN_SVG) $(BIN_OBJ) $(BIN_FMT) $(BIN_GROUND)
 
 $(BIN_SILICON): m1_silicon_probe.mm Makefile
 	@mkdir -p $(BUILD_DIR)
@@ -43,6 +45,10 @@ $(BIN_FMT): format_ssot_bench.cpp Makefile
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_CPP) $< -o $@
 
+$(BIN_GROUND): embodied_grounding_bench.mm Makefile
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< -o $@ $(FRAMEWORKS)
+
 run: $(BIN_SILICON)
 	$(BIN_SILICON) --json $(JSON_SILICON)
 
@@ -58,7 +64,10 @@ run-obj: $(BIN_OBJ)
 run-fmt: $(BIN_FMT) run_format_info_eval.py
 	python3 run_format_info_eval.py --bench-bin $(BIN_FMT) --out-json $(JSON_FMT)
 
-run-all: run run-gpui run-svg run-obj run-fmt
+run-ground: $(BIN_GROUND)
+	$(BIN_GROUND) --json $(JSON_GROUND)
+
+run-all: run run-gpui run-svg run-obj run-fmt run-ground
 
 clean:
 	rm -rf $(BUILD_DIR)
