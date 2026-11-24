@@ -2,6 +2,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 #include "bloom_atlas.h"
+#include "bloom_embedded_shaders.h"
 #include "bloom_gpu.h"
 
 #include <algorithm>
@@ -199,17 +200,23 @@ static void build_frame_uniforms(const BloomScene *sc, uint32_t vp_w, uint32_t v
 
 BloomGpu *bloom_gpu_create(void *ca_metal_layer, const char *shader_path) {
     NSError *err = nil;
-    const char *spath = shader_path ? shader_path : "shaders/bloom_core.metal";
-    NSString *src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:spath]
-                                              encoding:NSUTF8StringEncoding error:&err];
-    if (!src || err) {
-        fprintf(stderr, "Cannot read shader %s: %s\n", spath, err ? err.localizedDescription.UTF8String : "?");
+    NSString *src = nil;
+    if (shader_path && shader_path[0]) {
+        src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:shader_path]
+                                        encoding:NSUTF8StringEncoding error:&err];
+    }
+    if (!src) {
+        err = nil;
+        src = [NSString stringWithUTF8String:bloom_embedded_core_shader()];
+    }
+    if (!src) {
+        fprintf(stderr, "Cannot load core Metal shader source\n");
         return nullptr;
     }
 
     BloomGpu *g = new BloomGpu();
-    {
-        std::string sp(spath);
+    if (shader_path && shader_path[0]) {
+        std::string sp(shader_path);
         size_t pos = sp.rfind("bloom_core.metal");
         std::string dir = (pos != std::string::npos) ? sp.substr(0, pos) : "shaders/";
         g->ground_shader_path = dir + "bloom_grounding.metal";
@@ -323,23 +330,37 @@ void bloom_gpu_destroy(BloomGpu *gpu) {
     delete gpu;
 }
 
+static id<MTLLibrary> compile_aux_lib(id<MTLDevice> dev, const std::string &path, const char *embedded_src) {
+    NSError *err = nil;
+    NSString *src = nil;
+    if (!path.empty()) {
+        src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:path.c_str()]
+                                        encoding:NSUTF8StringEncoding error:&err];
+    }
+    if (!src && embedded_src) {
+        err = nil;
+        src = [NSString stringWithUTF8String:embedded_src];
+    }
+    if (!src) {
+        fprintf(stderr, "Cannot load shader %s\n", path.empty() ? "<embedded>" : path.c_str());
+        return nil;
+    }
+    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    opts.languageVersion = MTLLanguageVersion3_0;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opts error:&err];
+    if (!lib || err) {
+        fprintf(stderr, "Shader %s compile failed: %s\n",
+                path.empty() ? "<embedded>" : path.c_str(),
+                err ? err.localizedDescription.UTF8String : "?");
+        return nil;
+    }
+    return lib;
+}
+
 static bool ensure_grounding_ready(BloomGpu *g, uint32_t id_w, uint32_t id_h, uint32_t max_slots) {
     if (!g->ground_lib) {
-        NSError *err = nil;
-        NSString *src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:g->ground_shader_path.c_str()]
-                                                  encoding:NSUTF8StringEncoding error:&err];
-        if (!src || err) {
-            fprintf(stderr, "Cannot read grounding shader %s: %s\n", g->ground_shader_path.c_str(),
-                    err ? err.localizedDescription.UTF8String : "?");
-            return false;
-        }
-        MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-        opts.languageVersion = MTLLanguageVersion3_0;
-        g->ground_lib = [g->dev newLibraryWithSource:src options:opts error:&err];
-        if (!g->ground_lib || err) {
-            fprintf(stderr, "Grounding shader compile failed: %s\n", err ? err.localizedDescription.UTF8String : "?");
-            return false;
-        }
+        g->ground_lib = compile_aux_lib(g->dev, g->ground_shader_path, bloom_embedded_grounding_shader());
+        if (!g->ground_lib) return false;
         auto make_id_r = [&](const char *vf, const char *ff) -> id<MTLRenderPipelineState> {
             MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
             d.vertexFunction = [g->ground_lib newFunctionWithName:[NSString stringWithUTF8String:vf]];
@@ -387,24 +408,6 @@ static bool ensure_grounding_ready(BloomGpu *g, uint32_t id_w, uint32_t id_h, ui
     return true;
 }
 
-static id<MTLLibrary> compile_aux_lib(id<MTLDevice> dev, const std::string &path) {
-    NSError *err = nil;
-    NSString *src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:path.c_str()]
-                                              encoding:NSUTF8StringEncoding error:&err];
-    if (!src || err) {
-        fprintf(stderr, "Cannot read shader %s: %s\n", path.c_str(), err ? err.localizedDescription.UTF8String : "?");
-        return nil;
-    }
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-    opts.languageVersion = MTLLanguageVersion3_0;
-    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opts error:&err];
-    if (!lib || err) {
-        fprintf(stderr, "Shader %s compile failed: %s\n", path.c_str(), err ? err.localizedDescription.UTF8String : "?");
-        return nil;
-    }
-    return lib;
-}
-
 static bool ensure_pbr_tex_array(BloomGpu *g) {
     if (g->pbr_tex_array) return true;
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
@@ -421,7 +424,7 @@ static bool ensure_pbr_tex_array(BloomGpu *g) {
 static bool ensure_pbr_ready(BloomGpu *g) {
     if (!ensure_pbr_tex_array(g)) return false;
     if (!g->pbr_lib) {
-        g->pbr_lib = compile_aux_lib(g->dev, g->pbr_shader_path);
+        g->pbr_lib = compile_aux_lib(g->dev, g->pbr_shader_path, bloom_embedded_pbr_shader());
         if (!g->pbr_lib) return false;
         g->p_mesh_pbr = make_rpso(g->dev, g->pbr_lib, "v_meshlet_pbr", "f_meshlet_pbr", false, false);
         if (!g->p_mesh_pbr) return false;
@@ -432,7 +435,7 @@ static bool ensure_pbr_ready(BloomGpu *g) {
 
 static bool ensure_sprite_ready(BloomGpu *g) {
     if (!g->sprite_lib) {
-        g->sprite_lib = compile_aux_lib(g->dev, g->sprite_shader_path);
+        g->sprite_lib = compile_aux_lib(g->dev, g->sprite_shader_path, bloom_embedded_sprite_shader());
         if (!g->sprite_lib) return false;
         g->p_hud_sprite = make_rpso(g->dev, g->sprite_lib, "v_hud_sprite", "f_hud_sprite", true, false);
         if (!g->p_hud_sprite) return false;

@@ -9,6 +9,8 @@ FRAMEWORKS = -framework Metal -framework QuartzCore -framework Cocoa -framework 
 BUILD_DIR = build
 CORE_OBJS = $(BUILD_DIR)/bloom_bobj.o $(BUILD_DIR)/bloom_scene.o $(BUILD_DIR)/bloom_sdk.o $(BUILD_DIR)/bloom_ui_kit.o $(BUILD_DIR)/bloom_gesture.o $(BUILD_DIR)/bloom_camera.o
 MAC_OBJS = $(BUILD_DIR)/bloom_atlas_mac.o $(BUILD_DIR)/bloom_metal.o $(BUILD_DIR)/bloom_vision_mac.o $(BUILD_DIR)/bloom_host_mac.o
+EMBED_HDR = $(BUILD_DIR)/bloom_embedded_shaders.h
+LIB_BLOOM = $(BUILD_DIR)/libbloom.a
 
 BIN_CORE_TEST = $(BUILD_DIR)/test_bloom_core
 BIN_METAL_TEST = $(BUILD_DIR)/test_bloom_metal
@@ -16,9 +18,19 @@ BIN_SDK_TEST = $(BUILD_DIR)/test_bloom_sdk
 BIN_M2_TEST = $(BUILD_DIR)/test_bloom_m2
 BIN_DEMO = $(BUILD_DIR)/bloom_studio_demo
 
-.PHONY: all test gate-ci demo clean
+.PHONY: all lib test gate-ci demo clean
 
-all: $(BIN_CORE_TEST) $(BIN_METAL_TEST) $(BIN_SDK_TEST) $(BIN_M2_TEST) $(BIN_DEMO)
+all: $(LIB_BLOOM) $(BIN_CORE_TEST) $(BIN_METAL_TEST) $(BIN_SDK_TEST) $(BIN_M2_TEST) $(BIN_DEMO)
+
+lib: $(LIB_BLOOM)
+
+$(EMBED_HDR): tools/embed_shaders.py shaders/*.metal Makefile
+	@mkdir -p $(BUILD_DIR)
+	python3 tools/embed_shaders.py --out $@
+
+$(LIB_BLOOM): $(CORE_OBJS) $(MAC_OBJS) Makefile
+	@mkdir -p $(BUILD_DIR)
+	ar rcs $@ $(CORE_OBJS) $(MAC_OBJS)
 
 $(BUILD_DIR)/bloom_bobj.o: src/bloom_bobj.c include/bloom_bobj.h include/bloom_abi.h Makefile
 	@mkdir -p $(BUILD_DIR)
@@ -48,13 +60,13 @@ $(BUILD_DIR)/bloom_atlas_mac.o: src/bloom_atlas_mac.m include/bloom_atlas.h incl
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(OBJCFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/bloom_metal.o: src/bloom_metal.mm include/bloom_gpu.h include/bloom_atlas.h include/bloom_scene.h Makefile
+$(BUILD_DIR)/bloom_metal.o: src/bloom_metal.mm include/bloom_gpu.h include/bloom_atlas.h include/bloom_scene.h $(EMBED_HDR) Makefile
 	@mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -I$(BUILD_DIR) -c $< -o $@
 
-$(BUILD_DIR)/bloom_vision_mac.o: src/bloom_vision_mac.mm include/bloom_vision.h include/bloom_scene.h include/bloom_abi.h Makefile
+$(BUILD_DIR)/bloom_vision_mac.o: src/bloom_vision_mac.mm include/bloom_vision.h include/bloom_scene.h include/bloom_abi.h $(EMBED_HDR) Makefile
 	@mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -I$(BUILD_DIR) -c $< -o $@
 
 $(BUILD_DIR)/bloom_host_mac.o: src/bloom_host_mac.mm include/bloom_host.h include/bloom_gpu.h include/bloom_scene.h Makefile
 	@mkdir -p $(BUILD_DIR)
@@ -68,17 +80,17 @@ $(BIN_METAL_TEST): tests/test_bloom_metal.mm $(BUILD_DIR)/bloom_bobj.o $(BUILD_D
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) tests/test_bloom_metal.mm $(BUILD_DIR)/bloom_bobj.o $(BUILD_DIR)/bloom_scene.o $(BUILD_DIR)/bloom_atlas_mac.o $(BUILD_DIR)/bloom_metal.o $(FRAMEWORKS) -o $@
 
-$(BIN_SDK_TEST): tests/test_bloom_sdk.mm $(CORE_OBJS) $(BUILD_DIR)/bloom_atlas_mac.o $(BUILD_DIR)/bloom_metal.o $(BUILD_DIR)/bloom_vision_mac.o Makefile
+$(BIN_SDK_TEST): tests/test_bloom_sdk.mm $(LIB_BLOOM) Makefile
 	@mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) tests/test_bloom_sdk.mm $(CORE_OBJS) $(BUILD_DIR)/bloom_atlas_mac.o $(BUILD_DIR)/bloom_metal.o $(BUILD_DIR)/bloom_vision_mac.o $(FRAMEWORKS) -lm -o $@
+	$(CXX) $(CXXFLAGS) tests/test_bloom_sdk.mm $(LIB_BLOOM) $(FRAMEWORKS) -lm -o $@
 
-$(BIN_M2_TEST): tests/test_bloom_m2.mm $(CORE_OBJS) $(BUILD_DIR)/bloom_atlas_mac.o $(BUILD_DIR)/bloom_metal.o Makefile
+$(BIN_M2_TEST): tests/test_bloom_m2.mm include/bloom.h $(LIB_BLOOM) Makefile
 	@mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) tests/test_bloom_m2.mm $(CORE_OBJS) $(BUILD_DIR)/bloom_atlas_mac.o $(BUILD_DIR)/bloom_metal.o $(FRAMEWORKS) -lm -o $@
+	$(CXX) $(CXXFLAGS) tests/test_bloom_m2.mm $(LIB_BLOOM) $(FRAMEWORKS) -lm -o $@
 
-$(BIN_DEMO): examples/bloom_studio_demo.mm $(CORE_OBJS) $(MAC_OBJS) Makefile
+$(BIN_DEMO): examples/bloom_studio_demo.mm $(LIB_BLOOM) Makefile
 	@mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) examples/bloom_studio_demo.mm $(CORE_OBJS) $(MAC_OBJS) $(FRAMEWORKS) -o $@
+	$(CXX) $(CXXFLAGS) examples/bloom_studio_demo.mm $(LIB_BLOOM) $(FRAMEWORKS) -o $@
 
 test: all
 	@mkdir -p $(BUILD_DIR)

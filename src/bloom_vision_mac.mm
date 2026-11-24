@@ -1,5 +1,6 @@
 #import <Metal/Metal.h>
 
+#include "bloom_embedded_shaders.h"
 #include "bloom_vision.h"
 
 #include <algorithm>
@@ -110,12 +111,18 @@ static void cam_basis_vis(const BloomCamera *cam, float r[3], float u[3], float 
 }
 
 BloomVision *bloom_vision_create(const char *shader_path) {
-    const char *spath = shader_path ? shader_path : "shaders/bloom_vision.metal";
     NSError *err = nil;
-    NSString *src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:spath]
-                                              encoding:NSUTF8StringEncoding error:&err];
-    if (!src || err) {
-        fprintf(stderr, "Cannot read vision shader %s: %s\n", spath, err ? err.localizedDescription.UTF8String : "?");
+    NSString *src = nil;
+    if (shader_path && shader_path[0]) {
+        src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:shader_path]
+                                        encoding:NSUTF8StringEncoding error:&err];
+    }
+    if (!src) {
+        err = nil;
+        src = [NSString stringWithUTF8String:bloom_embedded_vision_shader()];
+    }
+    if (!src) {
+        fprintf(stderr, "Cannot load vision shader source\n");
         return nullptr;
     }
 

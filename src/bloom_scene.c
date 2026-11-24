@@ -694,7 +694,15 @@ void bloom_scene_apply_projections(BloomScene *s, const BloomStateProjection *pr
             any_changed = true;
         }
         if (pr->field_mask & BLOOM_PROJ_FLAGS) {
-            o->flags = pr->flags;
+            uint32_t hi_mat = (pr->flags & UINT32_C(0xFFFF0000))
+                                  ? (pr->flags & UINT32_C(0xFFFF0000))
+                                  : (o->flags & UINT32_C(0xFFFF0000));
+            uint32_t lo_flg = pr->flags & UINT32_C(0x0000FFFF);
+            uint32_t mid = hi_mat >> 16u;
+            if (mid < s->mat_cnt && (s->materials[mid].flags & BLOOM_MAT_FLAG_PBR)) {
+                lo_flg |= BLOOM_OBJ_FLAG_PBR;
+            }
+            o->flags = hi_mat | lo_flg;
             any_changed = true;
         }
     }
@@ -745,6 +753,22 @@ static void sync_object_recursive(BloomScene *s, uint32_t idx, uint32_t depth,
     o->synced = true;
 }
 
+typedef struct {
+    uint32_t g_idx;
+    uint32_t obj_idx;
+    uint8_t  tier;
+    float    view_z;
+} MeshSortKey;
+
+static int cmp_mesh_sort_key(const void *pa, const void *pb) {
+    const MeshSortKey *a = (const MeshSortKey *)pa;
+    const MeshSortKey *b = (const MeshSortKey *)pb;
+    if (a->tier != b->tier) return (a->tier < b->tier) ? -1 : 1;
+    if (a->view_z < b->view_z) return -1;
+    if (a->view_z > b->view_z) return 1;
+    return (a->g_idx < b->g_idx) ? -1 : ((a->g_idx > b->g_idx) ? 1 : 0);
+}
+
 void bloom_scene_sync_transforms(BloomScene *s) {
     if (!s) return;
     for (uint32_t i = 1u; i < s->obj_cap; ++i) s->objs[i].synced = false;
@@ -764,12 +788,42 @@ void bloom_scene_sync_transforms(BloomScene *s) {
         uint32_t g_idx = s->gpu_state_cnt++;
         s->gpu_states[g_idx] = s->objs[i].world_state;
         s->gpu_obj_slots[g_idx] = i;
+    }
+    if (s->gpu_state_cnt == 0u) return;
 
-        uint16_t tid = s->objs[i].cspec.template_id;
+    MeshSortKey *order = (MeshSortKey *)malloc((size_t)s->gpu_state_cnt * sizeof(MeshSortKey));
+    if (order) {
+        float cy = cosf(s->camera.yaw), sy = sinf(s->camera.yaw);
+        float cp = cosf(s->camera.pitch), sp = sinf(s->camera.pitch);
+        float fx = sy * cp, fy = -sp, fz = cy * cp;
+        for (uint32_t g_idx = 0u; g_idx < s->gpu_state_cnt; ++g_idx) {
+            const BloomObjectState48 *st = &s->gpu_states[g_idx];
+            float dx = st->pos[0] - s->camera.pos[0];
+            float dy = st->pos[1] - s->camera.pos[1];
+            float dz = st->pos[2] - s->camera.pos[2];
+            float vz = dx * fx + dy * fy + dz * fz;
+            float sx = fabsf(bloom_f16_to_f32(st->scale_f16[0]));
+            float sy_s = fabsf(bloom_f16_to_f32(st->scale_f16[1]));
+            float sz = fabsf(bloom_f16_to_f32(st->scale_f16[2]));
+            float max_sc = sx > sy_s ? sx : sy_s;
+            if (sz > max_sc) max_sc = sz;
+            order[g_idx].g_idx = g_idx;
+            order[g_idx].obj_idx = s->gpu_obj_slots[g_idx];
+            order[g_idx].tier = (max_sc >= 8.0f) ? 1u : 0u;
+            order[g_idx].view_z = vz;
+        }
+        qsort(order, s->gpu_state_cnt, sizeof(MeshSortKey), cmp_mesh_sort_key);
+    }
+
+    for (uint32_t k = 0u; k < s->gpu_state_cnt; ++k) {
+        uint32_t g_idx = order ? order[k].g_idx : k;
+        uint32_t obj_idx = order ? order[k].obj_idx : s->gpu_obj_slots[k];
+        uint16_t tid = s->objs[obj_idx].cspec.template_id;
         if (tid < s->tpl_cnt) {
             const SceneTemplate *t = &s->templates[tid];
             if (!grow_array((void **)&s->gpu_meshlets, &s->gpu_meshlet_cap,
                             s->gpu_meshlet_cnt + t->meshlet_cnt, sizeof(BloomMeshletHeader32))) {
+                free(order);
                 return;
             }
             for (uint32_t m = 0u; m < t->meshlet_cnt; ++m) {
@@ -777,11 +831,12 @@ void bloom_scene_sync_transforms(BloomScene *s) {
                 h.vtx_offset += t->gpu_vtx_base;
                 h.idx_offset += t->gpu_idx_base;
                 h.obj_id = (uint16_t)g_idx;
-                h.flags |= (uint16_t)(s->objs[i].flags & BLOOM_OBJ_FLAG_CUTAWAY);
+                h.flags |= (uint16_t)(s->objs[obj_idx].flags & BLOOM_OBJ_FLAG_CUTAWAY);
                 s->gpu_meshlets[s->gpu_meshlet_cnt++] = h;
             }
         }
     }
+    free(order);
 }
 
 uint32_t bloom_scene_get_template_vtx_count(const BloomScene *s) {
@@ -1328,7 +1383,11 @@ static void layout_ui_recursive(BloomScene *s, uint32_t ui_idx, uint16_t clip_id
                u->desc.kind != BLOOM_UI_TEXT_INPUT && u->desc.kind != BLOOM_UI_TABS &&
                u->desc.kind != BLOOM_UI_SELECT && u->desc.kind != BLOOM_UI_SPRITE) {
         float pad = u->desc.pad > 0.0f ? u->desc.pad : 10.0f;
-        float ly = (u->desc.kind == BLOOM_UI_SLIDER) ? (u->y + 6.0f) : (u->y + pad * 0.6f);
+        float ly = (u->desc.kind == BLOOM_UI_SLIDER)
+                       ? (u->y + 6.0f)
+                       : ((u->desc.kind == BLOOM_UI_BUTTON || u->desc.kind == BLOOM_UI_TOAST)
+                              ? (u->y + (u->h - fpx * 1.2f) * 0.5f)
+                              : (u->y + pad * 0.6f));
         emit_text(s, u->key, u->x + pad, ly, u->w - 2.0f * pad, u->h,
                   fpx, tcol, clip_id, (uint16_t)(z_base + 5u), u->desc.text_wrap, u->label_buf);
     }

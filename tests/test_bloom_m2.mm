@@ -1,12 +1,4 @@
-#include "bloom_abi.h"
-#include "bloom_atlas.h"
-#include "bloom_bobj.h"
-#include "bloom_camera.h"
-#include "bloom_gesture.h"
-#include "bloom_gpu.h"
-#include "bloom_scene.h"
-#include "bloom_sdk.h"
-#include "bloom_ui_kit.h"
+#include "bloom.h"
 
 #include <algorithm>
 #include <cassert>
@@ -240,7 +232,7 @@ static void test_m2_a1_flex_cjk_sprite_4k(BloomGpu *gpu) {
     bloom_scene_destroy(sc);
 }
 
-static void test_m2_a2_ui_kit_ime_widgets_gesture_sdk(BloomGpu *gpu) {
+static void test_m2_a2_ui_kit_ime_widgets_gesture_sdk(BloomGpu *gpu, const char *ppm_path) {
     BloomTheme light = bloom_theme_light();
     BloomTheme dark = bloom_theme_dark();
     assert(light.bg_canvas != dark.bg_canvas);
@@ -257,6 +249,7 @@ static void test_m2_a2_ui_kit_ime_widgets_gesture_sdk(BloomGpu *gpu) {
     BloomHandle hsel = bloom_kit_select(sc, &dark, hp, "sel_backend", "Metal|WebGPU|Vulkan", 420.0f, 36.0f);
     BloomHandle htab = bloom_kit_tabs(sc, &dark, hp, "tab_mode", "Scene|Material|SDK", 420.0f, 34.0f);
     BloomHandle hprog = bloom_kit_progress(sc, &dark, hp, "prog_bake", 0.25f, 420.0f, 14.0f);
+    BloomHandle hbtn = bloom_kit_button(sc, &dark, hp, "btn_apply", "套用設定 / Apply", 420.0f, 36.0f);
     BloomHandle hsv = bloom_kit_scrollview(sc, &dark, hp, "sv_list", 420.0f, 120.0f, BLOOM_FLEX_COL);
     for (int i = 0; i < 12; ++i) {
         char bid[32], blabel[32];
@@ -266,7 +259,7 @@ static void test_m2_a2_ui_kit_ime_widgets_gesture_sdk(BloomGpu *gpu) {
     }
     BloomHandle htoast = bloom_kit_toast(sc, &dark, "toast_ok", "Milestone 2 Ready",
                                          540.0f, 40.0f, 320.0f, 44.0f);
-    assert(hp && hti && hchk && hsw && hsel && htab && hprog && hsv && htoast);
+    assert(hp && hti && hchk && hsw && hsel && htab && hprog && hbtn && hsv && htoast);
 
     bloom_scene_layout_ui(sc, 1280.0f, 720.0f);
 
@@ -330,6 +323,9 @@ static void test_m2_a2_ui_kit_ime_widgets_gesture_sdk(BloomGpu *gpu) {
     const BloomSdkEntity *e_sel = bloom_sdk_find_by_id(&snap, "sel_backend");
     assert(e_chk != nullptr && e_chk->visible_px > 0u && !e_chk->occluded);
     assert(e_sel != nullptr && e_sel->visible_px > 0u && !e_sel->occluded);
+    if (ppm_path && ppm_path[0]) {
+        assert(bloom_gpu_save_headless_ppm(gpu, ppm_path));
+    }
     std::printf("[Test M2-A2] UIKit+IME+SDK: chk_px=%u sel_px=%u scroll_y=%.1f ground=%.3f ms\n",
                 e_chk->visible_px, e_sel->visible_px, m_sv.scroll_y, snap.ground_ms);
     bloom_sdk_free_snapshot(&snap);
@@ -616,22 +612,98 @@ static void test_m2_b3_multi_glb_bobc(BloomGpu *gpu, const char *multi_bobc_path
     bloom_bobj_free(&doc);
 }
 
+static void test_m2_b4_packaging_atlas_flags_earlyz(void) {
+    /* 1. Embedded Vision Shader Zero-Path Creation */
+    BloomVision *vis = bloom_vision_create(nullptr);
+    assert(vis != nullptr);
+    bloom_vision_destroy(vis);
+
+    /* 2. Fresh Atlas Clears Row-0 Before First Glyph Packing */
+    BloomAtlas *ta = bloom_atlas_create(128u, 128u);
+    assert(ta != nullptr);
+    const uint8_t *px = nullptr;
+    uint32_t aw = 0u, ah = 0u, y0 = 999u, y1 = 0u;
+    assert(bloom_atlas_take_dirty(ta, &px, &aw, &ah, &y0, &y1));
+    assert(aw == 128u && ah == 128u && y0 == 0u && y1 == 128u && px != nullptr);
+    for (uint32_t x = 0u; x < 128u; ++x) assert(px[x] == 0u);
+    bloom_atlas_destroy(ta);
+
+    /* 3. BLOOM_PROJ_FLAGS Preserves High-16-bit mat_id & PBR Flag + Automatic Early-Z Sort */
+    BloomScene *sc = bloom_scene_create();
+    assert(sc != nullptr);
+    BloomCamera cam = {{0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, 1.8f, 0.5f, 80.0f};
+    bloom_scene_set_camera(sc, &cam);
+
+    BloomMaterial32 m0{};
+    m0.base_rgba8 = 0xFFFFFFFFu;
+    m0.flags = BLOOM_MAT_FLAG_PBR;
+    uint16_t id0 = bloom_scene_add_material(sc, &m0);
+    uint16_t id1 = bloom_scene_add_material(sc, &m0);
+    assert(id0 == 1u && id1 == 2u);
+
+    uint16_t tpl = build_torus_template(sc, "earlyz_torus");
+    float qid[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    float big_sc[3] = {20.0f, 1.0f, 20.0f};
+    float unit_sc[3] = {1.0f, 1.0f, 1.0f};
+    float p_bg[3] = {0.0f, 0.0f, 12.0f};
+    float p_far[3] = {0.0f, 0.0f, 16.0f};
+    float p_near[3] = {0.0f, 0.0f, 8.0f};
+
+    BloomHandle h_bg = bloom_scene_spawn_object(sc, "bg_floor", tpl, p_bg, qid, big_sc, 0xFFFFFFFFu, nullptr);
+    BloomHandle h_far = bloom_scene_spawn_object(sc, "fg_far", tpl, p_far, qid, unit_sc, 0xFFFFFFFFu, nullptr);
+    BloomHandle h_near = bloom_scene_spawn_object(sc, "fg_near", tpl, p_near, qid, unit_sc, 0xFFFFFFFFu, nullptr);
+    assert(bloom_scene_set_object_material(sc, h_far, id1));
+
+    /* Apply HIDDEN flag without touching mat_id bits -> high 16 bits and PBR bit stay intact */
+    BloomStateProjection pr{};
+    pr.node_key = bloom_fnv1a64("fg_far");
+    pr.flags = BLOOM_OBJ_FLAG_HIDDEN;
+    pr.field_mask = BLOOM_PROJ_FLAGS;
+    bloom_scene_apply_projections(sc, &pr, 1u);
+    bloom_scene_sync_transforms(sc);
+
+    BloomObjectState48 st{};
+    assert(bloom_scene_get_object_state(sc, h_far, &st));
+    assert((st.flags >> 16u) == id1 && (st.flags & BLOOM_OBJ_FLAG_HIDDEN) != 0u && (st.flags & BLOOM_OBJ_FLAG_PBR) != 0u);
+    assert(bloom_scene_get_gpu_meshlets(sc, nullptr) == 2u);
+
+    pr.flags = 0u;
+    bloom_scene_apply_projections(sc, &pr, 1u);
+    bloom_scene_sync_transforms(sc);
+    assert(bloom_scene_get_object_state(sc, h_far, &st));
+    assert((st.flags >> 16u) == id1 && (st.flags & BLOOM_OBJ_FLAG_HIDDEN) == 0u && (st.flags & BLOOM_OBJ_FLAG_PBR) != 0u);
+    (void)h_bg;
+    (void)h_near;
+
+    const BloomMeshletHeader32 *mh = nullptr;
+    uint32_t mcnt = bloom_scene_get_gpu_meshlets(sc, &mh);
+    assert(mcnt == 3u && mh != nullptr);
+    assert(mh[0].obj_id == 2u && mh[1].obj_id == 1u && mh[2].obj_id == 0u);
+
+    bloom_scene_destroy(sc);
+    std::printf("[Test M2-B4] EmbeddedVision + AtlasRow0 + PROJ_FLAGS(mat_id=%u) + EarlyZ(2->1->0) PASSED\n", id1);
+}
+
 int main(int argc, char **argv) {
     const char *multi_bobc = "build/multi_sample.bobc";
+    const char *ppm_path = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--multi-bobc") == 0) {
             multi_bobc = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--ppm") == 0) {
+            ppm_path = argv[i + 1];
         }
     }
 
-    BloomGpu *gpu = bloom_gpu_create(nullptr, "shaders/bloom_core.metal");
+    BloomGpu *gpu = bloom_gpu_create(nullptr, nullptr);
     assert(gpu != nullptr);
 
     test_m2_a1_flex_cjk_sprite_4k(gpu);
-    test_m2_a2_ui_kit_ime_widgets_gesture_sdk(gpu);
+    test_m2_a2_ui_kit_ime_widgets_gesture_sdk(gpu, ppm_path);
     test_m2_b1_pbr_tex_ktx2_4k(gpu);
     test_m2_b2_camera_raycast();
     test_m2_b3_multi_glb_bobc(gpu, multi_bobc);
+    test_m2_b4_packaging_atlas_flags_earlyz();
 
     bloom_gpu_destroy(gpu);
     std::printf("ALL MILESTONE-2 TESTS PASSED!\n");

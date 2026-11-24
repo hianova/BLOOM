@@ -171,12 +171,12 @@ static const GlyphEntry *get_or_rasterize_glyph(BloomAtlas *a, uint32_t cp, uint
         uint32_t bw = (uint32_t)(x1 - x0);
         uint32_t bh = (uint32_t)(y1 - y0);
         if (bw > 0u && bh > 0u && bw < a->width && bh < a->height) {
-            if (a->shelf_x + bw + 1u > a->width) {
-                a->shelf_y += a->shelf_h + 1u;
-                a->shelf_x = 1u;
+            if (a->shelf_x + bw + 2u > a->width) {
+                a->shelf_y += a->shelf_h + 2u;
+                a->shelf_x = 2u;
                 a->shelf_h = 0u;
             }
-            if (a->shelf_y + bh + 1u <= a->height) {
+            if (a->shelf_y + bh + 2u <= a->height) {
                 uint8_t *tmp = (uint8_t *)calloc((size_t)bw * bh, 1u);
                 if (tmp) {
                     CGContextRef ctx = CGBitmapContextCreate(tmp, bw, bh, 8, bw, NULL, (CGBitmapInfo)kCGImageAlphaOnly);
@@ -199,7 +199,7 @@ static const GlyphEntry *get_or_rasterize_glyph(BloomAtlas *a, uint32_t cp, uint
                         ge.h = (uint16_t)bh;
                         ge.bearing_x = (float)x0;
                         ge.bearing_y = (float)y1;
-                        a->shelf_x += bw + 1u;
+                        a->shelf_x += bw + 2u;
                         if (bh > a->shelf_h) a->shelf_h = bh;
                     }
                     free(tmp);
@@ -225,10 +225,16 @@ BloomAtlas *bloom_atlas_create(uint32_t width, uint32_t height) {
         free(a);
         return NULL;
     }
-    a->shelf_x = 1u;
-    a->shelf_y = 1u;
-    a->sp_shelf_x = 1u;
-    a->sp_shelf_y = 1u;
+    a->shelf_x = 2u;
+    a->shelf_y = 2u;
+    a->dirty_y0 = 0u;
+    a->dirty_y1 = a->height;
+    a->has_dirty = true;
+    a->sp_shelf_x = 2u;
+    a->sp_shelf_y = 2u;
+    a->sp_dirty_y0 = 0u;
+    a->sp_dirty_y1 = kSpriteAtlasDim;
+    a->sp_has_dirty = true;
     return a;
 }
 
@@ -316,8 +322,8 @@ uint32_t bloom_atlas_pack_runs(BloomAtlas *a, const BloomTextRun *runs, uint32_t
             }
             if (baseline_y - ascent >= run->y + run->h) break;
             if (ge->w > 0u && ge->h > 0u) {
-                float gx = pen_x + ge->bearing_x;
-                float gy = baseline_y - ge->bearing_y;
+                float gx = floorf(pen_x + ge->bearing_x + 0.5f);
+                float gy = floorf(baseline_y - ge->bearing_y + 0.5f);
                 if (gx + (float)ge->w > run->x && gx < run->x + run->w &&
                     gy < run->y + run->h) {
                     BloomGlyphInst inst;
@@ -363,15 +369,15 @@ uint32_t bloom_atlas_glyph_count(const BloomAtlas *a) {
 bool bloom_atlas_add_sprite_rgba8(BloomAtlas *a, const uint8_t *rgba8,
                                   uint32_t w, uint32_t h,
                                   uint16_t out_uv_unorm16[4]) {
-    if (!a || !rgba8 || w == 0u || h == 0u || w >= kSpriteAtlasDim - 2u || h >= kSpriteAtlasDim - 2u) {
+    if (!a || !rgba8 || w == 0u || h == 0u || w >= kSpriteAtlasDim - 4u || h >= kSpriteAtlasDim - 4u) {
         return false;
     }
-    if (a->sp_shelf_x + w + 1u > kSpriteAtlasDim) {
-        a->sp_shelf_y += a->sp_shelf_h + 1u;
-        a->sp_shelf_x = 1u;
+    if (a->sp_shelf_x + w + 2u > kSpriteAtlasDim) {
+        a->sp_shelf_y += a->sp_shelf_h + 2u;
+        a->sp_shelf_x = 2u;
         a->sp_shelf_h = 0u;
     }
-    if (a->sp_shelf_y + h + 1u > kSpriteAtlasDim) return false;
+    if (a->sp_shelf_y + h + 2u > kSpriteAtlasDim) return false;
 
     for (uint32_t row = 0u; row < h; ++row) {
         memcpy(a->sprite_pixels + ((size_t)(a->sp_shelf_y + row) * kSpriteAtlasDim + a->sp_shelf_x) * 4u,
@@ -389,7 +395,7 @@ bool bloom_atlas_add_sprite_rgba8(BloomAtlas *a, const uint8_t *rgba8,
         out_uv_unorm16[2] = (uint16_t)lround((double)w * inv);
         out_uv_unorm16[3] = (uint16_t)lround((double)h * inv);
     }
-    a->sp_shelf_x += w + 1u;
+    a->sp_shelf_x += w + 2u;
     if (h > a->sp_shelf_h) a->sp_shelf_h = h;
     a->sprite_cnt++;
     return true;
