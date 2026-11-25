@@ -28,7 +28,8 @@ struct BloomMaterial32 {
     uint base_rgba8, emissive_rgba8;
     half metallic, roughness, ao, normal_scale;
     ushort albedo_tex, mr_tex, normal_tex, flags;
-    uint pad0, pad1;
+    ushort emissive_tex, ao_tex;
+    uint pad1;
 };
 
 struct BloomLight32 {
@@ -105,7 +106,7 @@ vertex PbrVertOut v_meshlet_pbr(uint vid [[vertex_id]], uint iid [[instance_id]]
                 float3(float(st.sx), float(st.sy), float(st.sz));
     uint jmod = uint(v.joint_id % 3u);
     float dof = float(jmod == 0u ? st.dof0 : (jmod == 1u ? st.dof1 : st.dof2));
-    lp.y += sin(dof + lp.x) * 0.08f;
+    lp.y += (sin(dof + lp.x) - sin(lp.x)) * 0.08f;
     float4 q = float4(float(st.qx), float(st.qy), float(st.qz), float(st.qw));
     float3 wp = rotate_quat(q, lp) + float3(st.px, st.py, st.pz);
     float3 d = wp - float3(u.cam_pos);
@@ -117,7 +118,9 @@ vertex PbrVertOut v_meshlet_pbr(uint vid [[vertex_id]], uint iid [[instance_id]]
     o.clip_d[0] = ((st.flags & 1u) != 0u) ? (dot(lp, float3(float(st.cp0), float(st.cp1), float(st.cp2))) - float(st.cp3)) : 1.0f;
     o.wp = wp;
     o.uv = float2(float(v.u), float(v.v)) * (1.0f / 255.0f);
-    o.nrm = half3(rotate_quat(q, oct_decode_gpu(v.oct_x, v.oct_y)));
+    float3 sc = float3(float(st.sx), float(st.sy), float(st.sz));
+    float3 inv_sc = select(1.0f / sc, float3(1.0f), abs(sc) < 1e-5f);
+    o.nrm = half3(rotate_quat(q, normalize(oct_decode_gpu(v.oct_x, v.oct_y) * inv_sc)));
     o.col = unpack_unorm4x8_to_half(st.rgba8_mat);
     o.mat_id = (st.flags >> 16u) & 0xFFFFu;
     return o;
@@ -148,6 +151,7 @@ inline float g_smith(float ndv, float ndl, float r) {
 }
 
 fragment half4 f_meshlet_pbr(PbrFragIn in [[stage_in]],
+                             bool front_facing [[front_facing]],
                              device const BloomMaterial32 *materials [[buffer(0)]],
                              device const BloomLight32 *lights [[buffer(1)]],
                              constant uint4 &light_meta [[buffer(2)]],
@@ -155,6 +159,7 @@ fragment half4 f_meshlet_pbr(PbrFragIn in [[stage_in]],
                              texture2d_array<half, access::sample> tex_arr [[texture(0)]]) {
     BloomMaterial32 mat = materials[in.mat_id];
     half3 N0 = normalize(in.nrm);
+    if (!front_facing) N0 = -N0;
     if ((mat.flags & 1u) == 0u) {
         half ndotl = clamp(dot(N0, normalize(half3(0.4h, 0.7h, -0.5h))), 0.18h, 1.0h);
         half rim = pow(clamp(1.0h - abs(N0.z), 0.0h, 1.0h), 2.0h) * 0.28h;
@@ -216,9 +221,12 @@ fragment half4 f_meshlet_pbr(PbrFragIn in [[stage_in]],
     float3 sky_ir = mix(float3(0.10f, 0.12f, 0.16f), float3(0.42f, 0.54f, 0.72f), N.y * 0.5f + 0.5f);
     float3 env_col = mix(float3(0.08f, 0.10f, 0.14f), float3(0.85f, 0.92f, 1.0f), smoothstep(-0.2f, 0.8f, R.y));
     float3 Fr = F0 + (max(float3(1.0f - rough), F0) - F0) * pow(1.0f - ndv, 5.0f);
+    float ao = float(mat.ao);
+    if (mat.ao_tex > 0u) ao *= float(tex_arr.sample(s_pbr, in.uv, mat.ao_tex - 1u).r);
     float3 ambient = (1.0f - Fr) * (1.0f - metal) * sky_ir * albedo + Fr * env_col * (1.0f - rough * 0.65f);
     float3 em = float3(unpack_unorm4x8_to_half(mat.emissive_rgba8).rgb);
-    float3 col = ambient * float(mat.ao) + Lo + em;
+    if (mat.emissive_tex > 0u) em *= float3(tex_arr.sample(s_pbr, in.uv, mat.emissive_tex - 1u).rgb);
+    float3 col = ambient * ao + Lo + em;
     col = (col * (2.51f * col + 0.03f)) / (col * (2.43f * col + 0.59f) + 0.14f);
     return half4(half3(clamp(col, 0.0f, 1.0f)), 1.0h);
 }

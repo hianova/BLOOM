@@ -17,8 +17,11 @@ BIN_METAL_TEST = $(BUILD_DIR)/test_bloom_metal
 BIN_SDK_TEST = $(BUILD_DIR)/test_bloom_sdk
 BIN_M2_TEST = $(BUILD_DIR)/test_bloom_m2
 BIN_DEMO = $(BUILD_DIR)/bloom_studio_demo
+BIN_KH_TEST = $(BUILD_DIR)/test_khronos_gltf
+BIN_CLAY_SWAP = $(BUILD_DIR)/clay_bloom_swap
+BIN_PEANUT_SWAP = $(BUILD_DIR)/peanut_gb_bloom_swap
 
-.PHONY: all lib test gate-ci demo clean
+.PHONY: all lib test gate-ci gate-conformance demo clean
 
 all: $(LIB_BLOOM) $(BIN_CORE_TEST) $(BIN_METAL_TEST) $(BIN_SDK_TEST) $(BIN_M2_TEST) $(BIN_DEMO)
 
@@ -115,6 +118,18 @@ gate-ci: test
 	$(BIN_DEMO) --headless-frames 5 --w 1920 --h 1080 --ppm $(BUILD_DIR)/studio_demo.ppm
 	test -s $(BUILD_DIR)/studio_demo.ppm
 	@echo "ALL MILESTONE-1 & MILESTONE-2 CI GATES PASSED!"
+
+gate-conformance: $(LIB_BLOOM)
+	@echo "=== External Conformance: Fetching Khronos glTF + Clay + Peanut-GB into $(BUILD_DIR)/conformance_deps ==="
+	python3 conformance/fetch_conformance.py --import-bobc
+	@echo "=== Compiling Conformance & OSS Backend Swap Harnesses ==="
+	$(CXX) $(CXXFLAGS) conformance/test_khronos_gltf.mm $(LIB_BLOOM) $(FRAMEWORKS) -framework ImageIO -lm -o $(BIN_KH_TEST)
+	$(CXX) -std=c++20 -ObjC++ -O3 -Wall -Wextra -Werror -fobjc-arc -Iinclude conformance/clay_bloom_swap.mm $(LIB_BLOOM) $(FRAMEWORKS) -lm -o $(BIN_CLAY_SWAP)
+	$(CXX) -std=c++20 -ObjC++ -O3 -Wall -Wextra -Werror -fobjc-arc -Iinclude conformance/peanut_gb_bloom_swap.mm $(LIB_BLOOM) $(FRAMEWORKS) -lm -o $(BIN_PEANUT_SWAP)
+	$(BIN_KH_TEST) --out-dir $(BUILD_DIR)/conformance_deps/renders
+	$(BIN_CLAY_SWAP) --headless --ppm $(BUILD_DIR)/conformance_deps/renders/clay_bloom_swap.ppm
+	$(BIN_PEANUT_SWAP) --headless --rom $(BUILD_DIR)/conformance_deps/dmg-acid2.gb --ppm $(BUILD_DIR)/conformance_deps/renders/peanut_gb_dmg_acid2.ppm
+	@echo "ALL EXTERNAL CONFORMANCE & OSS SWAP GATES PASSED!"
 
 demo: $(BIN_DEMO)
 	$(BIN_DEMO)

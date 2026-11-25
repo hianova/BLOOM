@@ -139,7 +139,7 @@ kernel void k_cull_meshlets(device const BloomMeshletHeader32 *hdrs [[buffer(0)]
     float3 sc = float3(float(st.sx), float(st.sy), float(st.sz));
     float3 wc = rotate_quat(q, float3(float(m.bs_x), float(m.bs_y), float(m.bs_z)) * sc) + float3(st.px, st.py, st.pz);
     float3 vc = to_view(wc, u);
-    float rad = float(m.bs_r) * max(sc.x, max(sc.y, sc.z));
+    float rad = float(m.bs_r) * max(abs(sc.x), max(abs(sc.y), abs(sc.z)));
     if (vc.z + rad < u.near_z || vc.z - rad > u.far_z) return;
     float ly = vc.z * u.frustum_half_tan;
     float lx = ly * (u.vp_w / u.vp_h);

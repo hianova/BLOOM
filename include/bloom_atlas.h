@@ -32,6 +32,10 @@ bool bloom_atlas_add_sprite_rgba8(BloomAtlas *atlas, const uint8_t *rgba8,
                                   uint32_t w, uint32_t h,
                                   uint16_t out_uv_unorm16[4]);
 
+/** In-place update an existing sprite slot (zero shelf cursor advance) for dynamic streaming textures. */
+bool bloom_atlas_update_sprite_rgba8(BloomAtlas *atlas, const uint16_t uv_unorm16[4],
+                                     const uint8_t *rgba8, uint32_t w, uint32_t h);
+
 /** Return dirty row span for incremental Blit into Private+Opt RGBA8 Sprite Atlas texture. */
 bool bloom_atlas_take_sprite_dirty(BloomAtlas *atlas, const uint8_t **out_pixels,
                                    uint32_t *out_w, uint32_t *out_h,

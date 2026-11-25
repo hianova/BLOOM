@@ -49,8 +49,12 @@ fragment half4 f_hud_sprite(SpriteIn in [[stage_in]],
     float4 b = float4(float(sp.d0), float(sp.d1), float(sp.d2), float(sp.d3)) * 0.25f;
     float2 luv = (in.pos.xy - b.xy) / max(b.zw, float2(1e-4f));
     float4 uvr = float4(float(sp.u0), float(sp.u1), float(sp.u2), float(sp.u3)) * (1.0f / 65535.0f);
-    constexpr sampler smp(mag_filter::linear, min_filter::linear);
-    half4 texel = sprite_atlas.sample(smp, uvr.xy + luv * uvr.zw);
+    constexpr sampler smp_lin(mag_filter::linear, min_filter::linear);
+    constexpr sampler smp_near(mag_filter::nearest, min_filter::nearest);
+    float2 suv = uvr.xy + luv * uvr.zw;
+    half4 texel = ((sp.z_flags & (1u << 24u)) != 0u)
+                      ? sprite_atlas.sample(smp_near, suv)
+                      : sprite_atlas.sample(smp_lin, suv);
     half4 col = texel * unpack_unorm4x8_to_half(sp.tint_rgba8);
 
     half r = half((sp.z_flags >> 16u) & 0xFFu) * 0.25h;

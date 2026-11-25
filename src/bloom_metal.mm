@@ -18,7 +18,7 @@ static constexpr uint32_t kRingSlots = 3u;
 static constexpr uint32_t kAtlasDim = 1024u;
 static constexpr uint32_t kSpriteAtlasDim = 512u;
 static constexpr uint32_t kPbrTexDim = 512u;
-static constexpr uint32_t kPbrTexSlices = 32u;
+static constexpr uint32_t kPbrTexSlices = 64u;
 static constexpr uint32_t kMaxGlyphsPerFrame = 32768u;
 
 struct GroundParamsGpu {
@@ -652,8 +652,17 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
 
     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rpd];
     if (mh_cnt > 0u && g->priv_vtx && g->priv_lidx) {
+        bool any_double_sided = false;
+        if (use_pbr && mat_ptr) {
+            for (uint32_t mi = 0u; mi < mat_cnt; ++mi) {
+                if ((mat_ptr[mi].flags & BLOOM_MAT_FLAG_DOUBLE_SIDED) != 0u) {
+                    any_double_sided = true;
+                    break;
+                }
+            }
+        }
         [enc setDepthStencilState:g->ds_3d_write];
-        [enc setCullMode:MTLCullModeBack];
+        [enc setCullMode:(any_double_sided ? MTLCullModeNone : MTLCullModeBack)];
         [enc setRenderPipelineState:(use_pbr ? g->p_mesh_pbr : g->p_mesh_cut)];
         [enc setVertexBuffer:g->priv_surv_ids offset:0 atIndex:0];
         [enc setVertexBuffer:g->wc_ring[s] offset:off_mh atIndex:1];

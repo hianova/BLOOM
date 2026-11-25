@@ -16,7 +16,7 @@ import struct
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 CLUSTER_VTX = 64
 CLUSTER_TRI = 96
@@ -149,20 +149,54 @@ def parse_rgba(s: str, default: int = 0xFF40D8F0) -> int:
 # ============================================================================
 def _read_accessor(gltf: Dict[str, Any], bin_blob: bytes, acc_idx: int) -> List[Tuple[float, ...]]:
     acc = gltf["accessors"][acc_idx]
-    bv = gltf["bufferViews"][acc["bufferView"]]
-    base = bv.get("byteOffset", 0) + acc.get("byteOffset", 0)
     count = acc["count"]
     ctype = acc["componentType"]
     atype = acc["type"]
     ncomp = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}[atype]
     fmt_map = {5120: "b", 5121: "B", 5122: "h", 5123: "H", 5125: "I", 5126: "f"}
     ch = fmt_map[ctype]
-    elem_sz = struct.calcsize("<" + ch * ncomp)
-    stride = bv.get("byteStride", elem_sz)
-    out: List[Tuple[float, ...]] = []
-    for i in range(count):
-        off = base + i * stride
-        out.append(struct.unpack_from("<" + ch * ncomp, bin_blob, off))
+
+    if "bufferView" in acc:
+        bv = gltf["bufferViews"][acc["bufferView"]]
+        base = bv.get("byteOffset", 0) + acc.get("byteOffset", 0)
+        elem_sz = struct.calcsize("<" + ch * ncomp)
+        stride = bv.get("byteStride", elem_sz)
+        out: List[Tuple[float, ...]] = [
+            struct.unpack_from("<" + ch * ncomp, bin_blob, base + i * stride)
+            for i in range(count)
+        ]
+    else:
+        zero_val = 0.0 if ctype == 5126 else 0
+        out = [(zero_val,) * ncomp for _ in range(count)]
+
+    sparse = acc.get("sparse")
+    if sparse:
+        sp_cnt = int(sparse.get("count", 0))
+        sp_idx_info = sparse["indices"]
+        sp_val_info = sparse["values"]
+        ibv = gltf["bufferViews"][sp_idx_info["bufferView"]]
+        vbv = gltf["bufferViews"][sp_val_info["bufferView"]]
+        ibase = ibv.get("byteOffset", 0) + sp_idx_info.get("byteOffset", 0)
+        vbase = vbv.get("byteOffset", 0) + sp_val_info.get("byteOffset", 0)
+        ich = fmt_map[sp_idx_info["componentType"]]
+        isz = struct.calcsize("<" + ich)
+        vsz = struct.calcsize("<" + ch * ncomp)
+        istride = ibv.get("byteStride", isz)
+        vstride = vbv.get("byteStride", vsz)
+        for k in range(sp_cnt):
+            idx = struct.unpack_from("<" + ich, bin_blob, ibase + k * istride)[0]
+            if 0 <= idx < count:
+                out[idx] = struct.unpack_from("<" + ch * ncomp, bin_blob, vbase + k * vstride)
+
+    if acc.get("normalized", False):
+        if ctype == 5120:
+            out = [tuple(max(-1.0, v / 127.0) for v in item) for item in out]
+        elif ctype == 5121:
+            out = [tuple(v / 255.0 for v in item) for item in out]
+        elif ctype == 5122:
+            out = [tuple(max(-1.0, v / 32767.0) for v in item) for item in out]
+        elif ctype == 5123:
+            out = [tuple(v / 65535.0 for v in item) for item in out]
     return out
 
 
@@ -204,14 +238,55 @@ def _quat_rot(q: Tuple[float, float, float, float], v: Tuple[float, float, float
     )
 
 
+def _mat3_to_quat(r00: float, r01: float, r02: float,
+                  r10: float, r11: float, r12: float,
+                  r20: float, r21: float, r22: float) -> Tuple[float, float, float, float]:
+    tr = r00 + r11 + r22
+    if tr > 0.0:
+        s = math.sqrt(max(1e-12, tr + 1.0)) * 2.0
+        qw = 0.25 * s
+        qx = (r21 - r12) / s
+        qy = (r02 - r20) / s
+        qz = (r10 - r01) / s
+    elif r00 > r11 and r00 > r22:
+        s = math.sqrt(max(1e-12, 1.0 + r00 - r11 - r22)) * 2.0
+        qw = (r21 - r12) / s
+        qx = 0.25 * s
+        qy = (r01 + r10) / s
+        qz = (r02 + r20) / s
+    elif r11 > r22:
+        s = math.sqrt(max(1e-12, 1.0 + r11 - r00 - r22)) * 2.0
+        qw = (r02 - r20) / s
+        qx = (r01 + r10) / s
+        qy = 0.25 * s
+        qz = (r12 + r21) / s
+    else:
+        s = math.sqrt(max(1e-12, 1.0 + r22 - r00 - r11)) * 2.0
+        qw = (r10 - r01) / s
+        qx = (r02 + r20) / s
+        qy = (r12 + r21) / s
+        qz = 0.25 * s
+    ql = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw) or 1.0
+    return (qx / ql, qy / ql, qz / ql, qw / ql)
+
+
 def _node_local_trs(node: Dict[str, Any]) -> Tuple[Tuple[float, float, float], Tuple[float, float, float, float], Tuple[float, float, float]]:
     if "matrix" in node and len(node["matrix"]) == 16:
-        m = node["matrix"]
-        t = (float(m[12]), float(m[13]), float(m[14]))
+        m = [float(v) for v in node["matrix"]]
+        t = (m[12], m[13], m[14])
         sx = math.sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]) or 1.0
         sy = math.sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]) or 1.0
         sz = math.sqrt(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]) or 1.0
-        return t, (0.0, 0.0, 0.0, 1.0), (sx, sy, sz)
+        det = (m[0] * (m[5] * m[10] - m[6] * m[9]) -
+               m[4] * (m[1] * m[10] - m[2] * m[9]) +
+               m[8] * (m[1] * m[6] - m[2] * m[5]))
+        if det < 0.0:
+            sx = -sx
+        r00, r10, r20 = m[0] / sx, m[1] / sx, m[2] / sx
+        r01, r11, r21 = m[4] / sy, m[5] / sy, m[6] / sy
+        r02, r12, r22 = m[8] / sz, m[9] / sz, m[10] / sz
+        q = _mat3_to_quat(r00, r01, r02, r10, r11, r12, r20, r21, r22)
+        return t, q, (sx, sy, sz)
     tv = node.get("translation", [0.0, 0.0, 0.0])
     rv = node.get("rotation", [0.0, 0.0, 0.0, 1.0])
     sv = node.get("scale", [1.0, 1.0, 1.0])
@@ -223,22 +298,55 @@ def _node_local_trs(node: Dict[str, Any]) -> Tuple[Tuple[float, float, float], T
     )
 
 
-def _bake_primitive(gltf: Dict[str, Any], bin_blob: bytes, prim: Dict[str, Any], tpl_idx: int, name: str) -> Tuple[Dict[str, Any], int]:
+def _bake_primitive(gltf: Dict[str, Any], bin_blob: bytes, prim: Dict[str, Any], tpl_idx: int, name: str,
+                    axis_signs: Tuple[float, float, float] = (1.0, 1.0, 1.0)) -> Optional[Tuple[Dict[str, Any], int, int]]:
+    mode = prim.get("mode", 4)
+    if mode not in (4, 5, 6):
+        return None
     attrs = prim["attributes"]
     positions = _read_accessor(gltf, bin_blob, attrs["POSITION"])
+    if not positions:
+        return None
     normals = _read_accessor(gltf, bin_blob, attrs["NORMAL"]) if "NORMAL" in attrs else None
     uvs = _read_accessor(gltf, bin_blob, attrs["TEXCOORD_0"]) if "TEXCOORD_0" in attrs else None
 
     if "indices" in prim:
-        raw_idx = [int(x[0]) for x in _read_accessor(gltf, bin_blob, prim["indices"])]
+        seq = [int(x[0]) for x in _read_accessor(gltf, bin_blob, prim["indices"])]
     else:
-        raw_idx = list(range(len(positions)))
+        seq = list(range(len(positions)))
+
+    raw_idx: List[int] = []
+    if mode == 4:
+        raw_idx = seq[: (len(seq) // 3) * 3]
+    elif mode == 5:
+        for i in range(len(seq) - 2):
+            a, b, c = seq[i], seq[i + 1], seq[i + 2]
+            if a == b or b == c or a == c:
+                continue
+            raw_idx.extend((a, b, c) if (i & 1) == 0 else (a, c, b))
+    elif mode == 6:
+        for i in range(1, len(seq) - 1):
+            a, b, c = seq[0], seq[i], seq[i + 1]
+            if a == b or b == c or a == c:
+                continue
+            raw_idx.extend((a, b, c))
+
+    if len(raw_idx) < 3:
+        return None
+
+    sx_s, sy_s, sz_s = axis_signs
+    flip_winding = (sx_s * sy_s * sz_s) < 0.0
+    if flip_winding:
+        for t in range(0, len(raw_idx) - 2, 3):
+            raw_idx[t + 1], raw_idx[t + 2] = raw_idx[t + 2], raw_idx[t + 1]
+
+    pos_signed = [(p[0] * sx_s, p[1] * sy_s, p[2] * sz_s) for p in positions]
 
     if normals is None:
-        acc_n = [[0.0, 0.0, 0.0] for _ in range(len(positions))]
+        acc_n = [[0.0, 0.0, 0.0] for _ in range(len(pos_signed))]
         for t in range(0, len(raw_idx) - 2, 3):
             ia, ib, ic = raw_idx[t], raw_idx[t + 1], raw_idx[t + 2]
-            pa, pb, pc = positions[ia], positions[ib], positions[ic]
+            pa, pb, pc = pos_signed[ia], pos_signed[ib], pos_signed[ic]
             e1 = (pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2])
             e2 = (pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2])
             nx = e1[1] * e2[2] - e1[2] * e2[1]
@@ -248,21 +356,53 @@ def _bake_primitive(gltf: Dict[str, Any], bin_blob: bytes, prim: Dict[str, Any],
                 acc_n[idx][0] += nx
                 acc_n[idx][1] += ny
                 acc_n[idx][2] += nz
-        normals = []
+        nrm_signed = []
         for n in acc_n:
             l = math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) or 1.0
-            normals.append((n[0] / l, n[1] / l, n[2] / l))
+            nrm_signed.append((n[0] / l, n[1] / l, n[2] / l))
+    else:
+        nrm_signed = []
+        for n in normals:
+            nx, ny, nz = n[0] * sx_s, n[1] * sy_s, n[2] * sz_s
+            l = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+            nrm_signed.append((nx / l, ny / l, nz / l))
 
-    max_abs = max((max(abs(p[0]), abs(p[1]), abs(p[2])) for p in positions), default=1.0)
-    norm_scale = (1.35 / max_abs) if max_abs > 1.45 else 1.0
+    max_abs = max((max(abs(p[0]), abs(p[1]), abs(p[2])) for p in pos_signed), default=1.0)
+    norm_scale = (1.35 / max_abs) if (max_abs > 1e-6 and (max_abs > 1.45 or max_abs < 0.25)) else 1.0
+
+    if uvs:
+        us = [float(uv[0]) for uv in uvs]
+        vs = [float(uv[1]) for uv in uvs]
+        u_min, u_max = min(us), max(us)
+        v_min, v_max = min(vs), max(vs)
+        u_span = u_max - u_min
+        v_span = v_max - v_min
+        u_floor = math.floor(u_min)
+        v_floor = math.floor(v_min)
+    else:
+        u_min = v_min = u_span = v_span = u_floor = v_floor = 0.0
+
+    mat_idx = int(prim["material"]) if "material" in prim else -1
+    double_sided = False
+    rgba8 = 0xFF40D8F0
+    if mat_idx >= 0 and "materials" in gltf and mat_idx < len(gltf["materials"]):
+        mat = gltf["materials"][mat_idx]
+        double_sided = bool(mat.get("doubleSided", False))
+        bcf = mat.get("pbrMetallicRoughness", {}).get("baseColorFactor")
+        if bcf and len(bcf) >= 4:
+            r = max(0, min(255, int(round(bcf[0] * 255.0))))
+            g = max(0, min(255, int(round(bcf[1] * 255.0))))
+            b = max(0, min(255, int(round(bcf[2] * 255.0))))
+            a = max(0, min(255, int(round(bcf[3] * 255.0))))
+            rgba8 = (a << 24) | (b << 16) | (g << 8) | r
 
     # Morton-sort triangles by centroid for spatially coherent meshlets
     tris: List[Tuple[int, int, int, int]] = []
     for t in range(0, len(raw_idx) - 2, 3):
         ia, ib, ic = raw_idx[t], raw_idx[t + 1], raw_idx[t + 2]
-        cx = (positions[ia][0] + positions[ib][0] + positions[ic][0]) * (norm_scale / 3.0)
-        cy = (positions[ia][1] + positions[ib][1] + positions[ic][1]) * (norm_scale / 3.0)
-        cz = (positions[ia][2] + positions[ib][2] + positions[ic][2]) * (norm_scale / 3.0)
+        cx = (pos_signed[ia][0] + pos_signed[ib][0] + pos_signed[ic][0]) * (norm_scale / 3.0)
+        cy = (pos_signed[ia][1] + pos_signed[ib][1] + pos_signed[ic][1]) * (norm_scale / 3.0)
+        cz = (pos_signed[ia][2] + pos_signed[ib][2] + pos_signed[ic][2]) * (norm_scale / 3.0)
         tris.append((_morton3d(cx, cy, cz), ia, ib, ic))
     tris.sort(key=lambda item: item[0])
 
@@ -296,11 +436,14 @@ def _bake_primitive(gltf: Dict[str, Any], bin_blob: bytes, prim: Dict[str, Any],
         for slot in range(CLUSTER_VTX):
             if slot < len(gverts):
                 gi = gverts[slot]
-                px, py, pz = positions[gi][0] * norm_scale, positions[gi][1] * norm_scale, positions[gi][2] * norm_scale
-                nx, ny, nz = normals[gi][0], normals[gi][1], normals[gi][2]
-                nl = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
-                nx, ny, nz = nx / nl, ny / nl, nz / nl
+                px, py, pz = pos_signed[gi][0] * norm_scale, pos_signed[gi][1] * norm_scale, pos_signed[gi][2] * norm_scale
+                nx, ny, nz = nrm_signed[gi]
                 tu, tv = (uvs[gi][0], uvs[gi][1]) if uvs else (0.0, 0.0)
+                if uvs:
+                    tu = (tu - u_floor) if u_span <= 1.05 else ((tu - u_min) / max(1e-6, u_span))
+                    tv = (tv - v_floor) if v_span <= 1.05 else ((tv - v_min) / max(1e-6, v_span))
+                    tu = max(0.0, min(1.0, tu))
+                    tv = max(0.0, min(1.0, tv))
                 qp = (pack_pos_unorm16(px), pack_pos_unorm16(py), pack_pos_unorm16(pz))
                 ox, oy = oct_encode(nx, ny, nz)
                 uv8 = (max(0, min(255, int(round(tu * 255.0)))), max(0, min(255, int(round(tv * 255.0)))))
@@ -321,6 +464,7 @@ def _bake_primitive(gltf: Dict[str, Any], bin_blob: bytes, prim: Dict[str, Any],
         nsx, nsy, nsz = nsx / nl, nsy / nl, nsz / nl
         min_dot = min((n[0] * nsx + n[1] * nsy + n[2] * nsz for n in dec_nrm), default=1.0)
         cone_sin = math.sqrt(max(0.0, 1.0 - min_dot * min_dot)) if min_dot > 0.0 else 1.0
+        cone_c_val = 1.0 if double_sided else min(1.0, cone_sin + 0.05)
 
         hdrs.append({
             "vtx_offset": m_i * CLUSTER_VTX,
@@ -331,20 +475,9 @@ def _bake_primitive(gltf: Dict[str, Any], bin_blob: bytes, prim: Dict[str, Any],
             "flags": 0,
             "bsphere_f16": (f32_to_f16(cx), f32_to_f16(cy), f32_to_f16(cz), f32_to_f16(rad)),
             "cone_axis": (clamp_sym_i8(nsx), clamp_sym_i8(nsy), clamp_sym_i8(nsz)),
-            "cone_cutoff": clamp_sym_i8(min(1.0, cone_sin + 0.05)),
+            "cone_cutoff": clamp_sym_i8(cone_c_val),
             "aabb_scale_tag": 0,
         })
-
-    rgba8 = 0xFF40D8F0
-    if "material" in prim and "materials" in gltf:
-        mat = gltf["materials"][prim["material"]]
-        bcf = mat.get("pbrMetallicRoughness", {}).get("baseColorFactor")
-        if bcf and len(bcf) >= 4:
-            r = max(0, min(255, int(round(bcf[0] * 255.0))))
-            g = max(0, min(255, int(round(bcf[1] * 255.0))))
-            b = max(0, min(255, int(round(bcf[2] * 255.0))))
-            a = max(0, min(255, int(round(bcf[3] * 255.0))))
-            rgba8 = (a << 24) | (b << 16) | (g << 8) | r
 
     tpl = {
         "name": name[:60],
@@ -354,10 +487,67 @@ def _bake_primitive(gltf: Dict[str, Any], bin_blob: bytes, prim: Dict[str, Any],
         "local_idx": bytes(local_idx_stream),
         "world_scale": 1.0 / norm_scale,
     }
-    return tpl, rgba8
+    return tpl, rgba8, mat_idx
 
 
-def parse_glb_scene(glb_path: Path, tpl_offset: int = 0, x_offset: float = 0.0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def export_pbr_manifest(gltf: Dict[str, Any], bin_blob: bytes, obj_mats: List[Dict[str, Any]], manifest_path: Path) -> None:
+    tex_dir = manifest_path.parent / f"{manifest_path.stem}_textures"
+    images = gltf.get("images", [])
+    textures = gltf.get("textures", [])
+    bvs = gltf.get("bufferViews", [])
+    out_images: List[Dict[str, Any]] = []
+    for i, img in enumerate(images):
+        path_str = ""
+        if "bufferView" in img:
+            bv = bvs[int(img["bufferView"])]
+            off = bv.get("byteOffset", 0)
+            blen = bv.get("byteLength", 0)
+            raw = bin_blob[off : off + blen]
+            mime = img.get("mimeType", "image/png")
+            ext = "jpg" if "jpeg" in mime or "jpg" in mime else "png"
+            tex_dir.mkdir(parents=True, exist_ok=True)
+            img_file = tex_dir / f"tex_{i}.{ext}"
+            img_file.write_bytes(raw)
+            path_str = str(img_file)
+        out_images.append({"index": i, "path": path_str})
+
+    def _tex_img_idx(tex_info: Any) -> int:
+        if not isinstance(tex_info, dict) or "index" not in tex_info:
+            return -1
+        t_idx = int(tex_info["index"])
+        if 0 <= t_idx < len(textures):
+            return int(textures[t_idx].get("source", -1))
+        return -1
+
+    out_mats: List[Dict[str, Any]] = []
+    for mi, m in enumerate(gltf.get("materials", [])):
+        pmr = m.get("pbrMetallicRoughness", {})
+        bcf = pmr.get("baseColorFactor", [1.0, 1.0, 1.0, 1.0])
+        ef = m.get("emissiveFactor", [0.0, 0.0, 0.0])
+        nrm = m.get("normalTexture", {})
+        out_mats.append({
+            "index": mi,
+            "baseColorFactor": [float(v) for v in bcf],
+            "metallicFactor": float(pmr.get("metallicFactor", 1.0)),
+            "roughnessFactor": float(pmr.get("roughnessFactor", 1.0)),
+            "emissiveFactor": [float(v) for v in ef],
+            "doubleSided": bool(m.get("doubleSided", False)),
+            "alphaMode": str(m.get("alphaMode", "OPAQUE")),
+            "baseColorTex": _tex_img_idx(pmr.get("baseColorTexture")),
+            "mrTex": _tex_img_idx(pmr.get("metallicRoughnessTexture")),
+            "normalTex": _tex_img_idx(nrm),
+            "emissiveTex": _tex_img_idx(m.get("emissiveTexture")),
+            "aoTex": _tex_img_idx(m.get("occlusionTexture")),
+            "normalScale": float(nrm.get("scale", 1.0)) if isinstance(nrm, dict) else 1.0,
+        })
+
+    manifest = {"textures": out_images, "materials": out_mats, "objects": obj_mats}
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def parse_glb_scene(glb_path: Path, tpl_offset: int = 0, x_offset: float = 0.0,
+                    pbr_manifest: Optional[Path] = None, rh_to_lh: bool = False) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     data = glb_path.read_bytes()
     if len(data) < 20 or data[:4] != b"glTF":
         raise ValueError(f"Invalid GLB header in {glb_path}")
@@ -377,21 +567,33 @@ def parse_glb_scene(glb_path: Path, tpl_offset: int = 0, x_offset: float = 0.0) 
     gltf = json.loads(json_blob.decode("utf-8"))
     meshes = gltf.get("meshes", [])
     tpls: List[Dict[str, Any]] = []
-    prim_cache: Dict[Tuple[int, int], Tuple[int, float, int]] = {}
+    prim_cache: Dict[Tuple[int, int, Tuple[int, int, int]], Optional[Tuple[int, float, int, int]]] = {}
 
-    def _get_prim_tpl(m_idx: int, p_idx: int) -> Tuple[int, float, int]:
-        key = (m_idx, p_idx)
+    def _get_prim_tpl(m_idx: int, p_idx: int, ws: Tuple[float, float, float]) -> Optional[Tuple[int, float, int, int]]:
+        sx_s = -1 if ws[0] < 0.0 else 1
+        sy_s = -1 if ws[1] < 0.0 else 1
+        sz_s = -1 if ws[2] < 0.0 else 1
+        if rh_to_lh:
+            sz_s = -sz_s
+        signs = (sx_s, sy_s, sz_s)
+        key = (m_idx, p_idx, signs)
         if key in prim_cache:
             return prim_cache[key]
         mesh_name = meshes[m_idx].get("name", f"{glb_path.stem}_{m_idx}")
         tname = mesh_name if p_idx == 0 else f"{mesh_name}_p{p_idx}"
         global_tid = tpl_offset + len(tpls)
-        tpl, rgba8 = _bake_primitive(gltf, bin_blob, meshes[m_idx]["primitives"][p_idx], global_tid, tname)
+        baked = _bake_primitive(gltf, bin_blob, meshes[m_idx]["primitives"][p_idx], global_tid, tname,
+                                (float(sx_s), float(sy_s), float(sz_s)))
+        if baked is None:
+            prim_cache[key] = None
+            return None
+        tpl, rgba8, mat_idx = baked
         tpls.append(tpl)
-        prim_cache[key] = (global_tid, tpl["world_scale"], rgba8)
+        prim_cache[key] = (global_tid, tpl["world_scale"], rgba8, mat_idx)
         return prim_cache[key]
 
     objs: List[Dict[str, Any]] = []
+    obj_mats: List[Dict[str, Any]] = []
 
     def _make_obj(oid: str, tid: int, pos3: Tuple[float, float, float], quat4: Tuple[float, float, float, float],
                   sc3: Tuple[float, float, float], rgba8: int) -> Dict[str, Any]:
@@ -434,9 +636,16 @@ def parse_glb_scene(glb_path: Path, tpl_offset: int = 0, x_offset: float = 0.0) 
                 prims = meshes[m_idx].get("primitives", [])
                 nname = nd.get("name", f"{glb_path.stem}_n{n_idx}")
                 for p_i in range(len(prims)):
-                    tid, wscale, rgba8 = _get_prim_tpl(m_idx, p_i)
-                    oid = nname if len(prims) == 1 else f"{nname}_p{p_i}"
-                    objs.append(_make_obj(oid, tid, wt, wq, (ws[0] * wscale, ws[1] * wscale, ws[2] * wscale), rgba8))
+                    info = _get_prim_tpl(m_idx, p_i, ws)
+                    if info is None:
+                        continue
+                    tid, wscale, rgba8, mat_idx = info
+                    oid = (nname if len(prims) == 1 else f"{nname}_p{p_i}")[:60]
+                    abs_sc = (abs(ws[0]) * wscale, abs(ws[1]) * wscale, abs(ws[2]) * wscale)
+                    ewt = (wt[0], wt[1], -wt[2]) if rh_to_lh else wt
+                    ewq = (-wq[0], -wq[1], wq[2], wq[3]) if rh_to_lh else wq
+                    objs.append(_make_obj(oid, tid, ewt, ewq, abs_sc, rgba8))
+                    obj_mats.append({"id": oid, "material_index": mat_idx})
             for ch in nd.get("children", []):
                 _visit(int(ch), wt, wq, ws)
 
@@ -445,11 +654,17 @@ def parse_glb_scene(glb_path: Path, tpl_offset: int = 0, x_offset: float = 0.0) 
     else:
         for m_i, mesh in enumerate(meshes):
             for p_i in range(len(mesh.get("primitives", []))):
-                tid, wscale, rgba8 = _get_prim_tpl(m_i, p_i)
+                info = _get_prim_tpl(m_i, p_i, (1.0, 1.0, 1.0))
+                if info is None:
+                    continue
+                tid, wscale, rgba8, mat_idx = info
                 mname = mesh.get("name", glb_path.stem)
-                oid = f"imported_{mname}" if len(meshes) == 1 and p_i == 0 else f"imported_{mname}_{m_i}_{p_i}"
+                oid = (f"imported_{mname}" if len(meshes) == 1 and p_i == 0 else f"imported_{mname}_{m_i}_{p_i}")[:60]
                 objs.append(_make_obj(oid, tid, (x_offset, 0.0, 12.0), (0.0, 0.0, 0.0, 1.0), (wscale, wscale, wscale), rgba8))
+                obj_mats.append({"id": oid, "material_index": mat_idx})
 
+    if pbr_manifest is not None:
+        export_pbr_manifest(gltf, bin_blob, obj_mats, pbr_manifest)
     return tpls, objs
 
 
@@ -717,6 +932,8 @@ def main() -> None:
     imp.add_argument("--svg", type=Path, default=None)
     imp.add_argument("--format", choices=("bobc", "bobr"), default="bobc")
     imp.add_argument("--out", type=Path, required=True)
+    imp.add_argument("--pbr-manifest", type=Path, default=None)
+    imp.add_argument("--rh-to-lh", action="store_true", help="Convert right-handed glTF +Z to BLOOM LH +Z forward")
 
     insp = sub.add_parser("inspect", help="Inspect header counts of .bobc / .bobr file")
     insp.add_argument("file", type=Path)
@@ -748,7 +965,9 @@ def main() -> None:
     tpls: List[Dict[str, Any]] = []
     objs: List[Dict[str, Any]] = []
     for i, gp in enumerate(args.glb):
-        st, so = parse_glb_scene(gp, len(tpls), float(i) * 4.0)
+        st, so = parse_glb_scene(gp, len(tpls), float(i) * 4.0,
+                                  args.pbr_manifest if (i == 0 and args.pbr_manifest) else None,
+                                  rh_to_lh=args.rh_to_lh)
         tpls.extend(st)
         objs.extend(so)
     huds = parse_svg_huds(args.svg) if args.svg else []

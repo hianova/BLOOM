@@ -125,6 +125,7 @@ typedef struct {
     const char *options_pipe;
     uint16_t sprite_uv_unorm16[4];
     uint32_t sprite_tint_rgba8;
+    bool sprite_nearest;
 } BloomUiNodeDesc;
 
 typedef struct {

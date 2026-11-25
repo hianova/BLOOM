@@ -28,5 +28,17 @@ make demo                    # Opens native Retina Cocoa + Metal 3 Studio Demo
 
 External zero-path consumers only need `#include "bloom.h"`, link against `build/libbloom.a`, and call `bloom_gpu_create(layer, NULL)`.
 
+---
+
+## External Conformance & Open-Source Drop-In Swaps
+
+```sh
+make gate-conformance   # Downloads upstream assets into gitignored build/conformance_deps/ and verifies all suites
+```
+
+- **Khronos `glTF-Sample-Assets` (`conformance/test_khronos_gltf.mm`)**: Tests 8 official `.glb` models (`Box`, `BoxTextured`, `BoxInterleaved`, `CesiumMilkTruck`, `DamagedHelmet`, `MetalRoughSpheres`, `NegativeScaleTest`, `Avocado`) with 4x4 matrix TRS decomposition, sparse/normalized accessors, PBR albedo/MR/normal/AO/emissive maps, negative-scale winding preservation, GPU grounding, determinism, Idle Zero-Submit, and `4K DamagedHelmet` (`med = 1.723 ms`).
+- **`nicbarker/clay` UI Swap (`conformance/clay_bloom_swap.mm`)**: Swaps Clay's renderer directly onto `libbloom.a` (`pos_absolute`, nested scissor containers, CJK+ASCII CoreText measuring, hover/click state changes, dynamic resize, 300-frame soak `med = 0.916 ms` at 102+ commands/frame).
+- **`deltabeard/Peanut-GB` + `dmg-acid2.gb` Swap (`conformance/peanut_gb_bloom_swap.mm`)**: Runs unmodified `peanut_gb.h` Game Boy PPU output onto `libbloom.a` (`Zero SDL2`), streaming `160x144` RGBA8 via single in-place `bloom_atlas_update_sprite_rgba8` slot (`sprite_nearest = true`, 4 DMG shades verified, 1,000-frame live soak `med = 0.806 ms`, zero atlas leakage).
+
 - **Silicon, Architecture & Ecosystem Research**: [`research/README.md`](research/README.md) (`01`–`11`: M1 limits, GPUI comparison, Tri-Layer SSOT, 3D Constraint-Native SSOT, `../INFO` Hutter MDL format density proofs, frontend/3D package inventory, and Embodied UI SDK / Pixel Grounding M1 benchmarks).
 - **Consumer Boundary**: [`/Users/kuangtalin/Desktop/Games/include/ge_host_if.h`](file:///Users/kuangtalin/Desktop/Games/include/ge_host_if.h).

@@ -401,6 +401,24 @@ bool bloom_atlas_add_sprite_rgba8(BloomAtlas *a, const uint8_t *rgba8,
     return true;
 }
 
+bool bloom_atlas_update_sprite_rgba8(BloomAtlas *a, const uint16_t uv_unorm16[4],
+                                     const uint8_t *rgba8, uint32_t w, uint32_t h) {
+    if (!a || !uv_unorm16 || !rgba8 || w == 0u || h == 0u) return false;
+    uint32_t sx = (uint32_t)lround(((double)uv_unorm16[0] * (double)kSpriteAtlasDim) / 65535.0);
+    uint32_t sy = (uint32_t)lround(((double)uv_unorm16[1] * (double)kSpriteAtlasDim) / 65535.0);
+    if (sx + w > kSpriteAtlasDim || sy + h > kSpriteAtlasDim) return false;
+
+    for (uint32_t row = 0u; row < h; ++row) {
+        memcpy(a->sprite_pixels + ((size_t)(sy + row) * kSpriteAtlasDim + sx) * 4u,
+               rgba8 + (size_t)row * w * 4u,
+               (size_t)w * 4u);
+    }
+    if (!a->sp_has_dirty || sy < a->sp_dirty_y0) a->sp_dirty_y0 = sy;
+    if (!a->sp_has_dirty || sy + h > a->sp_dirty_y1) a->sp_dirty_y1 = sy + h;
+    a->sp_has_dirty = true;
+    return true;
+}
+
 bool bloom_atlas_take_sprite_dirty(BloomAtlas *a, const uint8_t **out_pixels,
                                    uint32_t *out_w, uint32_t *out_h,
                                    uint32_t *out_y0, uint32_t *out_y1) {

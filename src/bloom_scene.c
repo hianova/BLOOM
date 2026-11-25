@@ -1152,7 +1152,8 @@ static void emit_shadow(BloomScene *s, float x, float y, float w, float h,
 
 static void emit_sprite(BloomScene *s, float x, float y, float w, float h,
                         const uint16_t uv[4], uint32_t tint, float rad_px,
-                        uint16_t tex_id, uint16_t clip_id, uint16_t z_order, uint16_t ui_slot) {
+                        uint8_t spr_flags, uint16_t tex_id, uint16_t clip_id,
+                        uint16_t z_order, uint16_t ui_slot) {
     if (w <= 0.5f || h <= 0.5f) return;
     if (!grow_array((void **)&s->sprites, &s->sp_cap, s->sp_cnt + 1u, sizeof(BloomSpriteInst))) return;
     BloomSpriteInst sp;
@@ -1165,7 +1166,9 @@ static void emit_sprite(BloomScene *s, float x, float y, float w, float h,
     sp.tint_rgba8 = tint ? tint : 0xFFFFFFFFu;
     sp.tex_id = tex_id;
     sp.clip_id = clip_id;
-    sp.z_flags = ((uint32_t)z_order & 0xFFFFu) | ((uint32_t)f32_to_q6_2(rad_px) << 16u);
+    sp.z_flags = ((uint32_t)z_order & 0xFFFFu) |
+                 ((uint32_t)f32_to_q6_2(rad_px) << 16u) |
+                 ((uint32_t)spr_flags << 24u);
     sp.ui_slot = ui_slot;
     s->sprites[s->sp_cnt++] = sp;
 }
@@ -1233,8 +1236,9 @@ static void layout_ui_recursive(BloomScene *s, uint32_t ui_idx, uint16_t clip_id
                       u->desc.radius_px, bw, clip_id, (uint16_t)(z_base + 1u), (uint16_t)ui_idx, 0u, 0u);
         }
         emit_sprite(s, u->x, u->y, u->w, u->h, u->desc.sprite_uv_unorm16, u->desc.sprite_tint_rgba8,
-                    u->desc.radius_px, 0u, clip_id, (uint16_t)(z_base + 2u), (uint16_t)ui_idx);
-    } else {
+                    u->desc.radius_px, u->desc.sprite_nearest ? 1u : 0u, 0u,
+                    clip_id, (uint16_t)(z_base + 2u), (uint16_t)ui_idx);
+    } else if (!(u->desc.kind == BLOOM_UI_PANEL && (fill >> 24u) == 0u && (bw <= 0.1f || (bdr >> 24u) == 0u))) {
         emit_quad(s, u->x, u->y, u->w, u->h, fill, bdr,
                   u->desc.radius_px, bw, clip_id, (uint16_t)(z_base + 1u), (uint16_t)ui_idx, 0u, qf);
     }
@@ -1382,28 +1386,47 @@ static void layout_ui_recursive(BloomScene *s, uint32_t ui_idx, uint16_t clip_id
                u->desc.kind != BLOOM_UI_CHECKBOX && u->desc.kind != BLOOM_UI_SWITCH &&
                u->desc.kind != BLOOM_UI_TEXT_INPUT && u->desc.kind != BLOOM_UI_TABS &&
                u->desc.kind != BLOOM_UI_SELECT && u->desc.kind != BLOOM_UI_SPRITE) {
-        float pad = u->desc.pad > 0.0f ? u->desc.pad : 10.0f;
-        float ly = (u->desc.kind == BLOOM_UI_SLIDER)
-                       ? (u->y + 6.0f)
-                       : ((u->desc.kind == BLOOM_UI_BUTTON || u->desc.kind == BLOOM_UI_TOAST)
-                              ? (u->y + (u->h - fpx * 1.2f) * 0.5f)
-                              : (u->y + pad * 0.6f));
+        bool exact_abs_text = (u->desc.kind == BLOOM_UI_TEXT && u->desc.pos_absolute);
+        float pad = exact_abs_text ? u->desc.pad : (u->desc.pad > 0.0f ? u->desc.pad : 10.0f);
+        float ly = exact_abs_text
+                       ? (u->y + pad)
+                       : ((u->desc.kind == BLOOM_UI_SLIDER)
+                              ? (u->y + 6.0f)
+                              : ((u->desc.kind == BLOOM_UI_BUTTON || u->desc.kind == BLOOM_UI_TOAST)
+                                     ? (u->y + (u->h - fpx * 1.2f) * 0.5f)
+                                     : (u->y + pad * 0.6f)));
         emit_text(s, u->key, u->x + pad, ly, u->w - 2.0f * pad, u->h,
                   fpx, tcol, clip_id, (uint16_t)(z_base + 5u), u->desc.text_wrap, u->label_buf);
     }
 
-    uint32_t flow_idxs[128], abs_idxs[64];
+    uint32_t flow_stack[128], abs_stack[64];
     uint32_t flow_cnt = 0u, abs_cnt = 0u;
     for (uint32_t i = 1u; i < s->ui_cnt; ++i) {
         if (s->uis[i].alive && s->uis[i].desc.parent == u->self) {
-            if (s->uis[i].desc.pos_absolute) {
-                if (abs_cnt < 64u) abs_idxs[abs_cnt++] = i;
-            } else if (flow_cnt < 128u) {
-                flow_idxs[flow_cnt++] = i;
-            }
+            if (s->uis[i].desc.pos_absolute) ++abs_cnt;
+            else ++flow_cnt;
         }
     }
     if (flow_cnt == 0u && abs_cnt == 0u) return;
+
+    uint32_t *flow_heap = flow_cnt > 128u ? (uint32_t *)malloc((size_t)flow_cnt * sizeof(uint32_t)) : NULL;
+    uint32_t *abs_heap = abs_cnt > 64u ? (uint32_t *)malloc((size_t)abs_cnt * sizeof(uint32_t)) : NULL;
+    uint32_t *flow_idxs = flow_heap ? flow_heap : flow_stack;
+    uint32_t *abs_idxs = abs_heap ? abs_heap : abs_stack;
+    uint32_t flow_cap = flow_heap ? flow_cnt : 128u;
+    uint32_t abs_cap = abs_heap ? abs_cnt : 64u;
+    uint32_t fi = 0u, ai = 0u;
+    for (uint32_t i = 1u; i < s->ui_cnt; ++i) {
+        if (s->uis[i].alive && s->uis[i].desc.parent == u->self) {
+            if (s->uis[i].desc.pos_absolute) {
+                if (ai < abs_cap) abs_idxs[ai++] = i;
+            } else if (fi < flow_cap) {
+                flow_idxs[fi++] = i;
+            }
+        }
+    }
+    flow_cnt = fi;
+    abs_cnt = ai;
 
     uint16_t child_clip = clip_id;
     if (grow_array((void **)&s->clips, &s->clip_cap, s->clip_cnt + 1u, sizeof(BloomClipRect))) {
@@ -1432,11 +1455,21 @@ static void layout_ui_recursive(BloomScene *s, uint32_t ui_idx, uint16_t clip_id
         float ah = cu->desc.pct_h > 0.0f ? (cu->desc.pct_h * inner_h) : (cu->desc.h > 0.0f ? cu->desc.h : inner_h);
         cu->w = clamp_range_f32(aw, cu->desc.min_w, cu->desc.max_w);
         cu->h = clamp_range_f32(ah, cu->desc.min_h, cu->desc.max_h);
-        layout_ui_recursive(s, abs_idxs[a], child_clip, (uint16_t)(z_base + 50u + a * 10u));
+        uint32_t cz = (uint32_t)z_base + 8u + a * 8u;
+        if (cz > 11000u) cz = 11000u;
+        layout_ui_recursive(s, abs_idxs[a], child_clip, (uint16_t)cz);
     }
-    if (flow_cnt == 0u) return;
+    if (flow_cnt == 0u) {
+        free(flow_heap);
+        free(abs_heap);
+        return;
+    }
 
-    float base_w[128], base_h[128], weights[128];
+    float bw_stack[128], bh_stack[128], w_stack[128];
+    float *metrics_heap = flow_cnt > 128u ? (float *)malloc((size_t)flow_cnt * 3u * sizeof(float)) : NULL;
+    float *base_w = metrics_heap ? metrics_heap : bw_stack;
+    float *base_h = metrics_heap ? (metrics_heap + flow_cnt) : bh_stack;
+    float *weights = metrics_heap ? (metrics_heap + flow_cnt * 2u) : w_stack;
     for (uint32_t c = 0u; c < flow_cnt; ++c) {
         const UiSlot *cu = &s->uis[flow_idxs[c]];
         float cw = cu->desc.pct_w > 0.0f ? (cu->desc.pct_w * inner_w) : cu->desc.w;
@@ -1539,6 +1572,9 @@ static void layout_ui_recursive(BloomScene *s, uint32_t ui_idx, uint16_t clip_id
         emit_quad(s, u->x + u->w - 8.0f, ty, 5.0f, th, BLOOM_RGBA(0x5A, 0x80, 0xA8, 0xCC), 0u,
                   2.5f, 0.0f, child_clip, (uint16_t)(z_base + 40u), (uint16_t)ui_idx, 99u, 0u);
     }
+    free(metrics_heap);
+    free(flow_heap);
+    free(abs_heap);
 }
 
 void bloom_scene_layout_ui(BloomScene *s, float vp_w, float vp_h) {

@@ -146,7 +146,9 @@ typedef struct {
     uint16_t mr_tex;           /*  2 B: G=roughness, B=metallic */
     uint16_t normal_tex;       /*  2 B: tangent-space normal map */
     uint16_t flags;            /*  2 B */
-    uint32_t pad0[2];          /*  8 B */
+    uint16_t emissive_tex;     /*  2 B: emissive RGB map */
+    uint16_t ao_tex;           /*  2 B: ambient occlusion R map */
+    uint32_t pad1;             /*  4 B */
 } BloomMaterial32;
 BLOOM_STATIC_ASSERT(sizeof(BloomMaterial32) == 32, "BloomMaterial32 must be 32 bytes");
 
