@@ -251,16 +251,25 @@ BloomScene *bloom_scene_create(void) {
     BloomScene *s = (BloomScene *)calloc(1u, sizeof(BloomScene));
     if (!s) return NULL;
     /* Slot 0 reserved as BLOOM_HANDLE_NULL sentinel */
-    grow_array((void **)&s->objs, &s->obj_cap, 32u, sizeof(ObjectSlot));
+    if (!grow_array((void **)&s->objs, &s->obj_cap, 32u, sizeof(ObjectSlot))) {
+        bloom_scene_destroy(s);
+        return NULL;
+    }
     memset(&s->objs[0], 0, sizeof(ObjectSlot));
     s->objs[0].alive = false;
     s->objs[0].gen = 0u;
     /* Mark slots 1..obj_cap-1 unused: allocate sequentially on demand */
-    grow_array((void **)&s->uis, &s->ui_cap, 32u, sizeof(UiSlot));
+    if (!grow_array((void **)&s->uis, &s->ui_cap, 32u, sizeof(UiSlot))) {
+        bloom_scene_destroy(s);
+        return NULL;
+    }
     s->ui_cnt = 1u; /* Index 0 reserved for NULL */
 
     /* Material 0 reserved as default legacy material */
-    grow_array((void **)&s->materials, &s->mat_cap, 8u, sizeof(BloomMaterial32));
+    if (!grow_array((void **)&s->materials, &s->mat_cap, 8u, sizeof(BloomMaterial32))) {
+        bloom_scene_destroy(s);
+        return NULL;
+    }
     if (s->materials) {
         s->materials[0].base_rgba8 = 0xFFFFFFFFu;
         s->materials[0].roughness_f16 = bloom_f32_to_f16(0.5f);

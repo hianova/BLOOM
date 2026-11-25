@@ -23,7 +23,7 @@ typedef struct {
 
 static bool bw_reserve(BufWriter *bw, size_t extra) {
     if (bw->oom) return false;
-    if (bw->len + extra <= bw->cap) return true;
+    if (bw->data && bw->len + extra <= bw->cap) return true;
     size_t ncap = bw->cap ? bw->cap * 2u : 256u;
     while (ncap < bw->len + extra) ncap *= 2u;
     uint8_t *np = (uint8_t *)realloc(bw->data, ncap);
@@ -105,7 +105,7 @@ static uint32_t br_u32(BufReader *br) {
 }
 
 static void br_bytes(BufReader *br, void *dst, size_t n) {
-    if (n == 0u) return;
+    if (n == 0u || !dst) return;
     if (br->err || br->pos + n > br->len) {
         br->err = true;
         return;
@@ -442,6 +442,10 @@ bool bloom_bobj_encode_col(const BloomBobjDoc *doc, bool include_geom,
     bw_u32(&bw, doc->hud_cnt);
 
     const char **tnames = doc->template_cnt ? (const char **)malloc(doc->template_cnt * sizeof(char *)) : NULL;
+    if (doc->template_cnt && !tnames) {
+        free(bw.data);
+        return false;
+    }
     for (uint32_t i = 0u; i < doc->template_cnt; ++i) {
         tnames[i] = doc->templates[i].name;
         bw_uvarint(&bw, doc->templates[i].meshlet_cnt);
@@ -564,12 +568,14 @@ bool bloom_bobj_encode_col(const BloomBobjDoc *doc, bool include_geom,
 
     if (oc > 0u) {
         const char **ids = (const char **)malloc(oc * sizeof(char *));
+        if (!ids) { free(bw.data); return false; }
         for (uint32_t i = 0u; i < oc; ++i) ids[i] = doc->objects[i].id;
         put_front_strings(&bw, ids, oc);
         free(ids);
     }
     if (ac > 0u) {
         const char **ids = (const char **)malloc(ac * sizeof(char *));
+        if (!ids) { free(bw.data); return false; }
         for (uint32_t i = 0u; i < ac; ++i) ids[i] = doc->analytics[i].id;
         put_front_strings(&bw, ids, ac);
         free(ids);
@@ -577,6 +583,12 @@ bool bloom_bobj_encode_col(const BloomBobjDoc *doc, bool include_geom,
     if (hc > 0u) {
         const char **ids = (const char **)malloc(hc * sizeof(char *));
         const char **lbls = (const char **)malloc(hc * sizeof(char *));
+        if (!ids || !lbls) {
+            free(ids);
+            free(lbls);
+            free(bw.data);
+            return false;
+        }
         for (uint32_t i = 0u; i < hc; ++i) {
             ids[i] = doc->huds[i].id;
             lbls[i] = doc->huds[i].label;
@@ -612,6 +624,11 @@ bool bloom_bobj_decode_col(const uint8_t *buf, size_t len, BloomBobjDoc *out_doc
     if (oc) out_doc->objects = (BloomBobjObject *)calloc(oc, sizeof(BloomBobjObject));
     if (ac) out_doc->analytics = (BloomBobjAnalytic *)calloc(ac, sizeof(BloomBobjAnalytic));
     if (hc) out_doc->huds = (BloomBobjHud *)calloc(hc, sizeof(BloomBobjHud));
+    if ((tc && !out_doc->templates) || (oc && !out_doc->objects) ||
+        (ac && !out_doc->analytics) || (hc && !out_doc->huds)) {
+        bloom_bobj_free(out_doc);
+        return false;
+    }
 
     for (uint32_t i = 0u; i < tc; ++i) {
         out_doc->templates[i].meshlet_cnt = (uint32_t)br_uvarint(&br);
@@ -798,20 +815,28 @@ bool bloom_bobj_load_file(const char *path, BloomBobjDoc *out_doc) {
 
 void bloom_bobj_free(BloomBobjDoc *doc) {
     if (!doc) return;
-    for (uint32_t i = 0u; i < doc->template_cnt; ++i) {
-        free(doc->templates[i].name);
-        free(doc->templates[i].hdrs);
-        free(doc->templates[i].verts);
-        free(doc->templates[i].local_idx);
+    if (doc->templates) {
+        for (uint32_t i = 0u; i < doc->template_cnt; ++i) {
+            free(doc->templates[i].name);
+            free(doc->templates[i].hdrs);
+            free(doc->templates[i].verts);
+            free(doc->templates[i].local_idx);
+        }
     }
     free(doc->templates);
-    for (uint32_t i = 0u; i < doc->object_cnt; ++i) free(doc->objects[i].id);
+    if (doc->objects) {
+        for (uint32_t i = 0u; i < doc->object_cnt; ++i) free(doc->objects[i].id);
+    }
     free(doc->objects);
-    for (uint32_t i = 0u; i < doc->analytic_cnt; ++i) free(doc->analytics[i].id);
+    if (doc->analytics) {
+        for (uint32_t i = 0u; i < doc->analytic_cnt; ++i) free(doc->analytics[i].id);
+    }
     free(doc->analytics);
-    for (uint32_t i = 0u; i < doc->hud_cnt; ++i) {
-        free(doc->huds[i].id);
-        free(doc->huds[i].label);
+    if (doc->huds) {
+        for (uint32_t i = 0u; i < doc->hud_cnt; ++i) {
+            free(doc->huds[i].id);
+            free(doc->huds[i].label);
+        }
     }
     free(doc->huds);
     memset(doc, 0, sizeof(*doc));
