@@ -21,7 +21,7 @@ BIN_KH_TEST = $(BUILD_DIR)/test_khronos_gltf
 BIN_CLAY_SWAP = $(BUILD_DIR)/clay_bloom_swap
 BIN_PEANUT_SWAP = $(BUILD_DIR)/peanut_gb_bloom_swap
 
-.PHONY: all lib test gate-ci gate-conformance demo clean
+.PHONY: all lib test test-core gate-ci gate-conformance demo clean
 
 all: $(LIB_BLOOM) $(BIN_CORE_TEST) $(BIN_METAL_TEST) $(BIN_SDK_TEST) $(BIN_M2_TEST) $(BIN_DEMO)
 
@@ -94,6 +94,18 @@ $(BIN_M2_TEST): tests/test_bloom_m2.mm include/bloom.h $(LIB_BLOOM) Makefile
 $(BIN_DEMO): examples/bloom_studio_demo.mm $(LIB_BLOOM) Makefile
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) examples/bloom_studio_demo.mm $(LIB_BLOOM) $(FRAMEWORKS) -o $@
+
+test-core: $(BIN_CORE_TEST)
+	@mkdir -p $(BUILD_DIR)
+	python3 tools/bloom_import.py emit-sample-glb $(BUILD_DIR)/sample_mesh.glb
+	printf '<svg xmlns="http://www.w3.org/2000/svg"><g id="h_0" data-kind="slider" data-bind="0:0"><rect x="16" y="16" width="240" height="44" rx="6" fill="#22344CEB" stroke="#38D0FFFF"/><text x="20" y="34">ImportedSlider</text></g></svg>\n' > $(BUILD_DIR)/sample_ui.svg
+	python3 tools/bloom_import.py import --glb $(BUILD_DIR)/sample_mesh.glb --svg $(BUILD_DIR)/sample_ui.svg --format bobc --out $(BUILD_DIR)/imported_sample.bobc
+	python3 tools/bloom_import.py inspect $(BUILD_DIR)/imported_sample.bobc
+	$(BIN_CORE_TEST) --imported-bobc $(BUILD_DIR)/imported_sample.bobc
+	@echo "=== Gate 1: Zero Coupling Audit (Zero FLOW/INFO/SDL/ge_host_if) ==="
+	! grep -rnE "#include.*(flow|searu|ge_host_if|SDL|info\.h)" include/ src/ shaders/ tests/ examples/
+	@echo "=== Gate 2b: Shader Line Budget <= 400 per file ==="
+	@for f in shaders/*.metal; do n=$$(wc -l < "$$f" | tr -d ' '); echo "  $$f: $$n lines"; test $$n -le 400; done
 
 test: all
 	@mkdir -p $(BUILD_DIR)

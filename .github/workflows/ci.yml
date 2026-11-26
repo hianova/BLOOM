@@ -11,87 +11,31 @@ on:
     branches: [ main ]
 
 jobs:
-  build-and-verify-bloom:
-    name: BLOOM v9.0.0 Compile-Time Boundary Gate (${{ matrix.os }})
+  verify-bloom:
+    name: BLOOM vNext C17 Core, Embedded Metal Shaders & Gates (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ ubuntu-latest, macos-latest ]
     steps:
-      - name: Checkout FLOW (main)
-        uses: actions/checkout@v6
-        with:
-          repository: hianova/FLOW
-          ref: main
-          path: FLOW
+      - uses: actions/checkout@v4
 
-      - name: Checkout BLOOM
-        uses: actions/checkout@v6
-        with:
-          path: BLOOM
-
-      - name: Cache Lean 4 Toolchain
-        uses: actions/cache@v5
-        with:
-          path: ~/.elan
-          key: ${{ runner.os }}-${{ runner.arch }}-elan-lean-4.36.0
-
-      - name: Install Toolchain & Vulkan Lavapipe + SDL3 GPU (Linux)
+      - name: Install Clang (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            clang clang-tidy llvm lld curl cmake ninja-build pkg-config git \
-            mesa-vulkan-drivers libvulkan-dev \
-            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
-            libxi-dev libxss-dev libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev
-          git clone --depth 1 --branch release-3.2.8 https://github.com/libsdl-org/SDL.git /tmp/sdl3
-          cmake -S /tmp/sdl3 -B /tmp/sdl3/build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DCMAKE_INSTALL_LIBDIR=lib \
-            -DSDL_VULKAN=ON \
-            -DSDL_OFFSCREEN=ON \
-            -DSDL_SHARED=ON \
-            -DSDL_STATIC=OFF \
-            -DSDL_TESTS=OFF
-          sudo cmake --build /tmp/sdl3/build --target install
-          sudo ldconfig
+          sudo apt-get install -y clang
 
-      - name: Install W3C WebGPU Naga Compiler (Linux)
+      - name: Build & Verify Portable C17 Core + Gate 1/2b (Linux)
         if: runner.os == 'Linux'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: naga-cli
+        run: |
+          make clean
+          make test-core CC=clang
 
-      - name: Install Toolchain & SDL3 GPU (macOS)
+      - name: Build Full Metal Targets & Verify Core + Gate 1/2b (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install llvm naga-cli sdl3 pkg-config
-
-      - name: Install Lean 4 Toolchain
-        run: |
-          set -euo pipefail
-          if ! "$HOME/.elan/bin/lean" --version >/dev/null 2>&1; then
-            curl --retry 5 -sSfL https://elan.lean-lang.org/elan-init.sh -o /tmp/elan-init.sh
-            sh /tmp/elan-init.sh -y --default-toolchain leanprover/lean4:v4.36.0
-          fi
-          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-
-      - name: Build FLOW & Compile BLOOM (Single-Track WGSL + SDL3 GPU Gate)
-        run: |
-          export PATH="$HOME/.elan/bin:$PATH"
-          export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-          if [ "$(uname -s)" = "Linux" ]; then
-            export SDL_VIDEODRIVER=offscreen
-            LVP_ICD="$(ls /usr/share/vulkan/icd.d/*lvp*.json | head -n 1)"
-            export VK_ICD_FILENAMES="$LVP_ICD"
-            export VK_DRIVER_FILES="$LVP_ICD"
-          fi
-          make -C FLOW all CC=clang CXX=clang++
-          if [ "$(uname -s)" = "Linux" ]; then
-            make -C BLOOM clean && make -C BLOOM verify CC=clang CXX=clang++
-          else
-            make -C BLOOM clean && make -C BLOOM verify
-          fi
+          make clean
+          make all
+          make test-core
