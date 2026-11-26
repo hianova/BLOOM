@@ -66,8 +66,8 @@ $$\text{Object} = \langle \text{Identity},\; G_{\text{init}},\; s \in \mathcal{C
 
 - **Track V1（失敗教訓 — 點雲雙向 Chamfer `k_eval_hypotheses`）**：耗時 `1.98 ms`，僅用有限表面點雲投影無法正確處理 Genus-1 `torus` 自遮蔽與平直多面體內部飽和度，導致出現子集塌縮（誤分類 `bevel_box -> torus`）及高姿態誤差（`26°–65°`）。
 - **Track V2（勝出 ✅ — Hardware TBDR `16×8` Tiled Render-and-Compare）**：
-  - 先以 `k_vision_prep_64`（threadgroup `10×10` 共享快取 `maxTG=1024`，零多餘取樣）+ 5 步 `k_vision_jfa64` 產出 `64×64` 抗噪前景與 Euclidean Chamfer 距離場。
-  - 利用 BLOOM 原生硬體光柵管線，將 `128` 組候選假設以 **`[[clip_distance]][4]` 防溢界直接繪入 `1024×512` `RG8Unorm` (`16×8` Tiles) + `Memoryless Depth32Float`**（自然處理所有自遮蔽與方向光照！），再由 `k_vision_score_tiles` 計算精準 `Soft-IoU + Contour DT + Luminance` 誤差並進行 CEM 細化。
+  - 先以 `k_vision_prep_64`（正式版 [`shaders/bloom_vision.metal`](../shaders/bloom_vision.metal#L90-L125) 於 commit `9c7cc298` 已從初版探針的 `tg_lum[10][10]` 升級為 **`tg_lum[10][24]`** 消除 M1 32-bank 衝突，並以 `simd_sum` 合併原子加總，`maxTG=1024`，零多餘取樣；原初版探針 [`probes/embodied_grounding_bench.mm`](./probes/embodied_grounding_bench.mm#L505-L532) 仍保留 `10×10` 基線）+ 5 步 `k_vision_jfa64` 產出 `64×64` 抗噪前景與 Euclidean Chamfer 距離場。
+  - 利用 BLOOM 原生硬體光柵管線，將 `128` 組候選假設以 **`[[clip_distance]][4]` 防溢界直接繪入 `1024×512` `RG8Unorm` (`16×8` Tiles) + `Memoryless Depth32Float`**（自然處理所有自遮蔽與方向光照！），再由 `k_vision_score_tiles` 計算精準 `Soft-IoU + Contour DT + Luminance` 誤差並進行 CEM 細化（正式版 [`shaders/bloom_vision.metal`](../shaders/bloom_vision.metal#L214-L276) 於 `9c7cc298` 改採 **2-stage `simd_sum` 歸約**，`tg_*[8]` 僅 `160 B` 與單次 `threadgroup_barrier`）。
 
 | 真實目標 (`GT`) | 模板分類結果 | 實測 IoU | 平移誤差 (`t_err`) | 旋轉誤差 (`rot_err`) | 總 GPU 耗時 | Compute `maxTG` |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -77,3 +77,19 @@ $$\text{Object} = \langle \text{Identity},\; G_{\text{init}},\; s \in \mathcal{C
 | **平均 / 總結** | **`3 / 3 (100%)`** | **`0.839`** | **`0.1058 m`** | **`7.71°`** | **中位 `1.335 ms`** | **`1024` 全達標** |
 
 > *可觀測性附註*：`torus` 之局部 `0.08` 振幅 `dof0` 波形在 `64×64` 縮放尺度下僅約 `~1.2 px` 位移，與輕微 `yaw` 旋轉存在幾何權衡（此例 `dof_err = 0.802`）；較大振幅機械關節或以全解析度做最末輪微調即可進一步收斂。所有 **Go 準則**（`opt3` 增量 `+0.396 ms < 0.6 ms`、全域 `maxTG = 1024`、Experiment 2 遮擋與錨點全過、`3/3` 分類、`1.335 ms < 2.5 ms`、`0.106 m < 0.15 m`、`7.71° < 12°`）已全數達標，**直接進入 Phase 2 正式引擎實作**。
+
+---
+
+## 5. Commit `9c7cc298` 正式 Shader 工程審計與實測更新
+
+相較獨立基線探針 [`probes/embodied_grounding_bench.mm`](./probes/embodied_grounding_bench.mm#L442-L680)（保留於此供歷史重現；2026-11-26 重跑 `make -C probes run-ground` 實測：`opt3` `1.238 ms` / `delta=+0.703 ms`、`exp3` `torus=1.344 ms` / `bevel_box=1.232 ms` / `octa_prism=1.262 ms`、`mean_rot=7.71°` / `mean_t=0.1058 m`），正式引擎 [`shaders/bloom_grounding.metal`](../shaders/bloom_grounding.metal)（`282` 行）與 [`shaders/bloom_vision.metal`](../shaders/bloom_vision.metal)（`279` 行）已完成三項微架構最佳化與動態 threadgroup 邊界硬化，並通過 `make gate-ci` 實機驗證：
+
+| 正式 Shader 核心 | 最佳化內容 | 工程審計結論與邊界硬化 |
+| :--- | :--- | :--- |
+| **`k_compute_ground_reduce`**<br>[`bloom_grounding.metal:234-282`](../shaders/bloom_grounding.metal#L234-L282) | `L263-L266` 將寫死的 `32u * area` 改為 `uint simd_cnt = simd_sum(1u); emit_ground_stat(..., simd_cnt * area, ...)` | 搭配 `simd_all(in_vp)`（`L257`），即使以非 32 倍數的 `dispatchThreads` 產生 partial simdgroup 或未來變更 SIMD 寬度，像素面積統計仍精準無誤。`part_sample`（`L230, L266`）取 `simd_is_first()` 樣本屬預期語意。 |
+| **`k_vision_prep_64`**<br>[`bloom_vision.metal:90-125`](../shaders/bloom_vision.metal#L90-L125) | 1. `L96` 共享快取由 `tg_lum[10][10]` 改為 **`tg_lum[10][24]`**（stride `24` floats = `96 B`，總佔 `960 B`）<br>2. `L105-L124` 去除早期 `return`，改以 `in_b` 遮罩後透過 `simd_sum(sx/sy/sc)` 與 `simd_is_first() && gs_c != 0u` 合併寫入 `summary` | **32-Bank 零衝突實證**：`8×8` threadgroup（[`bloom_vision_mac.mm:377`](../src/bloom_vision_mac.mm#L377)）每組 32-lane simdgroup 覆蓋 `4×8` tile；`stride=10` 在 32-bank TG memory 下有 `3*10≡30 (mod 32)` 6 路雙向衝突，改為 `stride=24 ≡ -8 (mod 32)` 使 4 列映射至 4 組不相交 8-bank 區塊，對 `tg_lum[tid.y+1][tid.x+1]` 及 4 個鄰域讀取皆成 32-bank 雙射（0 衝突；注意若移植至 16-bank 硬體則 `24≡8 mod 16` 會與隔列碰撞）。全域原子操作最高降 **`32×`**，`memory_order_relaxed` 因隨後 CPU `waitUntilCompleted`（[`bloom_vision_mac.mm:391`](../src/bloom_vision_mac.mm#L391)）而安全。 |
+| **`k_vision_score_tiles`**<br>[`bloom_vision.metal:214-279`](../shaders/bloom_vision.metal#L214-L279) | 1. 將 `tg_*[256]`（`5,120 B`）與 8 次 barrier 改為 **2-Stage `simd_sum` + 單次 `threadgroup_barrier`**<br>2. **已修復 `256/8` 硬編碼假設**：引入 `[[threads_per_threadgroup]]`（`tg_size`）與 `[[simdgroups_per_threadgroup]]`（`sg_count`），將 `tg_*` 擴為 `[32]`（`640 B`，支援至 `1024` 執行緒且維持 `maxTG=1024`），並加上 `s_gid < 32u` 寫入界限與 `s_lid < min(sg_count, 32u)` 歸約保護 | 徹底消除原先對 `tg_*[8]`、`p += 256u`、`s_lid < 8u` 之硬編碼風險；同步於 [`bloom_vision_mac.mm:310-314`](../src/bloom_vision_mac.mm#L310-L314) 將派送對齊 `threadExecutionWidth` 與 `maxTotalThreadsPerThreadgroup`。 |
+
+* **正式版 `test_bloom_sdk`（`make gate-ci` 實測，含完整端到端視埠渲染 + Grounding + 4-DoF Vision 定位）**：
+  - `bloom_vision_get_max_tg == 1024`（`k_vision_prep_64` / `k_vision_jfa64` / `k_vision_score_tiles` 全達標）；
+  - **Experiment 3（正式管線）**：`cls = 3/3`（`torus` `iou=0.914, rot=3.06°, 3.471 ms`；`bevel_box` `iou=0.910, rot=8.01°, 2.352 ms`；`octa_prism` `iou=0.931, rot=3.43°, 2.360 ms`），**平均旋轉誤差 `4.83°`、平均平移誤差 `0.1193 m`、中位 GPU `2.360 ms`**（`Test 1` `ground=6.609 ms`、`Test 2` `sphere_surf_err=0.0000 m` 全數通過）。

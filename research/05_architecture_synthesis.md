@@ -23,7 +23,7 @@
 未來寫下任何一行正式程式碼，都必須由自動化基準測試守住以下七道閘門：
 
 1. **Zero `FLOW` / Zero 64-bit Compute**：Shader 禁止任何 `u64`/`i64` 模擬算術（M1 GPU 慢 `19.2×`：`107.1 G_u64_OPS` vs `2,061.9 GFLOPS fp16`）與科學計算法則；`BLOOM` 零 `#include` `FLOW` 與遊戲核心標頭檔。
-2. **Shader Occupancy Gate (`maxTotalThreadsPerThreadgroup == 1024`)**：所有常規渲染與 UI Shader 保持極短特化（單檔 ≤ 400 行），嚴禁再出現降 Occupancy 至 `384–448` 的 Megashader；`alu_precision` 證實降暫存器壓力即可把 `fp32` 吞吐從 `960.9` 拉高到 `1,719.3 GFLOPS`。
+2. **Shader Occupancy Gate (`maxTotalThreadsPerThreadgroup == 1024`)**：所有常規渲染與 UI Shader 保持極短特化（單檔 ≤ 400 行；現行 `shaders/*.metal` 實測為 `bloom_core.metal` `399` 行、`bloom_grounding.metal` `282` 行、`bloom_vision.metal` `276` 行、`bloom_pbr.metal` `232` 行、`bloom_sprite.metal` `69` 行），嚴禁再出現降 Occupancy 至 `384–448` 的 Megashader；`alu_precision` 證實降暫存器壓力即可把 `fp32` 吞吐從 `960.9` 拉高到 `1,719.3 GFLOPS`。並於 commit `9c7cc298` 完成 `SIMD32` 合併原子（`k_cull_meshlets`、`k_tex_checksum`、`k_vision_prep_64`）、`tg_lum[10][24]` 32-bank 零衝突填充及 `k_vision_score_tiles` 2-stage `simd_sum` 歸約；`make gate-ci` 實機驗證 `test_bloom_metal` 4K `1.075 ms` (`930.2 fps`)、`test_bloom_sdk` 視覺定位 `3/3` (`4.83°` / `2.753 ms`)、`bloom_studio_demo` 1080p `0.482 ms`。
 3. **離散圖元 100% 走 TBDR RenderPass (`framebufferOnly = YES`)**：UI / 2D / 3D 網格全面走硬體光柵（`127.54×` 快過全螢幕掃描 Compute）；`CAMetalLayer` 不開 `ShaderWrite`，保留片上無損壓縮。
 4. **`20 B` StageIn + `32 B` Hot L1 Refetch (`Refetch20B`)**：UI 管線禁止把 `44–72 B` 頂點屬性塞進 Tiler Parameter RAM；只傳 `pos + quad_id [[flat]]`，Fragment 走 L1 讀 `32 B` `BloomQuadHot`（4K 2k Quads 鎖在 `< 0.7 ms`）。
 5. **Zero-Discard Opaque + `Memoryless Depth32Float`**：UI 實心底與 3D 不透明幾何一律零 `discard_fragment()`（避免 HSR 崩壞 `15.8×` 到 `68.1 ms`），切進獨立 Opaque Pass（`blend = NO`）。

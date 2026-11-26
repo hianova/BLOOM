@@ -72,6 +72,21 @@ flowchart LR
 實驗 `[3/6]` 實測揭示了一個常被規格書誤導的事實：雖然 Apple M1 已支援 Metal 3 `MTLMeshRenderPipelineDescriptor` 與 `[[object]]`/`[[mesh]]`（實測功能完整且可用），但在 M1 (`Apple7`) 架構上，**Mesh Shader 較高的 threadgroup 排程與 payload 讀寫開銷使其在 393k 幾何負載下耗時 `0.812 ms`，反而慢於粗暴 Draw (`0.483 ms`) 與 `ComputeCull + Indirect` (`0.419 ms`)**。  
 更重要的是，`ComputeCull + Indirect Draw` 只需要標準 **Metal Compute + `drawIndexedPrimitives(..., indirectBuffer:)` / WebGPU 等價路徑**，天然與決策 `#1 (Option A: Metal-First + WebGPU gpui_wgpu 同構)` 完全吻合——不需要為了早期 Apple Silicon 上反而較慢的 Mesh Shader 去裂解核心管線。
 
+### 3.2 Commit `9c7cc298` 正式 Shader 升級（SIMD 合併原子與實機 CI 更新）
+
+上述 §3 表格數據來自獨立對照探針 [`probes/object_ssot_bench.mm`](./probes/object_ssot_bench.mm)（其中 `k_cull_meshlets` `L658-L671` 與 `k_tex_checksum` `L560-L571` 仍為每執行緒單獨 `atomic_fetch_add_explicit` 之基線版本；2026-11-26 重跑 `make -C probes run-obj` 實測維持穩態：`ComputeCull+Indirect` `0.415 ms` / `2,408.1 fps`、Single-CB 4K Composite `0.965 ms` / `1,036.7 fps`）。  
+在正式引擎 [`shaders/bloom_core.metal`](../shaders/bloom_core.metal)（`399` 行，緊守 `<= 400` 行 Gate 2b 上限）中，commit `9c7cc298` 已將兩支核心升級為 **無早期 `return` 分歧的 SIMD-Coalesced Atomics**：
+
+1. **`k_cull_meshlets`（[`bloom_core.metal:128-160`](../shaders/bloom_core.metal#L128-L160)）**：
+   - 以巢狀 `bool keep` 取代 4 處早期 `return`，使同 simdgroup 32 條通道一致匯聚至 `simd_prefix_exclusive_sum(keep ? 1u : 0u)`（`L154`）與 `simd_sum(keep ? 1u : 0u)`（`L155`）。
+   - 僅由 `simd_is_first()` 在 `grp_cnt > 0u` 時對 `ind.instanceCount` 發出 **單次 `atomic_fetch_add_explicit(..., memory_order_relaxed)`**（原子次數最多降 **`32×`**），再透過 `simd_broadcast_first(base_slot)`（`L158`）分發各通道寫入 `surviving_ids[base_slot + lane_off]`。
+   - **邊界審計與奇異點修復**：[`bloom_metal.mm:627-628`](../src/bloom_metal.mm#L627-L628) 以 `threadsPerThreadgroup=(64,1,1)` 派送（2 組完整 SIMD32），且 `simd_is_first()` / `simd_broadcast_first()` 皆對齊最低活躍通道，即使未來改以非 32 倍數 `dispatchThreads` 亦安全；`memory_order_relaxed` 因 Compute Encoder 結束後才由同一條 CommandBuffer 的 Render Encoder 消費而安全。原先 `L148-L150` 於攝影機與包絡球心重合 (`d_cam == 0`) 時會產生 `normalize(d_cam) = NaN` 奇異點，後續已於 [`bloom_core.metal:148-150`](../shaders/bloom_core.metal#L148-L150) 改為 `d_len = length(d_cam); keep = (d_len < 1e-4f) || (dot(d_cam / d_len, axis) < ...)` 消除未定義 `NaN`（維持全檔 `399` 行 `<= 400` Gate 2b）。
+2. **`k_tex_checksum`（[`bloom_core.metal:386-399`](../shaders/bloom_core.metal#L386-L399)）**：
+   - 越界執行緒保持 `q = 0u` 參與 `uint s = simd_sum(q)`（`L397`），僅在 `simd_is_first() && s != 0u` 時執行全域原子加法（`L398`）。無號 32-bit 整數加法在 MSL 滿足 $\bmod\ 2^{32}$ 結合律與交換律，雜湊結果與逐執行緒原子完全等價。
+3. **正式版 4K 實機驗證（`make gate-ci` → `test_bloom_metal`）**：
+   - `k_cull_meshlets` 與 `k_tex_checksum` 雙雙維持 **`maxTG = 1024`**；
+   - **4K (`3840×2160`) 複合幀**（`2,048` meshlets / `32` analytic probes / `7`-node CoreText HUD + 動畫時間軸）：**GPU 中位數 `0.934 ms`（`1,070.5 fps`）、CPU pack `77.6 µs`、WC Ring `83.5 KB`、決定性雜湊 `0x59F6B0F0`、靜止 `20` 幀 `0` 次提交**（`make -C probes run-obj`：`ComputeCull+Indirect` `0.388 ms` / `2,576.1 fps`、Single-CB 4K Composite `0.947 ms` / `1,056.4 fps`）。
+
 ---
 
 ## §4 物理邊界與 BLOOM 3D Object SSOT 語法定義討論

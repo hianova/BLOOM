@@ -307,8 +307,11 @@ static void encode_render_and_score(BloomVision *v, id<MTLCommandBuffer> cb,
     [ce setBuffer:v->b_obs64b offset:0 atIndex:0];
     [ce setBuffer:v->b_hyps offset:0 atIndex:1];
     [ce setBytes:&vps length:sizeof(vps) atIndex:2];
+    NSUInteger simd_w = std::max<NSUInteger>(1u, v->p_score.threadExecutionWidth);
+    NSUInteger tg_w = std::min<NSUInteger>(256u, v->p_score.maxTotalThreadsPerThreadgroup);
+    tg_w = std::max<NSUInteger>(simd_w, (tg_w / simd_w) * simd_w);
     [ce dispatchThreadgroups:MTLSizeMake(total_score_hyps, 1u, 1u)
-       threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+       threadsPerThreadgroup:MTLSizeMake(tg_w, 1u, 1u)];
     [ce endEncoding];
 }
 

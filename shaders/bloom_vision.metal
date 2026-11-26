@@ -217,15 +217,17 @@ kernel void k_vision_score_tiles(texture2d<half, access::read> atlas [[texture(0
                                  constant VisionParamsGpu &vp [[buffer(2)]],
                                  uint tid [[thread_index_in_threadgroup]],
                                  uint tgid [[threadgroup_position_in_grid]],
+                                 uint tg_size [[threads_per_threadgroup]],
                                  uint s_lid [[thread_index_in_simdgroup]],
-                                 uint s_gid [[simdgroup_index_in_threadgroup]]) {
+                                 uint s_gid [[simdgroup_index_in_threadgroup]],
+                                 uint sg_count [[simdgroups_per_threadgroup]]) {
     if (tgid >= vp.n_hyps) return;
-    threadgroup float tg_inter[8], tg_union[8], tg_lum[8], tg_dt[8], tg_ecnt[8];
+    threadgroup float tg_inter[32], tg_union[32], tg_lum[32], tg_dt[32], tg_ecnt[32];
     uint tile_i = vp.tile_base + tgid;
     uint tx = tile_i & 15u, ty = tile_i >> 4u;
     uint bx = tx * 64u, by = ty * 64u;
     float s_inter = 0.0f, s_union = 0.0f, s_lum = 0.0f, s_dt = 0.0f, s_ecnt = 0.0f;
-    for (uint p = tid; p < 4096u; p += 256u) {
+    for (uint p = tid; p < 4096u; p += tg_size) {
         uint lx = p & 63u, ly = p >> 6u;
         half2 rv = atlas.read(uint2(bx + lx, by + ly)).rg;
         float rm = float(rv.r), rl = float(rv.g);
@@ -249,13 +251,14 @@ kernel void k_vision_score_tiles(texture2d<half, access::read> atlas [[texture(0
     }
     float w_inter = simd_sum(s_inter), w_union = simd_sum(s_union), w_lum = simd_sum(s_lum);
     float w_dt = simd_sum(s_dt), w_ecnt = simd_sum(s_ecnt);
-    if (s_lid == 0u) {
+    if (s_lid == 0u && s_gid < 32u) {
         tg_inter[s_gid] = w_inter; tg_union[s_gid] = w_union; tg_lum[s_gid] = w_lum;
         tg_dt[s_gid] = w_dt; tg_ecnt[s_gid] = w_ecnt;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (s_gid == 0u) {
-        bool v = (s_lid < 8u);
+        uint n_sg = min(sg_count, 32u);
+        bool v = (s_lid < n_sg);
         float tot_inter = simd_sum(v ? tg_inter[s_lid] : 0.0f);
         float tot_union = simd_sum(v ? tg_union[s_lid] : 0.0f);
         float tot_lum   = simd_sum(v ? tg_lum[s_lid]   : 0.0f);

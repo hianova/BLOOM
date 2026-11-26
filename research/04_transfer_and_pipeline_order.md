@@ -71,7 +71,7 @@ sequenceDiagram
 | **`24.0 MB`** (12× 步幅，**3× 溢出 8 MB SLC**) | `2.156 ms` / `2.510 ms` | `2.162 ms` / `2.561 ms` | `2.118 ms` / **`2.948 ms`** | 緩衝區大於 8 MB 迫使中間結果被驅逐到 55 GB/s LPDDR4X DRAM，GPU 耗時直接翻倍 (`+1.14 ms`)；拆開兩條 CB 更增加 **`+0.44 ms` 同步懲罰**。 |
 
 **設計原則**：
-* **同條 Command Buffer 一竿到底**：任何一幀內的 `Atlas Upload (Blit) → GPU Culling / Prefix-Sum (Compute) → Opaque / UI RenderPass → Final Present` 全編碼進**同一條 `MTLCommandBuffer`**（多 Pass 間以 `MTLHeap` + `Untracked` + `MTLFence` 或預設追蹤接力），絕不中斷 `waitUntilCompleted` 跨端乒乓。
+* **同條 Command Buffer 一竿到底**：任何一幀內的 `Atlas Upload (Blit) → GPU Culling / Prefix-Sum (Compute) → Opaque / UI RenderPass → Final Present` 全編碼進**同一條 `MTLCommandBuffer`**（多 Pass 間以 `MTLHeap` + `Untracked` + `MTLFence` 或預設追蹤接力），絕不中斷 `waitUntilCompleted` 跨端乒乓。正式管線 [`k_cull_meshlets`](../shaders/bloom_core.metal#L154-L159)（commit `9c7cc298`）即在單一 Compute Pass 內以 `simd_prefix_exclusive_sum` + `simd_sum` + 單次 `atomic_fetch_add_explicit(..., memory_order_relaxed)` 完成緊湊輸出，並依賴同一 CommandBuffer 內 Compute → Render Encoder 隱式記憶體可見性直接供 Indirect Draw 讀取。
 * **中間工作集壓在 `≤ 4–6 MB`**：確保 Compute → Render 的 Culling / Compacted Instance List 完全不溢出 8 MB SLC。
 
 ---

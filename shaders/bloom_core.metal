@@ -145,9 +145,9 @@ kernel void k_cull_meshlets(device const BloomMeshletHeader32 *hdrs [[buffer(0)]
             float ly = vc.z * u.frustum_half_tan, lx = ly * (u.vp_w / u.vp_h);
             keep = !(vc.z + rad < u.near_z || vc.z - rad > u.far_z || abs(vc.x) - rad > lx || abs(vc.y) - rad > ly);
             if (keep) {
-                float3 d_cam = wc - float3(u.cam_pos);
+                float3 d_cam = wc - float3(u.cam_pos); float d_len = length(d_cam);
                 float3 axis = rotate_quat(q, float3(float(m.cone_x), float(m.cone_y), float(m.cone_z)) * (1.0f / 127.0f));
-                keep = (dot(normalize(d_cam), axis) < float(m.cone_c) * (1.0f / 127.0f) + rad / max(length(d_cam), 1e-4f));
+                keep = (d_len < 1e-4f) || (dot(d_cam / d_len, axis) < float(m.cone_c) * (1.0f / 127.0f) + rad / d_len);
             }
         }
     }

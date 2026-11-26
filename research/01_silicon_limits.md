@@ -15,7 +15,7 @@
 | **快取行 & 分頁** | `CacheLine = 128 B`, `PageSize = 16,384 B (16 KB)` | `hw.cachelinesize/pagesize` | x86 的 2× cache line 與 4× VM page；原子防偽共享須對齊 128 B |
 | **安全工作集上限** | `5,461.3 MB` (`5,726,633,984 B`) | `recommendedMaxWorkingSetSize` | 含 OS 與 App 的 GPU 安全總常駐上限；引擎自身應壓在 `≤ 512 MB` |
 | **單一緩衝區上限** | `4,096.0 MB` (`4,294,967,296 B`) | `maxBufferLength` | 實際受制於 8 GB UMA，不應開大於數百 MB 的靜態常駐池 |
-| **Threadgroup 上限** | `MaxTG = (1024, 1024, 1024)`, `TGMem = 32 KB` | `MTLDevice` | 滿載 1024 threads/TG 需低 VGPR 壓力；Tile/TG 共享記憶體上限 32 KB |
+| **Threadgroup 上限** | `MaxTG = (1024, 1024, 1024)`, `TGMem = 32 KB` | `MTLDevice` | 滿載 1024 threads/TG 需低 VGPR 壓力；Tile/TG 共享記憶體上限 32 KB；2D TG 須配合 32-bank 步幅（見 [`bloom_vision.metal`](../shaders/bloom_vision.metal#L96) `tg_lum[10][24]`） |
 
 ---
 
