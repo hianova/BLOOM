@@ -260,8 +260,9 @@ kernel void k_compute_ground_reduce(texture2d<uint, access::read> id_tex [[textu
         bool interior = (tid.x >= 2u && tid.x + 2u < 16u && tid.y >= 2u && tid.y + 2u < 16u);
         uint anc = ((interior ? 60u : 28u) << 26u) | ((px & 0x1FFFu) << 13u) | (py & 0x1FFFu);
         uint best_a = simd_max(anc);
+        uint simd_cnt = simd_sum(1u);
         if (simd_is_first()) {
-            emit_ground_stat(first_key, 32u * area, mn_x, mn_y, mx_x, mx_y,
+            emit_ground_stat(first_key, simd_cnt * area, mn_x, mn_y, mx_x, mx_y,
                              best_a, (val >> 8u) & 0xFFu, min_d, gp.max_slots / 3u, gp.max_slots, stats);
         }
         return;

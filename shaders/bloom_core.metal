@@ -131,25 +131,32 @@ kernel void k_cull_meshlets(device const BloomMeshletHeader32 *hdrs [[buffer(0)]
                             device uint *surviving_ids [[buffer(3)]],
                             device DrawIndexedIndirectArgs &ind [[buffer(4)]],
                             uint gid [[thread_position_in_grid]]) {
-    if (gid >= u.total_meshlets) return;
-    BloomMeshletHeader32 m = hdrs[gid];
-    BloomObjectState48 st = states[m.obj_id];
-    if ((st.flags & 2u) != 0u) return;
-    float4 q = float4(float(st.qx), float(st.qy), float(st.qz), float(st.qw));
-    float3 sc = float3(float(st.sx), float(st.sy), float(st.sz));
-    float3 wc = rotate_quat(q, float3(float(m.bs_x), float(m.bs_y), float(m.bs_z)) * sc) + float3(st.px, st.py, st.pz);
-    float3 vc = to_view(wc, u);
-    float rad = float(m.bs_r) * max(abs(sc.x), max(abs(sc.y), abs(sc.z)));
-    if (vc.z + rad < u.near_z || vc.z - rad > u.far_z) return;
-    float ly = vc.z * u.frustum_half_tan;
-    float lx = ly * (u.vp_w / u.vp_h);
-    if (abs(vc.x) - rad > lx || abs(vc.y) - rad > ly) return;
-    float3 view_dir = normalize(wc - float3(u.cam_pos));
-    float3 axis = rotate_quat(q, float3(float(m.cone_x), float(m.cone_y), float(m.cone_z)) * (1.0f / 127.0f));
-    float cutoff = float(m.cone_c) * (1.0f / 127.0f);
-    if (dot(view_dir, axis) >= cutoff + rad / max(length(wc - float3(u.cam_pos)), 1e-4f)) return;
-    uint slot = atomic_fetch_add_explicit(&ind.instanceCount, 1u, memory_order_relaxed);
-    surviving_ids[slot] = gid;
+    bool keep = (gid < u.total_meshlets);
+    if (keep) {
+        BloomMeshletHeader32 m = hdrs[gid];
+        BloomObjectState48 st = states[m.obj_id];
+        keep = ((st.flags & 2u) == 0u);
+        if (keep) {
+            float4 q = float4(float(st.qx), float(st.qy), float(st.qz), float(st.qw));
+            float3 sc = float3(float(st.sx), float(st.sy), float(st.sz));
+            float3 wc = rotate_quat(q, float3(float(m.bs_x), float(m.bs_y), float(m.bs_z)) * sc) + float3(st.px, st.py, st.pz);
+            float3 vc = to_view(wc, u);
+            float rad = float(m.bs_r) * max(abs(sc.x), max(abs(sc.y), abs(sc.z)));
+            float ly = vc.z * u.frustum_half_tan, lx = ly * (u.vp_w / u.vp_h);
+            keep = !(vc.z + rad < u.near_z || vc.z - rad > u.far_z || abs(vc.x) - rad > lx || abs(vc.y) - rad > ly);
+            if (keep) {
+                float3 d_cam = wc - float3(u.cam_pos);
+                float3 axis = rotate_quat(q, float3(float(m.cone_x), float(m.cone_y), float(m.cone_z)) * (1.0f / 127.0f));
+                keep = (dot(normalize(d_cam), axis) < float(m.cone_c) * (1.0f / 127.0f) + rad / max(length(d_cam), 1e-4f));
+            }
+        }
+    }
+    uint lane_off = simd_prefix_exclusive_sum(keep ? 1u : 0u);
+    uint grp_cnt = simd_sum(keep ? 1u : 0u);
+    uint base_slot = 0u;
+    if (simd_is_first() && grp_cnt > 0u) base_slot = atomic_fetch_add_explicit(&ind.instanceCount, grp_cnt, memory_order_relaxed);
+    base_slot = simd_broadcast_first(base_slot);
+    if (keep) surviving_ids[base_slot + lane_off] = gid;
 }
 
 struct ObjFragIn {
@@ -380,11 +387,13 @@ kernel void k_tex_checksum(texture2d<half, access::read> tex [[texture(0)]],
                            device atomic_uint *out_acc [[buffer(0)]],
                            uint2 gid [[thread_position_in_grid]]) {
     uint w = tex.get_width(), h = tex.get_height();
-    uint x = gid.x * 8u, y = gid.y * 8u;
-    if (x >= w || y >= h) return;
-    half4 p = tex.read(uint2(x, y));
-    uint q = uint(clamp(p.r * 255.0h, 0.0h, 255.0h)) +
-             (uint(clamp(p.g * 255.0h, 0.0h, 255.0h)) << 8u) +
-             (uint(clamp(p.b * 255.0h, 0.0h, 255.0h)) << 16u);
-    if (q != 0u) atomic_fetch_add_explicit(out_acc, q, memory_order_relaxed);
+    uint x = gid.x * 8u, y = gid.y * 8u, q = 0u;
+    if (x < w && y < h) {
+        half4 p = tex.read(uint2(x, y));
+        q = uint(clamp(p.r * 255.0h, 0.0h, 255.0h)) +
+            (uint(clamp(p.g * 255.0h, 0.0h, 255.0h)) << 8u) +
+            (uint(clamp(p.b * 255.0h, 0.0h, 255.0h)) << 16u);
+    }
+    uint s = simd_sum(q);
+    if (simd_is_first() && s != 0u) atomic_fetch_add_explicit(out_acc, s, memory_order_relaxed);
 }

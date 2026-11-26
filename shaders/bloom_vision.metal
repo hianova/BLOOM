@@ -93,7 +93,7 @@ kernel void k_vision_prep_64(texture2d<half, access::read> cam_tex [[texture(0)]
                              constant VisionParamsGpu &vp [[buffer(2)]],
                              uint2 tid [[thread_position_in_threadgroup]],
                              uint2 gid [[thread_position_in_grid]]) {
-    threadgroup float tg_lum[10][10];
+    threadgroup float tg_lum[10][24];
     float c = sample_avg4(cam_tex, vp.img_w, vp.img_h, int(gid.x), int(gid.y));
     tg_lum[tid.y + 1u][tid.x + 1u] = c;
     if (tid.x == 0u) tg_lum[tid.y + 1u][0u] = sample_avg4(cam_tex, vp.img_w, vp.img_h, int(gid.x) - 1, int(gid.y));
@@ -101,19 +101,26 @@ kernel void k_vision_prep_64(texture2d<half, access::read> cam_tex [[texture(0)]
     if (tid.y == 0u) tg_lum[0u][tid.x + 1u] = sample_avg4(cam_tex, vp.img_w, vp.img_h, int(gid.x), int(gid.y) - 1);
     if (tid.y == 7u) tg_lum[9u][tid.x + 1u] = sample_avg4(cam_tex, vp.img_w, vp.img_h, int(gid.x), int(gid.y) + 1);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (gid.x >= 64u || gid.y >= 64u) return;
 
-    float fg = clamp((c - 0.095f) * 20.0f, 0.0f, 1.0f);
-    float l_norm = clamp(c / 0.773f, 0.0f, 1.0f);
-    float gx = -tg_lum[tid.y + 1u][tid.x] + tg_lum[tid.y + 1u][tid.x + 2u];
-    float gy = -tg_lum[tid.y][tid.x + 1u] + tg_lum[tid.y + 2u][tid.x + 1u];
-    bool is_edge = (sqrt(gx * gx + gy * gy) > 0.070f) && (gid.x > 8u || gid.y > 10u);
-    uint idx = gid.y * 64u + gid.x;
-    obs64[idx] = ObsCell64{is_edge ? short(gid.x) : short(-1), is_edge ? short(gid.y) : short(-1), fg, l_norm};
-    if (fg > 0.45f && (gid.x > 12u || gid.y > 12u)) {
-        atomic_fetch_add_explicit(&summary->sum_x, gid.x, memory_order_relaxed);
-        atomic_fetch_add_explicit(&summary->sum_y, gid.y, memory_order_relaxed);
-        atomic_fetch_add_explicit(&summary->fg_cnt, 1u, memory_order_relaxed);
+    bool in_b = (gid.x < 64u && gid.y < 64u);
+    uint sx = 0u, sy = 0u, sc = 0u;
+    if (in_b) {
+        float fg = clamp((c - 0.095f) * 20.0f, 0.0f, 1.0f);
+        float l_norm = clamp(c / 0.773f, 0.0f, 1.0f);
+        float gx = -tg_lum[tid.y + 1u][tid.x] + tg_lum[tid.y + 1u][tid.x + 2u];
+        float gy = -tg_lum[tid.y][tid.x + 1u] + tg_lum[tid.y + 2u][tid.x + 1u];
+        bool is_edge = (sqrt(gx * gx + gy * gy) > 0.070f) && (gid.x > 8u || gid.y > 10u);
+        uint idx = gid.y * 64u + gid.x;
+        obs64[idx] = ObsCell64{is_edge ? short(gid.x) : short(-1), is_edge ? short(gid.y) : short(-1), fg, l_norm};
+        if (fg > 0.45f && (gid.x > 12u || gid.y > 12u)) {
+            sx = gid.x; sy = gid.y; sc = 1u;
+        }
+    }
+    uint gs_x = simd_sum(sx), gs_y = simd_sum(sy), gs_c = simd_sum(sc);
+    if (simd_is_first() && gs_c != 0u) {
+        atomic_fetch_add_explicit(&summary->sum_x, gs_x, memory_order_relaxed);
+        atomic_fetch_add_explicit(&summary->sum_y, gs_y, memory_order_relaxed);
+        atomic_fetch_add_explicit(&summary->fg_cnt, gs_c, memory_order_relaxed);
     }
 }
 
@@ -209,9 +216,11 @@ kernel void k_vision_score_tiles(texture2d<half, access::read> atlas [[texture(0
                                  device VisionHypGpu *hyps [[buffer(1)]],
                                  constant VisionParamsGpu &vp [[buffer(2)]],
                                  uint tid [[thread_index_in_threadgroup]],
-                                 uint tgid [[threadgroup_position_in_grid]]) {
+                                 uint tgid [[threadgroup_position_in_grid]],
+                                 uint s_lid [[thread_index_in_simdgroup]],
+                                 uint s_gid [[simdgroup_index_in_threadgroup]]) {
     if (tgid >= vp.n_hyps) return;
-    threadgroup float tg_inter[256], tg_union[256], tg_lum[256], tg_dt[256], tg_ecnt[256];
+    threadgroup float tg_inter[8], tg_union[8], tg_lum[8], tg_dt[8], tg_ecnt[8];
     uint tile_i = vp.tile_base + tgid;
     uint tx = tile_i & 15u, ty = tile_i >> 4u;
     uint bx = tx * 64u, by = ty * 64u;
@@ -238,27 +247,30 @@ kernel void k_vision_score_tiles(texture2d<half, access::read> atlas [[texture(0
             }
         }
     }
-    tg_inter[tid] = s_inter; tg_union[tid] = s_union; tg_lum[tid] = s_lum; tg_dt[tid] = s_dt; tg_ecnt[tid] = s_ecnt;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint off = 128u; off > 0u; off >>= 1u) {
-        if (tid < off) {
-            tg_inter[tid] += tg_inter[tid + off];
-            tg_union[tid] += tg_union[tid + off];
-            tg_lum[tid]   += tg_lum[tid + off];
-            tg_dt[tid]    += tg_dt[tid + off];
-            tg_ecnt[tid]  += tg_ecnt[tid + off];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    float w_inter = simd_sum(s_inter), w_union = simd_sum(s_union), w_lum = simd_sum(s_lum);
+    float w_dt = simd_sum(s_dt), w_ecnt = simd_sum(s_ecnt);
+    if (s_lid == 0u) {
+        tg_inter[s_gid] = w_inter; tg_union[s_gid] = w_union; tg_lum[s_gid] = w_lum;
+        tg_dt[s_gid] = w_dt; tg_ecnt[s_gid] = w_ecnt;
     }
-    if (tid == 0u) {
-        float iou = (tg_union[0] > 4.0f) ? (tg_inter[0] / tg_union[0]) : 0.0f;
-        float lum_m = (tg_inter[0] > 4.0f) ? (tg_lum[0] / tg_inter[0]) : 1.0f;
-        float dt_m = (tg_ecnt[0] > 4.0f) ? (tg_dt[0] / tg_ecnt[0]) : 16.0f;
-        float loss = (1.0f - iou) * 24.0f + dt_m * 1.5f + lum_m * 8.0f;
-        uint hi = vp.hyps_base + tgid;
-        hyps[hi].iou_out = iou;
-        hyps[hi].lum_err = lum_m;
-        hyps[hi].edge_err = dt_m;
-        hyps[hi].score_out = loss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (s_gid == 0u) {
+        bool v = (s_lid < 8u);
+        float tot_inter = simd_sum(v ? tg_inter[s_lid] : 0.0f);
+        float tot_union = simd_sum(v ? tg_union[s_lid] : 0.0f);
+        float tot_lum   = simd_sum(v ? tg_lum[s_lid]   : 0.0f);
+        float tot_dt    = simd_sum(v ? tg_dt[s_lid]    : 0.0f);
+        float tot_ecnt  = simd_sum(v ? tg_ecnt[s_lid]  : 0.0f);
+        if (s_lid == 0u) {
+            float iou = (tot_union > 4.0f) ? (tot_inter / tot_union) : 0.0f;
+            float lum_m = (tot_inter > 4.0f) ? (tot_lum / tot_inter) : 1.0f;
+            float dt_m = (tot_ecnt > 4.0f) ? (tot_dt / tot_ecnt) : 16.0f;
+            float loss = (1.0f - iou) * 24.0f + dt_m * 1.5f + lum_m * 8.0f;
+            uint hi = vp.hyps_base + tgid;
+            hyps[hi].iou_out = iou;
+            hyps[hi].lum_err = lum_m;
+            hyps[hi].edge_err = dt_m;
+            hyps[hi].score_out = loss;
+        }
     }
 }
