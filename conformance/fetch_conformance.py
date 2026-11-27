@@ -102,10 +102,13 @@ def main() -> None:
         for name in KHRONOS_MODELS:
             glb = MODELS_DIR / f"{name}.glb"
             out_bobc = BOBC_DIR / f"{name}.bobc"
-            out_json = BOBC_DIR / f"{name}_pbr.json"
+            out_blmw = BOBC_DIR / f"{name}_pbr.blmw"
+            legacy_json = BOBC_DIR / f"{name}_pbr.json"
+            if legacy_json.exists():
+                legacy_json.unlink()
             subprocess.run(
                 [sys.executable, str(importer), "import", "--glb", str(glb), "--format", "bobc",
-                 "--out", str(out_bobc), "--pbr-manifest", str(out_json), "--rh-to-lh"],
+                 "--out", str(out_bobc), "--pbr-manifest", str(out_blmw), "--rh-to-lh"],
                 check=True,
             )
 

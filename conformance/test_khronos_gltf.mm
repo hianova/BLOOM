@@ -79,6 +79,7 @@ struct ModelCase {
 
 static bool run_model(const ModelCase &mc, const fs::path &bobc_dir, const fs::path &out_dir) {
     fs::path bobc_path = bobc_dir / (std::string(mc.name) + ".bobc");
+    fs::path blmw_path = bobc_dir / (std::string(mc.name) + "_pbr.blmw");
     fs::path json_path = bobc_dir / (std::string(mc.name) + "_pbr.json");
 
     BloomBobjDoc doc{};
@@ -100,53 +101,117 @@ static bool run_model(const ModelCase &mc, const fs::path &bobc_dir, const fs::p
     bloom_bobj_free(&doc);
     bloom_scene_sync_transforms(scene);
 
-    /* Parse JSON PBR manifest & upload embedded textures */
-    NSData *jdata = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:json_path.c_str()]];
-    NSDictionary *manifest = jdata ? [NSJSONSerialization JSONObjectWithData:jdata options:0 error:nil] : nil;
-
+    /* Load packed binary "BLMW" PBR manifest (fallback to legacy JSON for backward compatibility) */
     std::vector<uint16_t> tex_slices;
-    NSArray *jtexs = manifest[@"textures"];
-    if (jtexs) {
-        tex_slices.resize(jtexs.count, 0u);
-        for (NSUInteger i = 0; i < jtexs.count; ++i) {
-            NSDictionary *td = jtexs[i];
-            NSString *tpath = td[@"path"];
-            if (tpath && tpath.length > 0) {
+    std::vector<uint16_t> mat_ids;
+    std::vector<int32_t> obj_mat_indices;
+
+    auto resolve_tex_path = [&](const char *raw_path) -> std::string {
+        if (!raw_path || !raw_path[0]) return "";
+        fs::path p(raw_path);
+        if (p.is_relative()) return (bobc_dir / p).string();
+        return std::string(raw_path);
+    };
+
+    BloomPbrManifest blmw{};
+    if (fs::exists(blmw_path) && bloom_wire_load_pbr_manifest_file(blmw_path.c_str(), &blmw)) {
+        tex_slices.resize(blmw.texture_cnt, 0u);
+        for (uint32_t i = 0u; i < blmw.texture_cnt; ++i) {
+            std::string tpath = resolve_tex_path(blmw.textures[i].path);
+            if (!tpath.empty()) {
                 std::vector<uint8_t> rgba;
                 uint32_t tw = 0u, th = 0u;
-                if (decode_image_rgba8(tpath.UTF8String, rgba, tw, th)) {
+                if (decode_image_rgba8(tpath.c_str(), rgba, tw, th)) {
                     tex_slices[i] = bloom_gpu_upload_texture_rgba8(gpu, rgba.data(), tw, th, true);
                 }
             }
         }
-    }
-
-    auto tex_slice = [&](NSNumber *n) -> uint16_t {
-        if (!n) return 0u;
-        NSInteger idx = [n integerValue];
-        if (idx >= 0 && (size_t)idx < tex_slices.size()) return tex_slices[(size_t)idx];
-        return 0u;
-    };
-
-    std::vector<uint16_t> mat_ids;
-    NSArray *jmats = manifest[@"materials"];
-    if (jmats && jmats.count > 0) {
-        for (NSDictionary *md in jmats) {
+        auto slice_at = [&](int32_t idx) -> uint16_t {
+            if (idx >= 0 && (size_t)idx < tex_slices.size()) return tex_slices[(size_t)idx];
+            return 0u;
+        };
+        auto q8 = [](float x) -> uint32_t {
+            long v = lroundf(std::max(0.0f, std::min(1.0f, x)) * 255.0f);
+            return (uint32_t)v;
+        };
+        for (uint32_t mi = 0u; mi < blmw.material_cnt; ++mi) {
+            const BloomPbrMaterialDesc &md = blmw.materials[mi];
             BloomMaterial32 bm{};
-            bm.base_rgba8 = pack_rgba_f4(md[@"baseColorFactor"], true);
-            bm.emissive_rgba8 = md[@"emissiveFactor"] ? pack_rgba_f4(md[@"emissiveFactor"], false) & 0x00FFFFFFu : 0u;
-            bm.metallic_f16 = bloom_f32_to_f16([md[@"metallicFactor"] floatValue]);
-            bm.roughness_f16 = bloom_f32_to_f16([md[@"roughnessFactor"] floatValue]);
+            bm.base_rgba8 = BLOOM_RGBA(q8(md.base_color_factor[0]), q8(md.base_color_factor[1]),
+                                       q8(md.base_color_factor[2]), q8(md.base_color_factor[3]));
+            bm.emissive_rgba8 = BLOOM_RGBA(q8(md.emissive_factor[0]), q8(md.emissive_factor[1]),
+                                           q8(md.emissive_factor[2]), 255u) & 0x00FFFFFFu;
+            bm.metallic_f16 = bloom_f32_to_f16(md.metallic_factor);
+            bm.roughness_f16 = bloom_f32_to_f16(md.roughness_factor);
             bm.ao_f16 = bloom_f32_to_f16(1.0f);
-            float ns = md[@"normalScale"] ? [md[@"normalScale"] floatValue] : 1.0f;
-            bm.normal_scale_f16 = bloom_f32_to_f16(ns);
-            bm.albedo_tex = tex_slice(md[@"baseColorTex"]);
-            bm.mr_tex = tex_slice(md[@"mrTex"]);
-            bm.normal_tex = tex_slice(md[@"normalTex"]);
-            bm.emissive_tex = tex_slice(md[@"emissiveTex"]);
-            bm.ao_tex = tex_slice(md[@"aoTex"]);
-            bm.flags = BLOOM_MAT_FLAG_PBR | ([md[@"doubleSided"] boolValue] ? BLOOM_MAT_FLAG_DOUBLE_SIDED : 0u);
+            bm.normal_scale_f16 = bloom_f32_to_f16(md.normal_scale);
+            bm.albedo_tex = slice_at(md.base_color_tex);
+            bm.mr_tex = slice_at(md.mr_tex);
+            bm.normal_tex = slice_at(md.normal_tex);
+            bm.emissive_tex = slice_at(md.emissive_tex);
+            bm.ao_tex = slice_at(md.ao_tex);
+            bm.flags = BLOOM_MAT_FLAG_PBR | (md.double_sided ? BLOOM_MAT_FLAG_DOUBLE_SIDED : 0u);
             mat_ids.push_back(bloom_scene_add_material(scene, &bm));
+        }
+        obj_mat_indices.reserve(blmw.object_cnt);
+        for (uint32_t oi = 0u; oi < blmw.object_cnt; ++oi) {
+            obj_mat_indices.push_back(blmw.objects[oi].material_index);
+        }
+        bloom_pbr_manifest_free(&blmw);
+    } else {
+        NSData *jdata = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:json_path.c_str()]];
+        NSDictionary *manifest = jdata ? [NSJSONSerialization JSONObjectWithData:jdata options:0 error:nil] : nil;
+
+        NSArray *jtexs = manifest[@"textures"];
+        if (jtexs) {
+            tex_slices.resize(jtexs.count, 0u);
+            for (NSUInteger i = 0; i < jtexs.count; ++i) {
+                NSDictionary *td = jtexs[i];
+                NSString *tpath = td[@"path"];
+                if (tpath && tpath.length > 0) {
+                    std::string resolved = resolve_tex_path(tpath.UTF8String);
+                    std::vector<uint8_t> rgba;
+                    uint32_t tw = 0u, th = 0u;
+                    if (decode_image_rgba8(resolved.c_str(), rgba, tw, th)) {
+                        tex_slices[i] = bloom_gpu_upload_texture_rgba8(gpu, rgba.data(), tw, th, true);
+                    }
+                }
+            }
+        }
+
+        auto tex_slice = [&](NSNumber *n) -> uint16_t {
+            if (!n) return 0u;
+            NSInteger idx = [n integerValue];
+            if (idx >= 0 && (size_t)idx < tex_slices.size()) return tex_slices[(size_t)idx];
+            return 0u;
+        };
+
+        NSArray *jmats = manifest[@"materials"];
+        if (jmats && jmats.count > 0) {
+            for (NSDictionary *md in jmats) {
+                BloomMaterial32 bm{};
+                bm.base_rgba8 = pack_rgba_f4(md[@"baseColorFactor"], true);
+                bm.emissive_rgba8 = md[@"emissiveFactor"] ? pack_rgba_f4(md[@"emissiveFactor"], false) & 0x00FFFFFFu : 0u;
+                bm.metallic_f16 = bloom_f32_to_f16([md[@"metallicFactor"] floatValue]);
+                bm.roughness_f16 = bloom_f32_to_f16([md[@"roughnessFactor"] floatValue]);
+                bm.ao_f16 = bloom_f32_to_f16(1.0f);
+                float ns = md[@"normalScale"] ? [md[@"normalScale"] floatValue] : 1.0f;
+                bm.normal_scale_f16 = bloom_f32_to_f16(ns);
+                bm.albedo_tex = tex_slice(md[@"baseColorTex"]);
+                bm.mr_tex = tex_slice(md[@"mrTex"]);
+                bm.normal_tex = tex_slice(md[@"normalTex"]);
+                bm.emissive_tex = tex_slice(md[@"emissiveTex"]);
+                bm.ao_tex = tex_slice(md[@"aoTex"]);
+                bm.flags = BLOOM_MAT_FLAG_PBR | ([md[@"doubleSided"] boolValue] ? BLOOM_MAT_FLAG_DOUBLE_SIDED : 0u);
+                mat_ids.push_back(bloom_scene_add_material(scene, &bm));
+            }
+        }
+        NSArray *jobjs = manifest[@"objects"];
+        if (jobjs) {
+            obj_mat_indices.reserve(jobjs.count);
+            for (NSDictionary *od in jobjs) {
+                obj_mat_indices.push_back((int32_t)[od[@"material_index"] integerValue]);
+            }
         }
     }
     BloomMaterial32 def_bm{};
@@ -158,15 +223,14 @@ static bool run_model(const ModelCase &mc, const fs::path &bobc_dir, const fs::p
     def_bm.flags = BLOOM_MAT_FLAG_PBR;
     uint16_t def_mat_id = bloom_scene_add_material(scene, &def_bm);
 
-    NSArray *jobjs = manifest[@"objects"];
     uint32_t slot_cnt = bloom_scene_get_object_slot_count(scene);
     size_t obj_ord = 0u;
     for (uint32_t s = 0u; s < slot_cnt; ++s) {
         BloomObjectMeta meta{};
         if (!bloom_scene_get_object_meta(scene, s, &meta)) continue;
         uint16_t mid = def_mat_id;
-        if (jobjs && obj_ord < jobjs.count) {
-            NSInteger mi = [jobjs[obj_ord][@"material_index"] integerValue];
+        if (obj_ord < obj_mat_indices.size()) {
+            int32_t mi = obj_mat_indices[obj_ord];
             if (mi >= 0 && (size_t)mi < mat_ids.size()) mid = mat_ids[(size_t)mi];
         }
         bloom_scene_set_object_material(scene, meta.handle, mid);

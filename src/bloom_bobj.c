@@ -117,12 +117,27 @@ static void br_bytes(BufReader *br, void *dst, size_t n) {
 static uint64_t br_uvarint(BufReader *br) {
     uint64_t v = 0u;
     uint32_t sh = 0u;
-    while (!br->err && br->pos < br->len) {
+    for (uint32_t i = 0u; i < 10u; ++i) {
+        if (br->err || br->pos >= br->len) {
+            br->err = true;
+            return 0u;
+        }
         uint8_t b = br->data[br->pos++];
+        if (i == 9u) {
+            if (b != 1u) {
+                br->err = true;
+                return 0u;
+            }
+            v |= UINT64_C(1) << 63u;
+            return v;
+        }
+        if (i > 0u && b == 0u) {
+            br->err = true;
+            return 0u;
+        }
         v |= (uint64_t)(b & 0x7Fu) << sh;
         if ((b & 0x80u) == 0u) return v;
         sh += 7u;
-        if (sh >= 64u) break;
     }
     br->err = true;
     return 0u;
@@ -174,7 +189,7 @@ static bool get_front_strings(BufReader *br, char **out_strs, uint32_t count) {
             free(prev);
             return false;
         }
-        if (lcp > 0u) memcpy(cur, prev, lcp);
+        if (lcp > 0u && prev) memcpy(cur, prev, lcp);
         br_bytes(br, cur + lcp, suf);
         cur[lcp + suf] = '\0';
         out_strs[i] = cur;
@@ -441,17 +456,17 @@ bool bloom_bobj_encode_col(const BloomBobjDoc *doc, bool include_geom,
     bw_u32(&bw, doc->analytic_cnt);
     bw_u32(&bw, doc->hud_cnt);
 
-    const char **tnames = doc->template_cnt ? (const char **)malloc(doc->template_cnt * sizeof(char *)) : NULL;
-    if (doc->template_cnt && !tnames) {
-        free(bw.data);
-        return false;
-    }
-    for (uint32_t i = 0u; i < doc->template_cnt; ++i) {
-        tnames[i] = doc->templates[i].name;
-        bw_uvarint(&bw, doc->templates[i].meshlet_cnt);
-        bw_uvarint(&bw, include_geom ? doc->templates[i].idx_bytes : 0u);
-    }
-    if (doc->template_cnt) {
+    if (doc->template_cnt > 0u) {
+        const char **tnames = (const char **)malloc(doc->template_cnt * sizeof(char *));
+        if (!tnames) {
+            free(bw.data);
+            return false;
+        }
+        for (uint32_t i = 0u; i < doc->template_cnt; ++i) {
+            tnames[i] = doc->templates[i].name;
+            bw_uvarint(&bw, doc->templates[i].meshlet_cnt);
+            bw_uvarint(&bw, include_geom ? doc->templates[i].idx_bytes : 0u);
+        }
         put_front_strings(&bw, tnames, doc->template_cnt);
         free(tnames);
     }

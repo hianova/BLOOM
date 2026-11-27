@@ -13,5 +13,6 @@
 #include "bloom_ui_kit.h"
 #include "bloom_gesture.h"
 #include "bloom_camera.h"
+#include "bloom_wire.h"
 
 #endif /* BLOOM_UMBRELLA_H */

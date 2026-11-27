@@ -1,5 +1,6 @@
 #include "bloom_sdk.h"
 #include "bloom_vision.h"
+#include "bloom_wire.h"
 
 #include <algorithm>
 #include <cassert>
@@ -283,8 +284,21 @@ static void run_test1_ui_sdk_and_modal(BloomGpu *gpu) {
     assert(strstr(jbuf.data(), "\"reactor_core\"") != nullptr);
     assert(strstr(jbuf.data(), "\"anchor\"") != nullptr);
 
-    printf("  [PASS] Test 1 (4K UI SDK + Modal Trap): ground=%.3f ms | hidden_px=0 -> visible=%u | sl_ratio=%.2f -> t=%.2f\n",
-           snap.ground_ms, e_hidden2->visible_px, e_part->visible_ratio, bloom_scene_get_ui_slider(sc, sl_partial));
+    /* Packed binary "BLMW" SDK snapshot roundtrip + byte savings vs JSON */
+    uint8_t *wbuf = nullptr;
+    size_t wlen = 0u;
+    assert(bloom_wire_encode_sdk_snapshot(&snap2, &wbuf, &wlen));
+    assert(wlen < jlen);
+    BloomSdkSnapshot snap2_dec{};
+    assert(bloom_wire_decode_sdk_snapshot(wbuf, wlen, &snap2_dec));
+    BloomDigest128 dw_exp = bloom_sdk_snapshot_digest128(&snap2);
+    BloomDigest128 dw_got = bloom_sdk_snapshot_digest128(&snap2_dec);
+    assert(dw_exp.lo == dw_got.lo && dw_exp.hi == dw_got.hi);
+    bloom_sdk_free_snapshot(&snap2_dec);
+    free(wbuf);
+
+    printf("  [PASS] Test 1 (4K UI SDK + Modal Trap): ground=%.3f ms | hidden_px=0 -> visible=%u | sl_ratio=%.2f -> t=%.2f | wire=%zu B vs json=%zu B\n",
+           snap.ground_ms, e_hidden2->visible_px, e_part->visible_ratio, bloom_scene_get_ui_slider(sc, sl_partial), wlen, jlen);
 
     bloom_sdk_free_snapshot(&snap);
     bloom_sdk_free_snapshot(&snap2);

@@ -1,5 +1,9 @@
+export PATH := $(HOME)/.elan/bin:/opt/homebrew/bin:/usr/local/bin:$(PATH)
+
 CC ?= clang
 CXX ?= clang++
+LEAN_BIN ?= lean
+LEANCHECKER ?= leanchecker
 
 CFLAGS = -std=c17 -O3 -Wall -Wextra -Werror -Iinclude
 OBJCFLAGS = -std=c17 -O3 -Wall -Wextra -Werror -fobjc-arc -Iinclude
@@ -7,7 +11,9 @@ CXXFLAGS = -std=c++17 -ObjC++ -O3 -Wall -Wextra -Werror -fobjc-arc -Iinclude
 FRAMEWORKS = -framework Metal -framework QuartzCore -framework Cocoa -framework CoreText -framework CoreGraphics -framework Foundation
 
 BUILD_DIR = build
-CORE_OBJS = $(BUILD_DIR)/bloom_bobj.o $(BUILD_DIR)/bloom_scene.o $(BUILD_DIR)/bloom_sdk.o $(BUILD_DIR)/bloom_ui_kit.o $(BUILD_DIR)/bloom_gesture.o $(BUILD_DIR)/bloom_camera.o
+LEAN_DIR = $(BUILD_DIR)/lean
+LEAN_MOD = $(LEAN_DIR)/BloomInvariants.olean
+CORE_OBJS = $(BUILD_DIR)/bloom_bobj.o $(BUILD_DIR)/bloom_scene.o $(BUILD_DIR)/bloom_sdk.o $(BUILD_DIR)/bloom_ui_kit.o $(BUILD_DIR)/bloom_gesture.o $(BUILD_DIR)/bloom_camera.o $(BUILD_DIR)/bloom_wire.o
 MAC_OBJS = $(BUILD_DIR)/bloom_atlas_mac.o $(BUILD_DIR)/bloom_metal.o $(BUILD_DIR)/bloom_vision_mac.o $(BUILD_DIR)/bloom_host_mac.o
 EMBED_HDR = $(BUILD_DIR)/bloom_embedded_shaders.h
 LIB_BLOOM = $(BUILD_DIR)/libbloom.a
@@ -22,7 +28,7 @@ BIN_KH_TEST = $(BUILD_DIR)/test_khronos_gltf
 BIN_CLAY_SWAP = $(BUILD_DIR)/clay_bloom_swap
 BIN_PEANUT_SWAP = $(BUILD_DIR)/peanut_gb_bloom_swap
 
-.PHONY: all lib test test-core gate-ci gate-conformance demo clean
+.PHONY: all lib test test-core gate-ci gate-conformance gate-lean demo clean
 
 all: $(LIB_BLOOM) $(BIN_CORE_TEST) $(BIN_METAL_TEST) $(BIN_SDK_TEST) $(BIN_M2_TEST) $(BIN_VRS_TEST) $(BIN_DEMO)
 
@@ -60,6 +66,10 @@ $(BUILD_DIR)/bloom_camera.o: src/bloom_camera.c include/bloom_camera.h include/b
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/bloom_wire.o: src/bloom_wire.c include/bloom_wire.h include/bloom_sdk.h include/bloom_gpu.h include/bloom_scene.h include/bloom_bobj.h include/bloom_abi.h Makefile
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/bloom_atlas_mac.o: src/bloom_atlas_mac.m include/bloom_atlas.h include/bloom_scene.h Makefile
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(OBJCFLAGS) -c $< -o $@
@@ -76,9 +86,9 @@ $(BUILD_DIR)/bloom_host_mac.o: src/bloom_host_mac.mm include/bloom_host.h includ
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BIN_CORE_TEST): tests/test_bloom_core.c $(BUILD_DIR)/bloom_bobj.o $(BUILD_DIR)/bloom_scene.o Makefile
+$(BIN_CORE_TEST): tests/test_bloom_core.c $(BUILD_DIR)/bloom_bobj.o $(BUILD_DIR)/bloom_scene.o $(BUILD_DIR)/bloom_wire.o Makefile
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) tests/test_bloom_core.c $(BUILD_DIR)/bloom_bobj.o $(BUILD_DIR)/bloom_scene.o -lm -o $@
+	$(CC) $(CFLAGS) tests/test_bloom_core.c $(BUILD_DIR)/bloom_bobj.o $(BUILD_DIR)/bloom_scene.o $(BUILD_DIR)/bloom_wire.o -lm -o $@
 
 $(BIN_METAL_TEST): tests/test_bloom_metal.mm $(BUILD_DIR)/bloom_bobj.o $(BUILD_DIR)/bloom_scene.o $(BUILD_DIR)/bloom_atlas_mac.o $(BUILD_DIR)/bloom_metal.o Makefile
 	@mkdir -p $(BUILD_DIR)
@@ -104,9 +114,10 @@ test-core: $(BIN_CORE_TEST)
 	@mkdir -p $(BUILD_DIR)
 	python3 tools/bloom_import.py emit-sample-glb $(BUILD_DIR)/sample_mesh.glb
 	printf '<svg xmlns="http://www.w3.org/2000/svg"><g id="h_0" data-kind="slider" data-bind="0:0"><rect x="16" y="16" width="240" height="44" rx="6" fill="#22344CEB" stroke="#38D0FFFF"/><text x="20" y="34">ImportedSlider</text></g></svg>\n' > $(BUILD_DIR)/sample_ui.svg
-	python3 tools/bloom_import.py import --glb $(BUILD_DIR)/sample_mesh.glb --svg $(BUILD_DIR)/sample_ui.svg --format bobc --out $(BUILD_DIR)/imported_sample.bobc
+	python3 tools/bloom_import.py import --glb $(BUILD_DIR)/sample_mesh.glb --svg $(BUILD_DIR)/sample_ui.svg --format bobc --out $(BUILD_DIR)/imported_sample.bobc --pbr-manifest $(BUILD_DIR)/imported_sample_pbr.blmw
 	python3 tools/bloom_import.py inspect $(BUILD_DIR)/imported_sample.bobc
-	$(BIN_CORE_TEST) --imported-bobc $(BUILD_DIR)/imported_sample.bobc
+	python3 tools/bloom_import.py inspect $(BUILD_DIR)/imported_sample_pbr.blmw
+	$(BIN_CORE_TEST) --imported-bobc $(BUILD_DIR)/imported_sample.bobc --imported-blmw $(BUILD_DIR)/imported_sample_pbr.blmw
 	@echo "=== Gate 1: Zero Coupling Audit (Zero FLOW/INFO/SDL/ge_host_if) ==="
 	! grep -rnE "#include.*(flow|searu|ge_host_if|SDL|info\.h)" include/ src/ shaders/ tests/ examples/
 	@echo "=== Gate 2b: Shader Line Budget <= 400 per file ==="
@@ -116,9 +127,10 @@ test: all
 	@mkdir -p $(BUILD_DIR)
 	python3 tools/bloom_import.py emit-sample-glb $(BUILD_DIR)/sample_mesh.glb
 	printf '<svg xmlns="http://www.w3.org/2000/svg"><g id="h_0" data-kind="slider" data-bind="0:0"><rect x="16" y="16" width="240" height="44" rx="6" fill="#22344CEB" stroke="#38D0FFFF"/><text x="20" y="34">ImportedSlider</text></g></svg>\n' > $(BUILD_DIR)/sample_ui.svg
-	python3 tools/bloom_import.py import --glb $(BUILD_DIR)/sample_mesh.glb --svg $(BUILD_DIR)/sample_ui.svg --format bobc --out $(BUILD_DIR)/imported_sample.bobc
+	python3 tools/bloom_import.py import --glb $(BUILD_DIR)/sample_mesh.glb --svg $(BUILD_DIR)/sample_ui.svg --format bobc --out $(BUILD_DIR)/imported_sample.bobc --pbr-manifest $(BUILD_DIR)/imported_sample_pbr.blmw
 	python3 tools/bloom_import.py inspect $(BUILD_DIR)/imported_sample.bobc
-	$(BIN_CORE_TEST) --imported-bobc $(BUILD_DIR)/imported_sample.bobc
+	python3 tools/bloom_import.py inspect $(BUILD_DIR)/imported_sample_pbr.blmw
+	$(BIN_CORE_TEST) --imported-bobc $(BUILD_DIR)/imported_sample.bobc --imported-blmw $(BUILD_DIR)/imported_sample_pbr.blmw
 	$(BIN_METAL_TEST)
 	$(BIN_SDK_TEST)
 	python3 tools/bloom_import.py emit-multi-glb $(BUILD_DIR)/multi_sample.glb
@@ -148,6 +160,19 @@ gate-conformance: $(LIB_BLOOM)
 	$(BIN_CLAY_SWAP) --headless --ppm $(BUILD_DIR)/conformance_deps/renders/clay_bloom_swap.ppm
 	$(BIN_PEANUT_SWAP) --headless --rom $(BUILD_DIR)/conformance_deps/dmg-acid2.gb --ppm $(BUILD_DIR)/conformance_deps/renders/peanut_gb_dmg_acid2.ppm
 	@echo "ALL EXTERNAL CONFORMANCE & OSS SWAP GATES PASSED!"
+
+$(LEAN_MOD): lean/BloomInvariants.lean Makefile
+	@mkdir -p $(LEAN_DIR)
+	$(LEAN_BIN) -DwarningAsError=true --root=lean -o $@ $<
+
+gate-lean: $(LEAN_MOD)
+	@echo "=== Gate Lean: Pure-Init Lean 4 + leanchecker + Axiom Audit ==="
+	LEAN_PATH=$(LEAN_DIR) $(LEANCHECKER) BloomInvariants
+	@! grep -Eq '\bsorry\b|\bnative_decide\b|\baxiom\b' lean/BloomInvariants.lean
+	@python3 -c 'import re; txt=open("lean/BloomInvariants.lean").read(); thms=re.findall(r"^\s*theorem\s+(\S+)", txt, re.M); assert len(thms)>=12, f"Too few theorems: {len(thms)}"; open("$(BUILD_DIR)/AxiomAudit.lean","w").write("import BloomInvariants\n" + "".join(f"#print axioms BloomInvariants.{t}\n" for t in thms)); print(f"  [LEAN4] Auditing {len(thms)} theorems...")'
+	@ax_out="$$(LEAN_PATH=$(LEAN_DIR) $(LEAN_BIN) -DwarningAsError=true $(BUILD_DIR)/AxiomAudit.lean)" && \
+		! printf '%s\n' "$$ax_out" | grep -Eq 'sorryAx|Lean\.ofReduceBool|Lean\.trustCompiler'
+	@echo "  [PASS] lean/BloomInvariants.lean verified with lean + leanchecker (0 sorryAx, 0 ofReduceBool, 0 native_decide)"
 
 demo: $(BIN_DEMO)
 	$(BIN_DEMO)

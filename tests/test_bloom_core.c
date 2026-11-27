@@ -1,4 +1,5 @@
 #include "bloom_scene.h"
+#include "bloom_wire.h"
 
 #include <assert.h>
 #include <math.h>
@@ -224,12 +225,99 @@ static void test_imported_bobc(const char *path) {
     printf("  [PASS] Loaded bloom_import.py BOBC (%s) + live StateStore preservation on hot-reload\n", path);
 }
 
+static void test_blmw_wire_codecs(void) {
+    /* 1. Canonical ULEB128 roundtrip + non-canonical rejection */
+    uint8_t vbuf[16];
+    uint64_t vals[] = {0u, 1u, 127u, 128u, 16383u, 16384u, UINT32_MAX, UINT64_MAX};
+    for (size_t i = 0u; i < sizeof(vals) / sizeof(vals[0]); ++i) {
+        size_t wp = 0u, rp = 0u;
+        uint64_t got = 0u;
+        assert(bloom_wire_put_varu64(vbuf, sizeof(vbuf), &wp, vals[i]));
+        assert(bloom_wire_get_varu64(vbuf, wp, &rp, &got));
+        assert(rp == wp && got == vals[i]);
+    }
+    /* Reject non-canonical trailing zero 2-byte encoding of 0: 0x80 0x00 */
+    uint8_t bad_var[2] = {0x80u, 0x00u};
+    size_t rp_bad = 0u;
+    uint64_t dummy = 0u;
+    assert(!bloom_wire_get_varu64(bad_var, 2u, &rp_bad, &dummy));
+
+    /* 2. PBR Manifest BLMW bit-exact roundtrip */
+    BloomPbrTextureRef texs[2] = {
+        {"DamagedHelmet_pbr_textures/tex_0.png"},
+        {"DamagedHelmet_pbr_textures/tex_1.png"},
+    };
+    BloomPbrMaterialDesc mats[2] = {0};
+    mats[0].base_color_factor[0] = 1.0f; mats[0].base_color_factor[1] = 1.0f;
+    mats[0].base_color_factor[2] = 1.0f; mats[0].base_color_factor[3] = 1.0f;
+    mats[0].metallic_factor = 1.0f; mats[0].roughness_factor = 0.45f; mats[0].normal_scale = 1.0f;
+    mats[0].base_color_tex = 0; mats[0].mr_tex = 1; mats[0].normal_tex = -1;
+    mats[0].emissive_tex = -1; mats[0].ao_tex = -1; mats[0].double_sided = 0u; mats[0].alpha_mode = BLOOM_ALPHA_OPAQUE;
+    mats[1] = mats[0];
+    mats[1].base_color_factor[0] = 0.25f; mats[1].double_sided = 1u; mats[1].alpha_mode = BLOOM_ALPHA_MASK;
+    BloomPbrObjectBinding objs[3] = {
+        {"helmet_body", 0},
+        {"helmet_visor", 1},
+        {"helmet_trim", 0},
+    };
+    BloomPbrManifest pbr = {texs, 2u, mats, 2u, objs, 3u};
+    BloomDigest128 pbr_exp = bloom_pbr_manifest_digest128(&pbr);
+
+    uint8_t *pbr_buf = NULL;
+    size_t pbr_len = 0u;
+    assert(bloom_wire_encode_pbr_manifest(&pbr, &pbr_buf, &pbr_len));
+    BloomPbrManifest pbr_dec = {0};
+    assert(bloom_wire_decode_pbr_manifest(pbr_buf, pbr_len, &pbr_dec));
+    BloomDigest128 pbr_got = bloom_pbr_manifest_digest128(&pbr_dec);
+    assert(pbr_got.lo == pbr_exp.lo && pbr_got.hi == pbr_exp.hi);
+    bloom_pbr_manifest_free(&pbr_dec);
+    free(pbr_buf);
+
+    /* 3. Benchmark Report BLMW bit-exact roundtrip */
+    BloomBenchMetric bms[3] = {
+        {"4k_frame_time", "ms", 1.125, 0u, 0x12345678u},
+        {"pbr_manifest_wire", "bytes", 184.0, 184u, 0x9ABCDEF0u},
+        {"sdk_snapshot_wire", "bytes", 160.0, 160u, 0xCAFEBABEu},
+    };
+    BloomBenchReport rep = {"bloom_core_bench", UINT64_C(1700000000000), bms, 3u};
+    BloomDigest128 rep_exp = bloom_bench_report_digest128(&rep);
+    uint8_t *rep_buf = NULL;
+    size_t rep_len = 0u;
+    assert(bloom_wire_encode_bench_report(&rep, &rep_buf, &rep_len));
+    BloomBenchReport rep_dec = {0};
+    assert(bloom_wire_decode_bench_report(rep_buf, rep_len, &rep_dec));
+    BloomDigest128 rep_got = bloom_bench_report_digest128(&rep_dec);
+    assert(rep_got.lo == rep_exp.lo && rep_got.hi == rep_exp.hi);
+    bloom_bench_report_free(&rep_dec);
+    free(rep_buf);
+
+    printf("  [PASS] BLMW Canonical Wire Codec (PBR=%zu B, Bench=%zu B) 128-bit bit-exact roundtrip\n",
+           pbr_len, rep_len);
+}
+
 int main(int argc, char **argv) {
     printf("=== BLOOM vNext Core C17 Unit & Importer Integration Tests ===\n");
     test_bobj_codecs();
+    test_blmw_wire_codecs();
     test_scene_handles_hierarchy_projections_and_ui();
     for (int i = 1; i + 1 < argc; ++i) {
         if (strcmp(argv[i], "--imported-bobc") == 0) test_imported_bobc(argv[i + 1]);
+        if (strcmp(argv[i], "--imported-blmw") == 0) {
+            BloomPbrManifest pm = {0};
+            assert(bloom_wire_load_pbr_manifest_file(argv[i + 1], &pm));
+            uint8_t *re_buf = NULL;
+            size_t re_len = 0u;
+            assert(bloom_wire_encode_pbr_manifest(&pm, &re_buf, &re_len));
+            BloomPbrManifest pm2 = {0};
+            assert(bloom_wire_decode_pbr_manifest(re_buf, re_len, &pm2));
+            BloomDigest128 d1 = bloom_pbr_manifest_digest128(&pm);
+            BloomDigest128 d2 = bloom_pbr_manifest_digest128(&pm2);
+            assert(d1.lo == d2.lo && d1.hi == d2.hi);
+            bloom_pbr_manifest_free(&pm2);
+            bloom_pbr_manifest_free(&pm);
+            free(re_buf);
+            printf("  [PASS] Loaded bloom_import.py BLMW (%s, %zu B) bit-exact C17 roundtrip\n", argv[i + 1], re_len);
+        }
     }
     printf("ALL CORE TESTS PASSED!\n");
     return 0;

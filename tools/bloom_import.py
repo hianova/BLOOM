@@ -25,6 +25,9 @@ LOCAL_BOX_SPAN = 3.0
 
 MAGIC_ROW = 0x52424F42  # "BOBR"
 MAGIC_COL = 0x43424F42  # "BOBC"
+MAGIC_BLMW = 0x574D4C42  # "BLMW"
+BLMW_VERSION = 1
+BLMW_KIND_PBR_MANIFEST = 1
 FLAG_GEOM = 1
 
 
@@ -490,14 +493,57 @@ def _bake_primitive(gltf: Dict[str, Any], bin_blob: bytes, prim: Dict[str, Any],
     return tpl, rgba8, mat_idx
 
 
-def export_pbr_manifest(gltf: Dict[str, Any], bin_blob: bytes, obj_mats: List[Dict[str, Any]], manifest_path: Path) -> None:
+def encode_blmw_pbr_manifest(
+    tex_paths: Sequence[str],
+    out_mats: Sequence[Dict[str, Any]],
+    obj_mats: Sequence[Dict[str, Any]],
+) -> bytes:
+    out = bytearray()
+    out.extend(struct.pack("<IBBH", MAGIC_BLMW, BLMW_VERSION, BLMW_KIND_PBR_MANIFEST, 0))
+    put_uvarint(out, len(tex_paths))
+    put_uvarint(out, len(out_mats))
+    put_uvarint(out, len(obj_mats))
+
+    if tex_paths:
+        put_front_strings(out, tex_paths)
+
+    if out_mats:
+        for k in range(4):
+            put_f32_planes(out, [float(m["baseColorFactor"][k]) for m in out_mats])
+        for k in range(3):
+            put_f32_planes(out, [float(m["emissiveFactor"][k]) for m in out_mats])
+        put_f32_planes(out, [float(m["metallicFactor"]) for m in out_mats])
+        put_f32_planes(out, [float(m["roughnessFactor"]) for m in out_mats])
+        put_f32_planes(out, [float(m["normalScale"]) for m in out_mats])
+        alpha_map = {"OPAQUE": 0, "MASK": 1, "BLEND": 2}
+        for m in out_mats:
+            ds = 1 if m.get("doubleSided", False) else 0
+            am = alpha_map.get(str(m.get("alphaMode", "OPAQUE")), 0)
+            out.append((ds | ((am & 3) << 1)) & 0xFF)
+        for field in ("baseColorTex", "mrTex", "normalTex", "emissiveTex", "aoTex"):
+            for m in out_mats:
+                put_uvarint(out, zz_enc(int(m[field])))
+
+    if obj_mats:
+        put_front_strings(out, [str(o["id"]) for o in obj_mats])
+        for o in obj_mats:
+            put_uvarint(out, zz_enc(int(o["material_index"])))
+
+    return bytes(out)
+
+
+def export_pbr_manifest(gltf: Dict[str, Any], bin_blob: bytes, obj_mats: List[Dict[str, Any]],
+                        manifest_path: Path, pbr_format: str = "auto") -> None:
     tex_dir = manifest_path.parent / f"{manifest_path.stem}_textures"
     images = gltf.get("images", [])
     textures = gltf.get("textures", [])
     bvs = gltf.get("bufferViews", [])
+    use_json = (pbr_format == "json") or (pbr_format == "auto" and manifest_path.suffix.lower() == ".json")
     out_images: List[Dict[str, Any]] = []
+    rel_paths: List[str] = []
     for i, img in enumerate(images):
         path_str = ""
+        rel_str = ""
         if "bufferView" in img:
             bv = bvs[int(img["bufferView"])]
             off = bv.get("byteOffset", 0)
@@ -509,7 +555,9 @@ def export_pbr_manifest(gltf: Dict[str, Any], bin_blob: bytes, obj_mats: List[Di
             img_file = tex_dir / f"tex_{i}.{ext}"
             img_file.write_bytes(raw)
             path_str = str(img_file)
+            rel_str = img_file.relative_to(manifest_path.parent).as_posix()
         out_images.append({"index": i, "path": path_str})
+        rel_paths.append(rel_str)
 
     def _tex_img_idx(tex_info: Any) -> int:
         if not isinstance(tex_info, dict) or "index" not in tex_info:
@@ -541,13 +589,18 @@ def export_pbr_manifest(gltf: Dict[str, Any], bin_blob: bytes, obj_mats: List[Di
             "normalScale": float(nrm.get("scale", 1.0)) if isinstance(nrm, dict) else 1.0,
         })
 
-    manifest = {"textures": out_images, "materials": out_mats, "objects": obj_mats}
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if use_json:
+        manifest = {"textures": out_images, "materials": out_mats, "objects": obj_mats}
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    else:
+        blob = encode_blmw_pbr_manifest(rel_paths, out_mats, obj_mats)
+        manifest_path.write_bytes(blob)
 
 
 def parse_glb_scene(glb_path: Path, tpl_offset: int = 0, x_offset: float = 0.0,
-                    pbr_manifest: Optional[Path] = None, rh_to_lh: bool = False) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+                    pbr_manifest: Optional[Path] = None, rh_to_lh: bool = False,
+                    pbr_format: str = "auto") -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     data = glb_path.read_bytes()
     if len(data) < 20 or data[:4] != b"glTF":
         raise ValueError(f"Invalid GLB header in {glb_path}")
@@ -664,7 +717,7 @@ def parse_glb_scene(glb_path: Path, tpl_offset: int = 0, x_offset: float = 0.0,
                 obj_mats.append({"id": oid, "material_index": mat_idx})
 
     if pbr_manifest is not None:
-        export_pbr_manifest(gltf, bin_blob, obj_mats, pbr_manifest)
+        export_pbr_manifest(gltf, bin_blob, obj_mats, pbr_manifest, pbr_format=pbr_format)
     return tpls, objs
 
 
@@ -933,9 +986,10 @@ def main() -> None:
     imp.add_argument("--format", choices=("bobc", "bobr"), default="bobc")
     imp.add_argument("--out", type=Path, required=True)
     imp.add_argument("--pbr-manifest", type=Path, default=None)
+    imp.add_argument("--pbr-format", choices=("auto", "blmw", "json"), default="auto")
     imp.add_argument("--rh-to-lh", action="store_true", help="Convert right-handed glTF +Z to BLOOM LH +Z forward")
 
-    insp = sub.add_parser("inspect", help="Inspect header counts of .bobc / .bobr file")
+    insp = sub.add_parser("inspect", help="Inspect header counts of .bobc / .bobr / .blmw file")
     insp.add_argument("file", type=Path)
 
     samp = sub.add_parser("emit-sample-glb", help="Emit a valid minimal glTF 2.0 .glb for CI testing")
@@ -957,7 +1011,12 @@ def main() -> None:
 
     if args.cmd == "inspect":
         d = args.file.read_bytes()
-        magic, flags, tc, oc, ac, hc = struct.unpack_from("<IIIIII", d, 0)
+        magic = struct.unpack_from("<I", d, 0)[0]
+        if magic == MAGIC_BLMW and len(d) >= 8:
+            _, ver, bkind, bflags = struct.unpack_from("<IBBH", d, 0)
+            print(f"{args.file}: kind=BLMW ver={ver} subkind={bkind} flags={bflags} bytes={len(d)}")
+            return
+        _, flags, tc, oc, ac, hc = struct.unpack_from("<IIIIII", d, 0)
         kind = "BOBC" if magic == MAGIC_COL else ("BOBR" if magic == MAGIC_ROW else "UNKNOWN")
         print(f"{args.file}: kind={kind} bytes={len(d)} geom={flags&1} tpls={tc} objs={oc} ana={ac} huds={hc}")
         return
@@ -967,7 +1026,8 @@ def main() -> None:
     for i, gp in enumerate(args.glb):
         st, so = parse_glb_scene(gp, len(tpls), float(i) * 4.0,
                                   args.pbr_manifest if (i == 0 and args.pbr_manifest) else None,
-                                  rh_to_lh=args.rh_to_lh)
+                                  rh_to_lh=args.rh_to_lh,
+                                  pbr_format=args.pbr_format)
         tpls.extend(st)
         objs.extend(so)
     huds = parse_svg_huds(args.svg) if args.svg else []
