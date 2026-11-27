@@ -13,6 +13,7 @@ SHADERS: List[Tuple[str, str]] = [
     ("shaders/bloom_pbr.metal", "bloom_embedded_pbr_shader"),
     ("shaders/bloom_sprite.metal", "bloom_embedded_sprite_shader"),
     ("shaders/bloom_vision.metal", "bloom_embedded_vision_shader"),
+    ("shaders/bloom_vrs.metal", "bloom_embedded_vrs_shader"),
 ]
 
 

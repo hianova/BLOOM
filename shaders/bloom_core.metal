@@ -242,10 +242,7 @@ fragment half4 f_obj_lit(ObjFragIn in [[stage_in]]) {
     return half4(in.col.rgb * ndotl + half3(0.10h, 0.25h, 0.35h) * rim, 1.0h);
 }
 
-struct TightProxyIn {
-    float4 pos [[position]];
-    uint idx [[flat]];
-};
+struct TightProxyIn { float4 pos [[position]]; float2 ndc; uint idx [[flat]]; };
 
 vertex TightProxyIn v_tight_proxy_analytic(uint vid [[vertex_id]], uint iid [[instance_id]],
                                            device const BloomAnalyticPrim32 *prims [[buffer(0)]],
@@ -254,22 +251,22 @@ vertex TightProxyIn v_tight_proxy_analytic(uint vid [[vertex_id]], uint iid [[in
     float3 vc = to_view(float3(sp.cx, sp.cy, sp.cz), u);
     float aspect = u.vp_w / u.vp_h;
     float r = sp.radius + (sp.prim_kind_flags == 2u ? float(sp.half_len) : 0.0f);
-    if (vc.z + r < u.near_z) return TightProxyIn{float4(0.0f, 0.0f, -2.0f, 1.0f), iid};
+    if (vc.z + r < u.near_z) return TightProxyIn{float4(0.0f, 0.0f, -2.0f, 1.0f), float2(0.0f), iid};
     float z_near = max(vc.z - r, 0.25f);
     float hy = (r * u.focal) / z_near;
     float hx = hy / aspect;
     float2 c_ndc = float2((vc.x * u.focal) / (max(vc.z, 0.25f) * aspect), (vc.y * u.focal) / max(vc.z, 0.25f));
     float2 cr = float2((vid & 1u) ? 1.0f : -1.0f, (vid & 2u) ? 1.0f : -1.0f);
     float nz = clamp(0.20f + (1.0f - (2.0f / max(vc.z - r * 0.45f, 0.25f))) * 0.78f, 0.20f, 0.98f);
-    return TightProxyIn{float4(c_ndc + cr * float2(hx, hy), nz, 1.0f), iid};
+    float2 p_ndc = c_ndc + cr * float2(hx, hy);
+    return TightProxyIn{float4(p_ndc, nz, 1.0f), p_ndc, iid};
 }
 
 fragment half4 f_tight_proxy_analytic(TightProxyIn in [[stage_in]],
                                       device const BloomAnalyticPrim32 *prims [[buffer(0)]],
                                       constant BloomFrameUniforms &u [[buffer(1)]]) {
     BloomAnalyticPrim32 sp = prims[in.idx];
-    float2 uv = (in.pos.xy / float2(u.vp_w, u.vp_h)) * 2.0f - 1.0f;
-    uv.y = -uv.y;
+    float2 uv = in.ndc;
     float3 ro = float3(u.cam_pos);
     float3 rd = normalize(float3(u.cam_right) * (uv.x * (u.vp_w / u.vp_h) / u.focal) +
                           float3(u.cam_up) * (uv.y / u.focal) + float3(u.cam_fwd));

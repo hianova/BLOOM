@@ -29,7 +29,32 @@ typedef struct {
     bool     pbr_active;
     bool     sprite_active;
     uint32_t uploaded_textures;
+    bool     vrs_supported;
+    bool     vrs_active;
+    uint32_t vrs_phys_w;
+    uint32_t vrs_phys_h;
+    float    vrs_pixel_ratio;
 } BloomGpuStats;
+
+/**
+ * Opt-in Foveated Variable Rate Shading (MTLRasterizationRateMap) configuration.
+ * Default disabled; when enabled, shades at 1.0x inside the ~15-deg fovea and
+ * reduces shading rate in mid/outer periphery with graceful fallback if unsupported.
+ */
+typedef struct {
+    bool  enabled;
+    float gaze_x;         /* Normalized screen-space gaze X [0..1] (default 0.5) */
+    float gaze_y;         /* Normalized screen-space gaze Y [0..1] (default 0.5) */
+    float fovea_radius;   /* Normalized horizontal foveal half-width at 1.0x (default 0.125 ~= 15-deg @ 60 FOV) */
+    float mid_radius;     /* Normalized horizontal mid-periphery half-width (default 0.30) */
+    float mid_rate;       /* Mid-periphery rate in [0.25, 1.0] (default 0.50) */
+    float periphery_rate; /* Outer periphery rate in [0.25, 1.0] (default 0.25) */
+} BloomVrsConfig;
+
+static inline BloomVrsConfig bloom_vrs_default_config(void) {
+    BloomVrsConfig cfg = {false, 0.5f, 0.5f, 0.125f, 0.30f, 0.50f, 0.25f};
+    return cfg;
+}
 
 /**
  * Create Metal 3 Layer 2 GPU backend.
@@ -78,6 +103,18 @@ bool bloom_gpu_render_grounded(BloomGpu *gpu, BloomScene *scene,
                                BloomPickGpuResult *out_pick);
 
 BloomGpuStats bloom_gpu_get_stats(const BloomGpu *gpu);
+
+/** Query whether the Metal device supports hardware MTLRasterizationRateMap. */
+bool bloom_gpu_vrs_supported(const BloomGpu *gpu);
+
+/** Configure opt-in Foveated Variable Rate Shading (graceful fallback if unsupported). */
+void bloom_gpu_set_vrs(BloomGpu *gpu, const BloomVrsConfig *cfg);
+
+/** Update normalized [0..1] gaze center for Foveated VRS. */
+void bloom_gpu_set_vrs_gaze(BloomGpu *gpu, float gaze_x, float gaze_y);
+
+/** Retrieve current Foveated VRS configuration. */
+BloomVrsConfig bloom_gpu_get_vrs(const BloomGpu *gpu);
 
 #ifdef __cplusplus
 }

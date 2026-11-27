@@ -16,6 +16,7 @@ BIN_CORE_TEST = $(BUILD_DIR)/test_bloom_core
 BIN_METAL_TEST = $(BUILD_DIR)/test_bloom_metal
 BIN_SDK_TEST = $(BUILD_DIR)/test_bloom_sdk
 BIN_M2_TEST = $(BUILD_DIR)/test_bloom_m2
+BIN_VRS_TEST = $(BUILD_DIR)/test_bloom_vrs
 BIN_DEMO = $(BUILD_DIR)/bloom_studio_demo
 BIN_KH_TEST = $(BUILD_DIR)/test_khronos_gltf
 BIN_CLAY_SWAP = $(BUILD_DIR)/clay_bloom_swap
@@ -23,7 +24,7 @@ BIN_PEANUT_SWAP = $(BUILD_DIR)/peanut_gb_bloom_swap
 
 .PHONY: all lib test test-core gate-ci gate-conformance demo clean
 
-all: $(LIB_BLOOM) $(BIN_CORE_TEST) $(BIN_METAL_TEST) $(BIN_SDK_TEST) $(BIN_M2_TEST) $(BIN_DEMO)
+all: $(LIB_BLOOM) $(BIN_CORE_TEST) $(BIN_METAL_TEST) $(BIN_SDK_TEST) $(BIN_M2_TEST) $(BIN_VRS_TEST) $(BIN_DEMO)
 
 lib: $(LIB_BLOOM)
 
@@ -91,6 +92,10 @@ $(BIN_M2_TEST): tests/test_bloom_m2.mm include/bloom.h $(LIB_BLOOM) Makefile
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) tests/test_bloom_m2.mm $(LIB_BLOOM) $(FRAMEWORKS) -lm -o $@
 
+$(BIN_VRS_TEST): tests/test_bloom_vrs.mm include/bloom.h $(LIB_BLOOM) Makefile
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) tests/test_bloom_vrs.mm $(LIB_BLOOM) $(FRAMEWORKS) -lm -o $@
+
 $(BIN_DEMO): examples/bloom_studio_demo.mm $(LIB_BLOOM) Makefile
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) examples/bloom_studio_demo.mm $(LIB_BLOOM) $(FRAMEWORKS) -o $@
@@ -120,6 +125,7 @@ test: all
 	python3 tools/bloom_import.py import --glb $(BUILD_DIR)/multi_sample.glb --format bobc --out $(BUILD_DIR)/multi_sample.bobc
 	python3 tools/bloom_import.py inspect $(BUILD_DIR)/multi_sample.bobc
 	$(BIN_M2_TEST) --multi-bobc $(BUILD_DIR)/multi_sample.bobc
+	$(BIN_VRS_TEST)
 
 gate-ci: test
 	@echo "=== Gate 1: Zero Coupling Audit (Zero FLOW/INFO/SDL/ge_host_if) ==="

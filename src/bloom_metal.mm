@@ -33,6 +33,12 @@ struct GroundRequest {
     uint32_t pick_x, pick_y, max_slots, half_shift, id_w, id_h;
 };
 
+struct VrsUniformsGpu {
+    float screen_size[2];
+    float phys_size[2];
+};
+BLOOM_STATIC_ASSERT(sizeof(VrsUniformsGpu) == 16, "VrsUniformsGpu must be 16 bytes");
+
 static inline size_t align256(size_t n) {
     return (n + 255u) & ~size_t(255u);
 }
@@ -104,6 +110,25 @@ struct BloomGpu {
     id<MTLBuffer> b_ground_pick = nil;
     uint32_t ground_id_w = 0u, ground_id_h = 0u;
 
+    /* Opt-in Hardware Foveated VRS (MTLRasterizationRateMap) */
+    bool vrs_supported = false;
+    BloomVrsConfig vrs_cfg = bloom_vrs_default_config();
+    bool vrs_dirty = false;
+    bool vrs_frame_dirty = false;
+    std::string vrs_shader_path;
+    id<MTLLibrary> vrs_lib = nil;
+    id<MTLRenderPipelineState> p_vrs_resolve_depth = nil;
+    id<MTLRenderPipelineState> p_vrs_resolve_nodepth = nil;
+    id<MTLDepthStencilState> ds_vrs_resolve = nil;
+    id<MTLRasterizationRateMap> vrs_rrm = nil;
+    id<MTLBuffer> vrs_rrm_buf[kRingSlots]{};
+    uint64_t vrs_rrm_buf_gen[kRingSlots]{};
+    uint64_t vrs_gen = 0u;
+    id<MTLTexture> vrs_color_tex = nil;
+    id<MTLTexture> vrs_depth_tex = nil;
+    uint32_t vrs_vp_w = 0u, vrs_vp_h = 0u;
+    uint32_t vrs_phys_w = 0u, vrs_phys_h = 0u;
+
     BloomGpuStats stats{};
     std::atomic<double> async_last_gpu_ms{0.0};
     std::vector<BloomGlyphInst> scratch_glyphs;
@@ -122,7 +147,8 @@ static id<MTLComputePipelineState> make_cpso(id<MTLDevice> dev, id<MTLLibrary> l
 }
 
 static id<MTLRenderPipelineState> make_rpso(id<MTLDevice> dev, id<MTLLibrary> lib,
-                                            const char *vf, const char *ff, bool blend, bool premul) {
+                                            const char *vf, const char *ff, bool blend, bool premul,
+                                            MTLPixelFormat depth_fmt = MTLPixelFormatDepth32Float) {
     NSError *err = nil;
     id<MTLFunction> v = [lib newFunctionWithName:[NSString stringWithUTF8String:vf]];
     id<MTLFunction> f = [lib newFunctionWithName:[NSString stringWithUTF8String:ff]];
@@ -131,7 +157,7 @@ static id<MTLRenderPipelineState> make_rpso(id<MTLDevice> dev, id<MTLLibrary> li
     d.vertexFunction = v;
     d.fragmentFunction = f;
     d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    d.depthAttachmentPixelFormat = depth_fmt;
     if (blend) {
         d.colorAttachments[0].blendingEnabled = YES;
         d.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
@@ -222,6 +248,7 @@ BloomGpu *bloom_gpu_create(void *ca_metal_layer, const char *shader_path) {
         g->ground_shader_path = dir + "bloom_grounding.metal";
         g->pbr_shader_path = dir + "bloom_pbr.metal";
         g->sprite_shader_path = dir + "bloom_sprite.metal";
+        g->vrs_shader_path = dir + "bloom_vrs.metal";
     }
     g->dev = MTLCreateSystemDefaultDevice();
     if (!g->dev) { delete g; return nullptr; }
@@ -313,10 +340,13 @@ BloomGpu *bloom_gpu_create(void *ca_metal_layer, const char *shader_path) {
     g->sprite_atlas_tex = [g->dev newTextureWithDescriptor:sd];
 
     g->scratch_glyphs.resize(kMaxGlyphsPerFrame);
+    g->vrs_supported = [g->dev supportsRasterizationRateMapWithLayerCount:1] ? true : false;
     g->stats.max_tg_cull = (uint32_t)g->p_cull.maxTotalThreadsPerThreadgroup;
     g->stats.max_tg_checksum = (uint32_t)g->p_chk.maxTotalThreadsPerThreadgroup;
     g->stats.memoryless_depth_active = true;
     g->stats.private_opt_atlas_active = true;
+    g->stats.vrs_supported = g->vrs_supported;
+    g->stats.vrs_pixel_ratio = 1.0f;
     return g;
 }
 
@@ -444,10 +474,165 @@ static bool ensure_sprite_ready(BloomGpu *g) {
     return true;
 }
 
+static float eval_vrs_axis_rate(float z0, float z1, float center,
+                                float r_fov, float r_mid,
+                                float mid_rate, float periph_rate) {
+    float d = 0.0f;
+    if (center < z0) d = z0 - center;
+    else if (center > z1) d = center - z1;
+    if (d <= r_fov) return 1.0f;
+    if (d <= r_mid) return mid_rate;
+    return periph_rate;
+}
+
+static bool ensure_vrs_ready(BloomGpu *g, uint32_t vp_w, uint32_t vp_h, uint32_t slot) {
+    if (!g->vrs_supported || !g->vrs_cfg.enabled || vp_w < 64u || vp_h < 64u) return false;
+    if (!g->vrs_lib) {
+        g->vrs_lib = compile_aux_lib(g->dev, g->vrs_shader_path, bloom_embedded_vrs_shader());
+        if (!g->vrs_lib) return false;
+        g->p_vrs_resolve_depth = make_rpso(g->dev, g->vrs_lib, "v_vrs_resolve", "f_vrs_resolve",
+                                           false, false, MTLPixelFormatDepth32Float);
+        g->p_vrs_resolve_nodepth = make_rpso(g->dev, g->vrs_lib, "v_vrs_resolve", "f_vrs_resolve",
+                                             false, false, MTLPixelFormatInvalid);
+        if (!g->p_vrs_resolve_depth || !g->p_vrs_resolve_nodepth) return false;
+        MTLDepthStencilDescriptor *dsv = [[MTLDepthStencilDescriptor alloc] init];
+        dsv.depthCompareFunction = MTLCompareFunctionAlways;
+        dsv.depthWriteEnabled = NO;
+        g->ds_vrs_resolve = [g->dev newDepthStencilStateWithDescriptor:dsv];
+    }
+
+    if (g->vrs_dirty || !g->vrs_rrm || g->vrs_vp_w != vp_w || g->vrs_vp_h != vp_h) {
+        float gx = std::clamp(g->vrs_cfg.gaze_x, 0.0f, 1.0f);
+        float gy = std::clamp(g->vrs_cfg.gaze_y, 0.0f, 1.0f);
+        float rf = std::clamp(g->vrs_cfg.fovea_radius, 0.01f, 1.0f);
+        float rm = std::clamp(g->vrs_cfg.mid_radius, rf, 1.5f);
+        float mr = std::clamp(g->vrs_cfg.mid_rate, 0.25f, 1.0f);
+        float pr = std::clamp(g->vrs_cfg.periphery_rate, 0.25f, 1.0f);
+        float aspect = (float)vp_w / (float)vp_h;
+        float rfy = rf * aspect;
+        float rmy = rm * aspect;
+
+        id<MTLRasterizationRateMap> rrm = nil;
+        uint32_t grids[2] = {(vp_w >= 512u && vp_h >= 512u) ? 16u : 8u, 8u};
+        for (int attempt = 0; attempt < 2 && !rrm; ++attempt) {
+            uint32_t nx = grids[attempt], ny = grids[attempt];
+            MTLRasterizationRateMapDescriptor *rrmDesc =
+                [MTLRasterizationRateMapDescriptor rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake(vp_w, vp_h, 1)];
+            MTLRasterizationRateLayerDescriptor *layerDesc =
+                [[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(nx, ny, 1)];
+            for (uint32_t i = 0u; i < nx; ++i) {
+                layerDesc.horizontalSampleStorage[i] =
+                    eval_vrs_axis_rate((float)i / (float)nx, (float)(i + 1u) / (float)nx, gx, rf, rm, mr, pr);
+            }
+            for (uint32_t j = 0u; j < ny; ++j) {
+                layerDesc.verticalSampleStorage[j] =
+                    eval_vrs_axis_rate((float)j / (float)ny, (float)(j + 1u) / (float)ny, gy, rfy, rmy, mr, pr);
+            }
+            [rrmDesc setLayer:layerDesc atIndex:0];
+            rrm = [g->dev newRasterizationRateMapWithDescriptor:rrmDesc];
+        }
+        if (!rrm) return false;
+
+        MTLSize ps = [rrm physicalSizeForLayer:0];
+        uint32_t pw = std::max(1u, (uint32_t)ps.width);
+        uint32_t ph = std::max(1u, (uint32_t)ps.height);
+        if (!g->vrs_color_tex || g->vrs_phys_w != pw || g->vrs_phys_h != ph) {
+            MTLTextureDescriptor *ctd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                           width:pw height:ph mipmapped:NO];
+            ctd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            ctd.storageMode = MTLStorageModePrivate;
+            ctd.allowGPUOptimizedContents = YES;
+            g->vrs_color_tex = [g->dev newTextureWithDescriptor:ctd];
+
+            MTLTextureDescriptor *dtd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                                                           width:pw height:ph mipmapped:NO];
+            dtd.usage = MTLTextureUsageRenderTarget;
+            dtd.storageMode = MTLStorageModeMemoryless;
+            dtd.allowGPUOptimizedContents = YES;
+            g->vrs_depth_tex = [g->dev newTextureWithDescriptor:dtd];
+        }
+        g->vrs_rrm = rrm;
+        g->vrs_vp_w = vp_w;
+        g->vrs_vp_h = vp_h;
+        g->vrs_phys_w = pw;
+        g->vrs_phys_h = ph;
+        g->vrs_dirty = false;
+        g->vrs_gen++;
+    }
+
+    if (g->vrs_rrm_buf_gen[slot] != g->vrs_gen) {
+        MTLSizeAndAlign sa = [g->vrs_rrm parameterBufferSizeAndAlign];
+        if (!g->vrs_rrm_buf[slot] || g->vrs_rrm_buf[slot].length < sa.size) {
+            g->vrs_rrm_buf[slot] = [g->dev newBufferWithLength:std::max<size_t>(sa.size, 64u)
+                                                      options:MTLResourceStorageModeShared];
+        }
+        [g->vrs_rrm copyParameterDataToBuffer:g->vrs_rrm_buf[slot] offset:0];
+        g->vrs_rrm_buf_gen[slot] = g->vrs_gen;
+    }
+    return g->vrs_color_tex != nil && g->vrs_depth_tex != nil && g->vrs_rrm_buf[slot] != nil;
+}
+
+static void encode_hud_draws(BloomGpu *g, id<MTLRenderCommandEncoder> enc, uint32_t s,
+                           const BloomFrameUniforms &u,
+                           uint32_t opq_cnt, size_t off_oq,
+                           uint32_t sh_cnt, size_t off_sh,
+                           uint32_t alp_cnt, size_t off_aq,
+                           uint32_t gl_cnt, size_t off_gl,
+                           uint32_t sp_cnt, size_t off_sp,
+                           size_t off_cl) {
+    [enc setCullMode:MTLCullModeNone];
+    if (opq_cnt > 0u) {
+        [enc setDepthStencilState:g->ds_ui_opq];
+        [enc setRenderPipelineState:g->p_hud_opq];
+        [enc setVertexBuffer:g->wc_ring[s] offset:off_oq atIndex:0];
+        [enc setVertexBuffer:g->wc_ring[s] offset:off_cl atIndex:1];
+        [enc setVertexBytes:&u length:sizeof(u) atIndex:2];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:opq_cnt];
+    }
+    if (sh_cnt > 0u) {
+        [enc setDepthStencilState:g->ds_ui_blend];
+        [enc setRenderPipelineState:g->p_hud_sh];
+        [enc setVertexBuffer:g->wc_ring[s] offset:off_sh atIndex:0];
+        [enc setVertexBuffer:g->wc_ring[s] offset:off_cl atIndex:1];
+        [enc setVertexBytes:&u length:sizeof(u) atIndex:2];
+        [enc setFragmentBuffer:g->wc_ring[s] offset:off_sh atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:sh_cnt];
+    }
+    if (alp_cnt > 0u) {
+        [enc setDepthStencilState:g->ds_ui_blend];
+        [enc setRenderPipelineState:g->p_hud_alp];
+        [enc setVertexBuffer:g->wc_ring[s] offset:off_aq atIndex:0];
+        [enc setVertexBuffer:g->wc_ring[s] offset:off_cl atIndex:1];
+        [enc setVertexBytes:&u length:sizeof(u) atIndex:2];
+        [enc setFragmentBuffer:g->wc_ring[s] offset:off_aq atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:alp_cnt];
+    }
+    if (gl_cnt > 0u) {
+        [enc setDepthStencilState:g->ds_ui_blend];
+        [enc setRenderPipelineState:g->p_hud_gl];
+        [enc setVertexBuffer:g->wc_ring[s] offset:off_gl atIndex:0];
+        [enc setVertexBuffer:g->wc_ring[s] offset:off_cl atIndex:1];
+        [enc setVertexBytes:&u length:sizeof(u) atIndex:2];
+        [enc setFragmentBuffer:g->wc_ring[s] offset:off_gl atIndex:0];
+        [enc setFragmentTexture:g->atlas_tex atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:gl_cnt];
+    }
+    if (sp_cnt > 0u && g->p_hud_sprite) {
+        [enc setDepthStencilState:g->ds_ui_blend];
+        [enc setRenderPipelineState:g->p_hud_sprite];
+        [enc setVertexBuffer:g->wc_ring[s] offset:off_sp atIndex:0];
+        [enc setVertexBuffer:g->wc_ring[s] offset:off_cl atIndex:1];
+        [enc setVertexBytes:&u length:sizeof(u) atIndex:2];
+        [enc setFragmentBuffer:g->wc_ring[s] offset:off_sp atIndex:0];
+        [enc setFragmentTexture:g->sprite_atlas_tex atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:sp_cnt];
+    }
+}
+
 static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint32_t vp_h,
                             bool force, bool headless, const GroundRequest *greq) {
     if (!g || !scene || vp_w == 0u || vp_h == 0u) return false;
-    if (!bloom_scene_is_dirty(scene) && !force) {
+    if (!bloom_scene_is_dirty(scene) && !g->vrs_frame_dirty && !force) {
         g->stats.idle_skipped_frames++;
         return true;
     }
@@ -640,15 +825,21 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
         color_target = drawable.texture;
     }
 
+    bool use_vrs = ensure_vrs_ready(g, vp_w, vp_h, s);
+    bool has_hud = (opq_cnt > 0u || sh_cnt > 0u || alp_cnt > 0u || gl_cnt > 0u || sp_cnt > 0u);
+
     MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-    rpd.colorAttachments[0].texture = color_target;
+    rpd.colorAttachments[0].texture = use_vrs ? g->vrs_color_tex : color_target;
     rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
     rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.043, 0.059, 0.090, 1.0);
-    rpd.depthAttachment.texture = g->depth_tex;
+    rpd.depthAttachment.texture = use_vrs ? g->vrs_depth_tex : g->depth_tex;
     rpd.depthAttachment.loadAction = MTLLoadActionClear;
     rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
     rpd.depthAttachment.clearDepth = 1.0;
+    if (use_vrs) {
+        rpd.rasterizationRateMap = g->vrs_rrm;
+    }
 
     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rpd];
     if (mh_cnt > 0u && g->priv_vtx && g->priv_lidx) {
@@ -692,54 +883,39 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
         [enc setFragmentBytes:&u length:sizeof(u) atIndex:1];
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:pr_cnt];
     }
-    [enc setCullMode:MTLCullModeNone];
-    if (opq_cnt > 0u) {
-        [enc setDepthStencilState:g->ds_ui_opq];
-        [enc setRenderPipelineState:g->p_hud_opq];
-        [enc setVertexBuffer:g->wc_ring[s] offset:off_oq atIndex:0];
-        [enc setVertexBuffer:g->wc_ring[s] offset:off_cl atIndex:1];
-        [enc setVertexBytes:&u length:sizeof(u) atIndex:2];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:opq_cnt];
-    }
-    if (sh_cnt > 0u) {
-        [enc setDepthStencilState:g->ds_ui_blend];
-        [enc setRenderPipelineState:g->p_hud_sh];
-        [enc setVertexBuffer:g->wc_ring[s] offset:off_sh atIndex:0];
-        [enc setVertexBuffer:g->wc_ring[s] offset:off_cl atIndex:1];
-        [enc setVertexBytes:&u length:sizeof(u) atIndex:2];
-        [enc setFragmentBuffer:g->wc_ring[s] offset:off_sh atIndex:0];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:sh_cnt];
-    }
-    if (alp_cnt > 0u) {
-        [enc setDepthStencilState:g->ds_ui_blend];
-        [enc setRenderPipelineState:g->p_hud_alp];
-        [enc setVertexBuffer:g->wc_ring[s] offset:off_aq atIndex:0];
-        [enc setVertexBuffer:g->wc_ring[s] offset:off_cl atIndex:1];
-        [enc setVertexBytes:&u length:sizeof(u) atIndex:2];
-        [enc setFragmentBuffer:g->wc_ring[s] offset:off_aq atIndex:0];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:alp_cnt];
-    }
-    if (gl_cnt > 0u) {
-        [enc setDepthStencilState:g->ds_ui_blend];
-        [enc setRenderPipelineState:g->p_hud_gl];
-        [enc setVertexBuffer:g->wc_ring[s] offset:off_gl atIndex:0];
-        [enc setVertexBuffer:g->wc_ring[s] offset:off_cl atIndex:1];
-        [enc setVertexBytes:&u length:sizeof(u) atIndex:2];
-        [enc setFragmentBuffer:g->wc_ring[s] offset:off_gl atIndex:0];
-        [enc setFragmentTexture:g->atlas_tex atIndex:0];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:gl_cnt];
-    }
-    if (sp_cnt > 0u && g->p_hud_sprite) {
-        [enc setDepthStencilState:g->ds_ui_blend];
-        [enc setRenderPipelineState:g->p_hud_sprite];
-        [enc setVertexBuffer:g->wc_ring[s] offset:off_sp atIndex:0];
-        [enc setVertexBuffer:g->wc_ring[s] offset:off_cl atIndex:1];
-        [enc setVertexBytes:&u length:sizeof(u) atIndex:2];
-        [enc setFragmentBuffer:g->wc_ring[s] offset:off_sp atIndex:0];
-        [enc setFragmentTexture:g->sprite_atlas_tex atIndex:0];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:sp_cnt];
+    if (!use_vrs) {
+        encode_hud_draws(g, enc, s, u, opq_cnt, off_oq, sh_cnt, off_sh,
+                       alp_cnt, off_aq, gl_cnt, off_gl, sp_cnt, off_sp, off_cl);
     }
     [enc endEncoding];
+
+    if (use_vrs) {
+        bool hud_in_pass2 = has_hud;
+        MTLRenderPassDescriptor *rpd2 = [MTLRenderPassDescriptor renderPassDescriptor];
+        rpd2.colorAttachments[0].texture = color_target;
+        rpd2.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        rpd2.colorAttachments[0].storeAction = MTLStoreActionStore;
+        if (hud_in_pass2) {
+            rpd2.depthAttachment.texture = g->depth_tex;
+            rpd2.depthAttachment.loadAction = MTLLoadActionClear;
+            rpd2.depthAttachment.storeAction = MTLStoreActionDontCare;
+            rpd2.depthAttachment.clearDepth = 1.0;
+        }
+        id<MTLRenderCommandEncoder> enc2 = [cmd renderCommandEncoderWithDescriptor:rpd2];
+        [enc2 setCullMode:MTLCullModeNone];
+        [enc2 setDepthStencilState:g->ds_vrs_resolve];
+        [enc2 setRenderPipelineState:(hud_in_pass2 ? g->p_vrs_resolve_depth : g->p_vrs_resolve_nodepth)];
+        VrsUniformsGpu vu{{(float)vp_w, (float)vp_h}, {(float)g->vrs_phys_w, (float)g->vrs_phys_h}};
+        [enc2 setFragmentTexture:g->vrs_color_tex atIndex:0];
+        [enc2 setFragmentBytes:&vu length:sizeof(vu) atIndex:0];
+        [enc2 setFragmentBuffer:g->vrs_rrm_buf[s] offset:0 atIndex:1];
+        [enc2 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        if (hud_in_pass2) {
+            encode_hud_draws(g, enc2, s, u, opq_cnt, off_oq, sh_cnt, off_sh,
+                           alp_cnt, off_aq, gl_cnt, off_gl, sp_cnt, off_sp, off_cl);
+        }
+        [enc2 endEncoding];
+    }
 
     if (greq) {
         MTLRenderPassDescriptor *irpd = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -835,11 +1011,19 @@ static bool render_internal(BloomGpu *g, BloomScene *scene, uint32_t vp_w, uint3
     }
 
     bloom_scene_clear_dirty(scene);
+    g->vrs_frame_dirty = false;
     g->stats.submitted_cbs++;
     g->stats.last_cpu_pack_us = std::chrono::duration<double, std::micro>(t_cpu1 - t_cpu0).count();
     g->stats.last_wc_bytes = (uint32_t)total_wc;
     g->stats.atlas_glyph_count = bloom_atlas_glyph_count(g->atlas);
     g->stats.total_meshlets = mh_cnt;
+    g->stats.vrs_supported = g->vrs_supported;
+    g->stats.vrs_active = use_vrs;
+    g->stats.vrs_phys_w = use_vrs ? g->vrs_phys_w : vp_w;
+    g->stats.vrs_phys_h = use_vrs ? g->vrs_phys_h : vp_h;
+    g->stats.vrs_pixel_ratio = use_vrs
+        ? (float)(((double)g->vrs_phys_w * (double)g->vrs_phys_h) / ((double)vp_w * (double)vp_h))
+        : 1.0f;
     return true;
 }
 
@@ -1029,4 +1213,38 @@ uint16_t bloom_gpu_upload_ktx2(BloomGpu *gpu, const uint8_t *ktx2_bytes, size_t 
 BloomGpuStats bloom_gpu_get_stats(const BloomGpu *gpu) {
     BloomGpuStats empty{};
     return gpu ? gpu->stats : empty;
+}
+
+bool bloom_gpu_vrs_supported(const BloomGpu *gpu) {
+    return gpu ? gpu->vrs_supported : false;
+}
+
+void bloom_gpu_set_vrs(BloomGpu *gpu, const BloomVrsConfig *cfg) {
+    if (!gpu) return;
+    BloomVrsConfig next = cfg ? *cfg : bloom_vrs_default_config();
+    next.gaze_x = std::clamp(next.gaze_x, 0.0f, 1.0f);
+    next.gaze_y = std::clamp(next.gaze_y, 0.0f, 1.0f);
+    next.fovea_radius = std::clamp(next.fovea_radius, 0.01f, 1.0f);
+    next.mid_radius = std::clamp(next.mid_radius, next.fovea_radius, 1.5f);
+    next.mid_rate = std::clamp(next.mid_rate, 0.25f, 1.0f);
+    next.periphery_rate = std::clamp(next.periphery_rate, 0.25f, 1.0f);
+    gpu->vrs_cfg = next;
+    gpu->vrs_dirty = true;
+    gpu->vrs_frame_dirty = true;
+}
+
+void bloom_gpu_set_vrs_gaze(BloomGpu *gpu, float gaze_x, float gaze_y) {
+    if (!gpu) return;
+    float nx = std::clamp(gaze_x, 0.0f, 1.0f);
+    float ny = std::clamp(gaze_y, 0.0f, 1.0f);
+    if (fabsf(nx - gpu->vrs_cfg.gaze_x) > 1e-4f || fabsf(ny - gpu->vrs_cfg.gaze_y) > 1e-4f) {
+        gpu->vrs_cfg.gaze_x = nx;
+        gpu->vrs_cfg.gaze_y = ny;
+        gpu->vrs_dirty = true;
+        gpu->vrs_frame_dirty = true;
+    }
+}
+
+BloomVrsConfig bloom_gpu_get_vrs(const BloomGpu *gpu) {
+    return gpu ? gpu->vrs_cfg : bloom_vrs_default_config();
 }
